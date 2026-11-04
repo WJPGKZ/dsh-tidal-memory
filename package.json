@@ -1,0 +1,39 @@
+{
+  "name": "dsh-tidal-memory",
+  "version": "0.1.0",
+  "description": "四层独立存储、证据召回与受限私人记录的 DeepSeek Harness 记忆插件。",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./core": "./src/store.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "index.d.ts", "client.js", "src", "cordis.patch.yml", "README.md", "LICENSE"],
+  "engines": {"node": ">=24.0.0", "dsh": "0.2.1-rc.5"},
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "test:ui": "node scripts/ui-test.mjs",
+    "preview": "node scripts/preview.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "playwright": "^1.56.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "peerDependencies": {"@deepseek-ai/dsh": "0.2.1-rc.5"},
+  "peerDependenciesMeta": {"@deepseek-ai/dsh": {"optional": true}},
+  "dsh": {
+    "bundle": {"patch": "./cordis.patch.yml"},
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-runtime", "@deepseek-ai/dsh-client-ui-settings"]
+    }
+  },
+  "repository": {"type": "git", "url": "git+https://github.com/WJPGKZ/dsh-tidal-memory.git"},
+  "license": "MIT"
+}

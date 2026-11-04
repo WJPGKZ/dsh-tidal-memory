@@ -1,0 +1,11 @@
+node_modules/
+.preview/
+coverage/
+artifacts/
+*.tgz
+*.sqlite3*
+*.db*
+.env*
+data/
+backups/
+*.log
