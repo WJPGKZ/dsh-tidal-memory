@@ -3,6 +3,8 @@ export interface MemoryProposal {
   text: string;
   layer: Exclude<Layer, 'L0'>;
   category?: 'event' | 'task' | 'preference' | 'agreement' | 'knowledge' | 'identity' | 'self' | 'observation';
+  horizon?: 'unspecified' | 'task' | 'event' | 'long_term';
+  taskKey?: string;
   tags?: string[];
 }
 export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
@@ -12,6 +14,8 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   status: string;
   kind: string;
   scope: 'space';
+  horizon: 'unspecified' | 'task' | 'event' | 'long_term';
+  taskKey: string;
   sessionId: string;
   occurredAt: string | null;
   source: Record<string, unknown>;
@@ -22,7 +26,10 @@ export interface RecallResult {
   estimatedTokens: number;
   budget: number;
   accounting: string;
-  picked: Array<{ id: string; layer: Layer; reason: string; score: number; hits: string[] }>;
+  threshold: number;
+  bestScore: number;
+  excluded: Array<{ id: string; reason: string; score?: number }>;
+  picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[] }>;
 }
 export interface TidalMemoryService {
   readonly version: 1;

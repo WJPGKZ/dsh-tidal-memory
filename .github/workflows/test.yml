@@ -1,0 +1,21 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  rc5-contract:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm install:host
+      - run: pnpm check
+      - run: pnpm test:unit
+      - name: Required real rc5 host contract and request tests
+        run: pnpm test:host

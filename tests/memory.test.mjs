@@ -4,9 +4,8 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from 'node
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { MemorySpace } from '../src/store.js';
-import { configOf, hash, LAYERS } from '../src/model.js';
+import { classifyRememberDirective, configOf, hash, LAYERS } from '../src/model.js';
 import { applyImport, importPreview, packBackup, restoreBackup, unpackBackup } from '../src/transfer.js';
-import { extractBatch, parseExtraction } from '../src/extraction.js';
 
 const admin = { admin: true };
 function fixture(t, options = {}) {
@@ -32,6 +31,16 @@ test('four independent SQLite stores and a private store persist across restart'
   f.replace(next);
   assert.equal(next.all().length, 4);
 });
+test('legacy layer schemas migrate pinned records into an indexed resident field', t => {
+  const f = fixture(t);
+  const record = create(f.space, 'fixed long-term rule', { layer: 'L3', pinned: true });
+  f.space.db('L3').exec('DROP INDEX by_status_pinned; ALTER TABLE memories DROP COLUMN pinned; PRAGMA user_version=1;');
+  f.space.close();
+  const next = new MemorySpace(f.root, 'test');
+  f.replace(next);
+  assert.equal(next.get(record.id, admin).pinned, true);
+  assert.equal(next.db('L3').prepare('SELECT pinned FROM memories WHERE id=?').get(record.id).pinned, 1);
+});
 test('same workspace shares across sessions and merges duplicate provenance, without reinforcement', t => {
   const { space } = fixture(t);
   const first = space.create({ layer: 'L3', text: '使用蓝色主题' }, { sessionId: 'session-a' });
@@ -41,7 +50,7 @@ test('same workspace shares across sessions and merges duplicate provenance, wit
   assert.equal(second.sources.length, 2);
   assert.equal(second.stability, 1);
   assert.equal(space.get(first.id, { sessionId: 'session-b' }).text, first.text);
-  assert.equal(second.status, 'candidate');
+  assert.equal(second.status, 'active');
 });
 test('different workspaces have independent stores and configuration disallows shared binding', t => {
   const { root, space, own } = fixture(t);
@@ -75,6 +84,26 @@ test('only manual confirmation reinforces; passive recall never reinforces', t =
   space.reinforce(a.id, 'confirmation-1', admin);
   assert.equal(space.get(a.id, admin).stability, 1.25);
 });
+test('reinforcement recovers if the layer write succeeds before its idempotency marker', t => {
+  const root = mkdtempSync(join(tmpdir(), 'tidal-reinforcement-recovery-'));
+  let fail = true;
+  let space = new MemorySpace(root, 'test', {
+    failpoint: point => { if (point === 'after-reinforcement-write' && fail) { fail = false; throw new Error('injected crash'); } },
+  });
+  t.after(() => { space.close(); rmSync(root, { recursive: true, force: true }); });
+  const candidate = space.create({ layer: 'L3', text: 'local recovery candidate' }, admin);
+  assert.throws(() => space.reinforce(candidate.id, 'evidence-1', admin), /injected crash/);
+  assert.equal(space.get(candidate.id, admin).stability, 1.25);
+  assert.equal(space.system.prepare('SELECT count(*) AS n FROM reinforcements').get().n, 0);
+  space.close();
+  space = new MemorySpace(root, 'test');
+  const recovered = space.get(candidate.id, admin);
+  assert.equal(recovered.stability, 1.25);
+  assert.equal(recovered.status, 'active');
+  assert.equal(space.system.prepare('SELECT count(*) AS n FROM reinforcements').get().n, 1);
+  assert.equal(space.system.prepare("SELECT count(*) AS n FROM operations WHERE state='pending'").get().n, 0);
+  assert.equal(space.reinforce(candidate.id, 'evidence-1', admin).revision, recovered.revision);
+});
 test('recall respects status, effective dates and exact budget including headers', t => {
   const { space } = fixture(t, { clock: () => Date.parse('2026-02-01T00:00:00Z') });
   create(space, '蓝色主题的说明');
@@ -85,6 +114,17 @@ test('recall respects status, effective dates and exact budget including headers
   assert.ok(result.estimatedTokens <= 256);
   for (const item of [future, expired, pending]) assert.ok(!result.picked.some(row => row.id === item.id));
   assert.equal(result.text.includes('待确认主题'), false);
+});
+test('FTS recall is local, honors query terms, and excludes unrelated shared tasks', t => {
+  const { space } = fixture(t);
+  const fact = create(space, 'blue theme preference', { layer: 'L3', status: 'active' });
+  create(space, 'unrelated database migration task', { layer: 'L1', category: 'task', status: 'active' });
+  const result = space.recall('blue theme', { sessionId: 'session' });
+  assert.deepEqual(result.picked.map(item => item.id), [fact.id]);
+  assert.equal(space.list({ query: 'blue' }, admin).total, 1);
+  const chinese = create(space, '偏好使用蓝色主题', { layer: 'L3', status: 'active' });
+  assert.ok(space.recall('蓝色主题', { sessionId: 'session' }).picked.some(item => item.id === chinese.id));
+  assert.equal(space.list({ query: '的' }, admin).total, 0);
 });
 test('cross-layer journal resumes after target write without duplicating target', t => {
   const f = fixture(t, { failpoint: point => { if (point === 'after-target') throw new Error('injected crash'); } });
@@ -99,7 +139,7 @@ test('cross-layer journal resumes after target write without duplicating target'
 });
 test('a second writer fails closed and never steals the first writer lock', t => {
   const { root, space } = fixture(t);
-  assert.throws(() => new MemorySpace(root, 'test'), /locked/);
+  assert.throws(() => new MemorySpace(root, 'test'), error => error.code === 'SPACE_BUSY');
   assert.equal(create(space, 'still writable').text, 'still writable');
 });
 test('forget deletes derivations, history, views and prevents exact reimport', t => {
@@ -165,21 +205,24 @@ test('legacy preview separates private files; repeated public import merges', t 
   assert.equal(space.privateStatus().count, 1);
   assert.throws(() => importPreview([{ name: '.credentials.yaml', text: 'not-a-real-secret' }]), /凭据/);
 });
-test('workspace extraction can combine sessions but must quote exact source text', async t => {
+test('explicit remember directives are automatic; unknown horizons remain dated episodes, not permanent facts', t => {
   const { space } = fixture(t);
-  const a = space.capture({ sessionId: 'a', eventId: 1, text: '偏好使用蓝色主题', at: '2026-01-01T00:00:00Z' });
-  const b = space.capture({ sessionId: 'b', eventId: 2, text: '偏好使用蓝色主题', at: '2026-01-01T00:00:00Z' });
-  const generate = async () => ({ text: JSON.stringify({ items: [a,b].map(source => ({
-    sourceId: source.id, quote: source.text, layer: 'L3', category: 'preference', tags: ['主题'],
-  })) }) });
-  await extractBatch(space, [a,b], generate);
-  const records = space.all().filter(r => r.layer === 'L3');
-  assert.equal(records.length, 1);
-  assert.equal(records[0].sources.length, 2);
-  assert.equal(records[0].status, 'candidate');
-  assert.throws(() => parseExtraction(JSON.stringify({ items: [{
-    sourceId: a.id, quote: '完全没有说过的话', layer: 'L3', category: 'knowledge', tags: [],
-  }] }), [a]), /准确片段/);
+  const task = space.capture({ sessionId: 'a', eventId: 1, text: '记住：这次任务先不改数据库', role: 'user' });
+  const preference = space.capture({ sessionId: 'b', eventId: 2, text: '记住：以后回答保持简洁', role: 'user' });
+  const ambiguous = space.capture({ sessionId: 'c', eventId: 3, text: '记住：项目名称是潮汐', role: 'user' });
+  const result = space.organizePending();
+  assert.deepEqual(result, { inspected: 3, organized: 3, needsReview: 0 });
+  const taskRecord = space.all().find(r => r.text === '这次任务先不改数据库');
+  const preferenceRecord = space.all().find(r => r.text === '以后回答保持简洁');
+  assert.deepEqual([taskRecord.layer, taskRecord.horizon, taskRecord.status], ['L1', 'task', 'active']);
+  assert.deepEqual([preferenceRecord.layer, preferenceRecord.horizon, preferenceRecord.status], ['L3', 'long_term', 'active']);
+  assert.equal(space.get(task.id, admin).status, 'processed');
+  assert.equal(space.get(preference.id, admin).status, 'processed');
+  assert.equal(space.get(ambiguous.id, admin).status, 'processed');
+  assert.equal(classifyRememberDirective('记住：项目名称是潮汐').horizon, 'unspecified');
+  const episode = space.all().find(r => r.text === '项目名称是潮汐');
+  assert.deepEqual([episode.layer, episode.status, episode.horizon], ['L2', 'active', 'unspecified']);
+  assert.ok(space.recall('项目名称潮汐', admin).picked.some(r => r.id === episode.id));
 });
 test('maintenance keeps pending buffers and does not silently lose failed work', t => {
   let now = Date.parse('2026-01-01T00:00:00Z');
@@ -227,16 +270,4 @@ test('restore rejects private provenance hidden in a secondary source', t => {
   envelope.payload = JSON.stringify(doc); envelope.sha256 = hash(envelope.payload);
   assert.throws(() => restoreBackup(root, 'invalid', JSON.stringify(envelope), '', {}), /私人来源/);
   assert.equal(existsSync(join(root, 'spaces', 'invalid')), false);
-});
-test('model cannot replace the verified source object and changed sources cancel extraction', async t => {
-  const { space } = fixture(t);
-  const a = space.capture({ sessionId: 'a', eventId: 1, text: 'verified quote' });
-  const output = JSON.stringify({ items: [{ sourceId: a.id, quote: a.text, layer: 'L3',
-    category: 'knowledge', tags: [], source: { id: 'untrusted' } }] });
-  assert.equal(parseExtraction(output, [a])[0].source.id, a.id);
-  await assert.rejects(() => extractBatch(space, [a], async () => {
-    space.update(a.id, { text: 'corrected source' }, a.revision, admin);
-    return { text: output };
-  }), /来源已变化/);
-  assert.equal(space.all().filter(r => r.layer === 'L3').length, 0);
 });

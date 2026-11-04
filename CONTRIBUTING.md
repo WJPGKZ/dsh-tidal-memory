@@ -1,0 +1,37 @@
+# Contributing
+
+Tidal Memory is being optimized around workspace-shared, four-layer memory for DeepSeek Harness rc5. The current implementation is local-first: capture, deterministic classification, SQLite/FTS5 retrieval, and persistence do not call a model.
+
+## Areas where help is welcome
+
+- Tests and labeled, synthetic benchmarks for local classification and recall.
+- Chinese and mixed-language rule coverage, especially false-positive and conflicting-memory cases.
+- An optional, fully local embedding retrieval backend. It must remain optional, preserve FTS5 fallback, isolate indexes by workspace, and never decide whether a memory is true, current, or safe to merge.
+- Future memory-organizer adapters. No `MemoryModelProvider` registration or execution interface exists yet. Design it explicitly; adapters must be opt-in, return proposals rather than write directly, and document exactly what data leaves the machine. Host-model extraction and query expansion are deferred, not silently enabled by the reference plan.
+
+New local-rule and tool memories are automatically recallable; human approval is not a normal ingestion prerequisite. Automatic eligibility must not imply verified truth. Preserve provenance, conflict isolation, optional human correction, and protection against tools rewriting user statements. Future adapters must use the same validated store boundary rather than mutate databases directly.
+
+## Privacy requirements
+
+Do not include real conversation histories, private journal entries, credentials, API keys, personal databases, or embedding vectors derived from private data in issues, pull requests, fixtures, or benchmarks. Use synthetic data only. Private journal content must remain outside ordinary retrieval, generated views, and plaintext backups.
+
+New backups exclude L0 records/history and source excerpts, including encrypted backups. Selected L1-L3 memory text is still sensitive. Test the entire snapshot, not just its `records` array; do not silently delete or rewrite old backups to satisfy a retention claim.
+
+## Checks
+
+Run the relevant checks before opening a pull request:
+
+```powershell
+pnpm install:host
+pnpm test
+pnpm test:host
+pnpm check
+pnpm test:ui
+pnpm bench 10000
+```
+
+The repository targets DeepSeek Harness `0.2.1-rc.5` and Node.js 24. Changes involving prompt delivery should distinguish provider registration, session event projection, and actual network delivery; do not claim a request was sent unless the host exposes evidence for it.
+
+Host dependencies are pinned in `tests/host-fixture`, separately from the plugin package. Missing or mismatched dependencies fail the tests instead of skipping. The CI host step exercises the real rc5 agent loop up to a fake transport's received request; it does not call a provider or cover compaction and long-conversation continuity.
+
+The benchmark compares a pinned original 0.1.0 commit with the working tree in separate processes. Its labeled development fixtures include unrelated active tasks and known semantic misses; they are not representative field data. Keep the failing semantic probes, report metric denominators and negative-query counts, and do not claim competitor or general-quality improvements from these fixtures. Local results go to `.preview/benchmark.json`.

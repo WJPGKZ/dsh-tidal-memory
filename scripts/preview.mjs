@@ -37,7 +37,7 @@ export async function startPreview(port = 0) {
     } },
     logger: { warn: message => console.warn(message) },
   };
-  const runtime = new TidalRuntime(ctx, config, root, input => ({ ...input, role: 'user' }));
+  const runtime = new TidalRuntime(ctx, config, root);
   const store = runtime.space('default');
   store.create({ layer: 'L3', text: '测试工作区使用蓝色主题。', status: 'active', kind: 'user_statement',
     category: 'preference', source: { kind: 'synthetic-fixture' } }, { admin: true });

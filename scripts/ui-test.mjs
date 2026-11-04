@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { startPreview } from './preview.mjs';
+import { MemorySpace } from '../src/store.js';
 
 const preview = await startPreview();
 const candidates = [
@@ -12,6 +13,7 @@ const candidates = [
 ].filter(Boolean);
 const executablePath = candidates.find(path => existsSync(path));
 let browser;
+let owner;
 try {
   browser = await chromium.launch({ ...(executablePath ? { executablePath } : {}), headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
@@ -40,11 +42,18 @@ try {
   assert.equal(rejected.status(), 403);
   await page.getByRole('tab', { name: '设置与迁移' }).click();
   await page.getByLabel('上下文预算（保守估算）').fill('2048');
+  assert.equal(await page.getByLabel('自动记录并召回用户陈述（本地规则，无需审核）').isChecked(), true);
+  assert.equal(await page.getByLabel('额外保存助手全文到短期 L0（默认关闭）').isChecked(), false);
+  await page.getByLabel('最低相关性分数').fill('0.5');
   await page.getByRole('button', { name: '保存设置', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
   const status = await (await page.request.get(`${preview.url}/tidal-memory/status?space=default`)).json();
   assert.equal(status.data.config.tokenBudget, 2048);
+  assert.equal(status.data.config.minScore, 0.5);
+  await page.getByRole('button', { name: '重建搜索索引', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '搜索索引已重建' }).waitFor();
   const shared = preview.runtime.space('default').all().find(r => r.text === 'UI 创建的跨会话共享记录');
+  assert.equal(shared.status, 'active');
   assert.equal(preview.runtime.space('default').get(shared.id, { sessionId: 'another-session' }).text, shared.text);
   await page.getByRole('tab', { name: '总览' }).click();
   await page.evaluate(() => document.documentElement.style.setProperty('--dsw-alias-label-primary', 'rgb(42, 53, 64)'));
@@ -54,9 +63,17 @@ try {
   await page.getByRole('combobox', { name: '记忆空间' }).selectOption('workspace-b');
   await page.getByRole('tab', { name: '分层记忆' }).click();
   await page.getByText('这一层还没有记忆。', { exact: true }).waitFor();
+  owner = new MemorySpace(preview.runtime.root, 'contended');
+  await page.getByRole('button', { name: '刷新', exact: true }).click();
+  await page.getByRole('combobox', { name: '记忆空间' }).selectOption('contended');
+  await page.getByText('当前空间不可用，未保存或召回记忆', { exact: true }).waitFor();
+  owner.close();
+  await page.getByRole('button', { name: '重试打开空间', exact: true }).click();
+  await page.getByText('当前空间不可用，未保存或召回记忆', { exact: true }).waitFor({ state: 'hidden' });
   assert.deepEqual(errors, []);
-  console.log('Browser UI checks passed: CRUD, workspace sharing/isolation, settings, privacy, CSRF.');
+  console.log('Browser UI checks passed: CRUD, workspace sharing/isolation, settings, privacy, index repair, lock retry, CSRF.');
 } finally {
+  owner?.close();
   await browser?.close();
   await preview.close();
 }

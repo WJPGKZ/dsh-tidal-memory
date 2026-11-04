@@ -6,9 +6,11 @@ import { MemorySpace } from './store.js';
 import { hash, MemoryError, normalizeRecord, requireValue, slug, string, timestamp } from './model.js';
 
 export function packBackup(space, password = '') {
+  return packSnapshot(space.snapshot({ includePrivate: Boolean(password) }), password);
+}
+function packSnapshot(snapshot, password = '') {
   if (password) string(password, '备份口令', 256);
   requireValue(!password || password.length >= 12, 'WEAK_PASSWORD', '包含私人记录的备份口令至少 12 个字符。');
-  const snapshot = space.snapshot({ includePrivate: Boolean(password) });
   const payload = JSON.stringify(snapshot);
   if (!password) return JSON.stringify({ format: 'tidal-backup', version: 1, sha256: hash(payload), payload });
   const salt = randomBytes(16), iv = randomBytes(12);
@@ -120,14 +122,13 @@ export function automaticBackup(space, root) {
   const last = space.system.prepare("SELECT value FROM metadata WHERE key='backup'").get();
   if (last && JSON.parse(last.value).day === day) return;
   const directory = join(root, 'backups', space.name);
-  const payload = packBackup(space);
   const snapshot = space.snapshot();
-  delete snapshot.createdAt;
-  const snapshotHash = hash(JSON.stringify(snapshot));
+  const { createdAt, ...content } = snapshot;
+  const snapshotHash = hash(JSON.stringify(content));
   if (last && JSON.parse(last.value).hash === snapshotHash) return;
   mkdirSync(directory, { recursive: true });
   const filename = `backup-${day}-${randomUUID()}.json`;
-  atomicFile(join(directory, filename), payload);
+  atomicFile(join(directory, filename), packSnapshot(snapshot));
   space.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
     .run('backup', JSON.stringify({ day, hash: snapshotHash, filename }));
   const files = readdirSync(directory).filter(name => /^backup-\d{4}-\d{2}-\d{2}-[a-f0-9-]{36}\.json$/.test(name)).sort().reverse();

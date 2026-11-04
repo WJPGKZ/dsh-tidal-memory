@@ -4,10 +4,9 @@ import { DEFAULTS, requireValue } from './src/model.js';
 
 const { default: z } = await hostModule('@deepseek-ai/schemastery');
 const { defineTool } = await hostModule('@deepseek-ai/dsh-tools');
-const { createUserMessage } = await hostModule('@deepseek-ai/dsh-llm');
 const { resolveDshHome } = await hostModule('@deepseek-ai/dsh-home-paths');
 export const name = 'dsh-tidal-memory';
-export const inject = ['agents', 'sessions', 'systemPrompt', 'tools', 'settings', 'webServer', 'connection', 'llm'];
+export const inject = ['agents', 'sessions', 'systemPrompt', 'tools', 'settings', 'webServer', 'connection'];
 export const provide = ['tidalMemory'];
 const integer = (value, min, max, description) => z.number().step(1).min(min).max(max).default(value).volatile().description(description);
 export const Config = z.object({
@@ -16,20 +15,22 @@ export const Config = z.object({
   bindings: z.array(z.object({ cwd: z.string(), space: z.string() })).default([]).volatile().description('显式绑定工作区与空间，不自动共享其他工作区。'),
   tokenBudget: integer(DEFAULTS.tokenBudget, 256, 12000, '记忆上下文预算（使用 UTF-8 字节保守估算）。'),
   maxRecall: integer(DEFAULTS.maxRecall, 1, 20, '每次自动召回最多条数。'),
+  minScore: z.number().min(0).max(1).default(DEFAULTS.minScore).volatile().description('最低相关性分数；不是事实可信度。'),
+  relativeFloor: z.number().min(0).max(1).default(DEFAULTS.relativeFloor).volatile().description('相对最高相关性分数的最低比例。'),
+  autoCandidates: z.boolean().default(DEFAULTS.autoCandidates).volatile().description('自动记录用户的偏好/约定、决策、技术事实和纠正并参与召回；不需要逐条审核，不代表事实已经核实。'),
+  captureAssistant: z.boolean().default(DEFAULTS.captureAssistant).volatile().description('保存助手全文至短期 L0；默认关闭，助手文本不自动生成已确认记忆。'),
   halfLifeDays: integer(DEFAULTS.halfLifeDays, 1, 3650, '情景记忆基础半衰期（天）。'),
   bufferHours: integer(DEFAULTS.bufferHours, 1, 720, '已处理缓冲保留小时数。'),
   idleMinutes: integer(DEFAULTS.idleMinutes, 1, 1440, '后台整理要求的空闲分钟数。'),
-  captureBatch: integer(DEFAULTS.captureBatch, 1, 100, '每批提炼的用户消息目标数。'),
-  autoExtract: z.boolean().default(false).volatile().description('允许后台调用当前会话模型提炼候选，会发送选中的对话片段并消耗模型额度。'),
-  maxModelCallsPerDay: integer(DEFAULTS.maxModelCallsPerDay, 0, 50, '每空间每天最多后台模型调用次数（UTC）。'),
-  maxModelOutputTokens: integer(DEFAULTS.maxModelOutputTokens, 256, 8192, '每次提炼模型输出上限。'),
-  autoBackup: z.boolean().default(true).volatile().description('自动创建不含私人日记的本地备份。'),
+  injectContext: z.boolean().default(DEFAULTS.injectContext).volatile()
+    .description('自动附加普通记忆到当前聊天请求；关闭不禁止模型主动调用记忆工具。'),
+  autoBackup: z.boolean().default(true).volatile().description('自动备份 L1-L3，不含 L0、来源摘录和私人日记；旧备份不会自动清理。'),
   backupKeep: integer(DEFAULTS.backupKeep, 1, 90, '每空间保留的自动恢复点数量。'),
   privateWriters: z.array(z.string()).default([]).volatile().description('允许写私人记录的插件名称。第一版不自动生成私人日记。'),
 });
 
 export function apply(ctx, rawConfig = {}) {
-  const runtime = new TidalRuntime(ctx, rawConfig, resolveDshHome(), createUserMessage);
+  const runtime = new TidalRuntime(ctx, rawConfig, resolveDshHome());
   ctx.effect(() => () => runtime.close());
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler: (req, res) => runtime.handle(req, res) }));
   ctx.on('session/event', (session, event) => runtime.onEvent(session, event), { global: true });
@@ -42,11 +43,13 @@ export function apply(ctx, rawConfig = {}) {
   const text = description => ({ type: 'string', description, required: true });
   const definitions = [
     {
-      name: 'tidal_remember', description: '提交当前工作区共享的记忆候选；候选不等于已确认事实。会话只作为来源。',
+      name: 'tidal_remember', description: '自动保存当前工作区共享的记忆并供后续召回，工具写入标为未核实推断。只记录有用信息，不记录凭据或私人日记；会话只作为来源。',
       parameters: { text: text('要记住的内容'), layer: { type: 'string', enum: ['L1', 'L2', 'L3'], required: true } },
       execute: async (args, exec) => {
-        const { store, actor } = runtime.forAgent(exec.agent);
-        return store.create({ text: args.text, layer: args.layer, category: args.layer === 'L1' ? 'task' : 'event' }, actor);
+        const { store, actor, space } = runtime.forAgent(exec.agent);
+        const result = store.create({ text: args.text, layer: args.layer, category: args.layer === 'L1' ? 'task' : 'event' }, actor);
+        runtime.invalidateSpace(space);
+        return result;
       },
     },
     {
@@ -63,15 +66,18 @@ export function apply(ctx, rawConfig = {}) {
       execute: async (args, exec) => {
         const { store, actor } = runtime.forAgent(exec.agent);
         const record = store.get(args.id, actor);
-        return { id: record.id, sources: record.sources, occurredAt: record.occurredAt, kind: record.kind };
+        return { id: record.id, sources: record.sources, occurredAt: record.occurredAt,
+          kind: record.kind, horizon: record.horizon, taskKey: record.taskKey };
       },
     },
     {
-      name: 'tidal_correct', description: '修改当前工作区的共享候选。已经确认的记忆必须在管理页纠正。',
+      name: 'tidal_correct', description: '修订当前工作区中未人工确认、未保护的工具推断，保留修订历史；不能改写用户原话或手工记录。',
       parameters: { id: text('记忆 ID'), text: text('修订正文'), revision: { type: 'integer', required: true } },
       execute: async (args, exec) => {
-        const { store, actor } = runtime.forAgent(exec.agent);
-        return store.update(args.id, { text: args.text }, args.revision, actor);
+        const { store, actor, space } = runtime.forAgent(exec.agent);
+        const result = store.update(args.id, { text: args.text }, args.revision, actor);
+        runtime.invalidateSpace(space);
+        return result;
       },
     },
   ];
@@ -81,7 +87,12 @@ export function apply(ctx, rawConfig = {}) {
     forAgent(agent) {
       const access = () => runtime.forAgent(agent);
       return Object.freeze({
-        proposeMemory: input => { const { store, actor } = access(); return store.create(input, actor); },
+        proposeMemory: input => {
+          const { store, actor, space } = access();
+          const result = store.create(input, actor);
+          runtime.invalidateSpace(space);
+          return result;
+        },
         recall: query => { const { store, actor } = access(); return store.recall(query, actor); },
       });
     },

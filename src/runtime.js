@@ -3,7 +3,6 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemorySpace } from './store.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
-import { extractBatch } from './extraction.js';
 import { bindingFor, configOf, MemoryError, requireValue, slug, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
@@ -13,23 +12,24 @@ const textOf = message => (message?.content ?? []).filter(block => block.type ==
   .map(block => block.text).join('\n').toWellFormed();
 
 export class TidalRuntime {
-  constructor(ctx, rawConfig, home, createUserMessage) {
+  constructor(ctx, rawConfig, home) {
     this.ctx = ctx;
     this.rawConfig = rawConfig;
+    const legacyAutoExtract = rawConfig?.autoExtract;
+    this.legacyModelExtractionIgnored = (legacyAutoExtract && typeof legacyAutoExtract.get === 'function'
+      ? legacyAutoExtract.get() : legacyAutoExtract) === true;
     this.config = configOf(rawConfig);
     this.root = resolve(this.config.dataRoot || join(home, 'tidal-memory'));
-    this.createUserMessage = createUserMessage;
     this.spaces = new Map();
+    this.spaceErrors = new Map();
     this.plans = new Map();
     this.sessions = new Map();
-    this.controllers = new Set();
     this.jobs = new Set();
     this.lastActivity = Date.now();
     this.workspaceActivity = new Map();
     this.disposed = false;
     this.lastError = null;
     this.busy = false;
-    this.space('default');
   }
   syncConfig() {
     const config = configOf(this.rawConfig);
@@ -37,16 +37,23 @@ export class TidalRuntime {
     const changed = JSON.stringify(config) !== JSON.stringify(this.config);
     this.config = config;
     for (const store of this.spaces.values()) store.setConfig(config);
-    if (changed) {
-      for (const state of this.sessions.values()) state.context = null;
-      for (const controller of this.controllers) controller.abort(new Error('Memory configuration changed'));
-    }
+    if (changed) for (const state of this.sessions.values()) state.context = null;
     return this.config;
   }
   space(name) {
     slug(name);
     requireValue(!this.disposed, 'CLOSED', '插件已停止。', 503);
-    if (!this.spaces.has(name)) this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config }));
+    if (!this.spaces.has(name)) {
+      try {
+        this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config }));
+        this.spaceErrors.delete(name);
+      } catch (error) {
+        this.spaceErrors.set(name, { code: error.code ?? 'OPEN_FAILED',
+          message: error instanceof MemoryError ? error.message : '空间无法打开，请检查数据目录。',
+          at: new Date().toISOString() });
+        throw error;
+      }
+    }
     return this.spaces.get(name);
   }
   names() {
@@ -63,7 +70,12 @@ export class TidalRuntime {
     requireValue(agent.session.header.origin !== 'subagent', 'SUBAGENT_SCOPE', '第一版不向子代理开放跨会话记忆。', 403);
     const binding = bindingFor(this.config, agent.session.header.cwd);
     requireValue(binding, 'UNBOUND_WORKSPACE', '当前工作区未绑定记忆空间，请在设置中绑定。', 403);
-    return { store: this.space(binding.space), actor: { sessionId: agent.id } };
+    return { store: this.space(binding.space), actor: { sessionId: agent.id }, space: binding.space };
+  }
+  invalidateSpace(name) {
+    for (const state of this.sessions.values()) {
+      if (state.space === name) state.context = null;
+    }
   }
   noteError(code, message) {
     this.lastError = { code, message, at: new Date().toISOString() };
@@ -78,9 +90,10 @@ export class TidalRuntime {
       if (!binding) return;
       let state = this.sessions.get(session.id);
       if (!state) {
-        state = { query: '', context: null, turn: null, lastSeen: Date.now() };
+        state = { query: '', context: null, turn: null, lastSeen: Date.now(), space: binding.space };
         this.sessions.set(session.id, state);
       }
+      state.space = binding.space;
       state.lastSeen = Date.now();
       this.lastActivity = state.lastSeen;
       this.workspaceActivity.set(binding.space, state.lastSeen);
@@ -90,12 +103,14 @@ export class TidalRuntime {
       if (!message) return;
       if (event.type === 'user/message' && message.source?.kind !== 'user') return;
       if (event.type === 'assistant/message' && event.data.interrupted) return;
+      if (message.role === 'assistant' && !this.config.captureAssistant) return;
       const text = textOf(message);
       if (!text.trim()) return;
       if (text.length > 16000) {
         this.noteError('CAPTURE_TOO_LARGE', '一条消息超过缓冲上限，未保存；原文仍由 DSH 管理。');
         return;
       }
+      if (message.role === 'user') { state.query = text; state.context = null; }
       const store = this.space(binding.space);
       const source = store.capture({
         sessionId: session.id, eventId: event.seq, text, role: message.role,
@@ -104,12 +119,7 @@ export class TidalRuntime {
       if (message.role === 'user') {
         state.query = text;
         state.context = null;
-        const explicit = text.match(/^(?:请)?(?:记住|记一下|remember)\s*[:：,，]?\s+([\s\S]+)$/i) ??
-          text.match(/^(?:请)?(?:记住|记一下)[:：]([\s\S]+)$/);
-        if (explicit && explicit[1].trim()) {
-          store.promote(source.id, { layer: 'L3', text: explicit[1].trim(), category: 'knowledge',
-            kind: 'user_statement', status: 'active' }, ADMIN);
-        }
+        if (store.organizePending(1, source.id).organized) this.invalidateSpace(binding.space);
       }
     } catch (error) {
       this.noteError(error.code ?? 'CAPTURE_FAILED', '记忆捕获未完成，请在管理页检查。');
@@ -119,42 +129,23 @@ export class TidalRuntime {
     try {
       this.syncConfig();
       if (!this.config.enabled || !agent?.session || agent.session.header.origin === 'subagent') return '';
+      if (!this.config.injectContext) return '';
       if (!bindingFor(this.config, agent.session.header.cwd)) return '';
-      const { store, actor } = this.forAgent(agent);
+      const { store, actor, space } = this.forAgent(agent);
       let state = this.sessions.get(agent.id);
       if (!state) {
         const events = agent.session.snapshotEvents();
         const last = [...events].reverse().find(e => e.type === 'user/message' && e.data.source?.kind === 'user');
-        state = { query: last ? textOf(last.data) : '', context: null, turn: null, lastSeen: Date.now() };
+        state = { query: last ? textOf(last.data) : '', context: null, turn: null, lastSeen: Date.now(), space };
         this.sessions.set(agent.id, state);
       }
+      state.space = space;
       if (state.context === null) state.context = store.recall(state.query, actor).text;
       return state.context;
     } catch (error) {
       this.noteError(error.code ?? 'RECALL_FAILED', '记忆召回不可用，不应声称已经读取历史。');
       return '[潮汐记忆暂不可用：请勿声称已检索到历史记录。]';
     }
-  }
-  async generate(agent, system, prompt, signal) {
-    const route = agent.session.requestHeader()?.config;
-    requireValue(route?.provider && route?.model && this.ctx.llm, 'MODEL_UNAVAILABLE', '会话尚无可用模型路由。', 503);
-    const blocks = new Map();
-    let usage, finish;
-    const request = {
-      provider: route.provider, model: route.model, system,
-      messages: [this.createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })],
-      maxTokens: this.config.maxModelOutputTokens, tools: [], signal, sessionId: agent.id,
-    };
-    for await (const chunk of this.ctx.llm.stream(request)) {
-      signal.throwIfAborted();
-      if (chunk.type === 'text-delta') blocks.set(chunk.index, (blocks.get(chunk.index) ?? '') + chunk.text);
-      if (chunk.type === 'block-end' && chunk.block.type === 'text') blocks.set(chunk.index, chunk.block.text);
-      if (chunk.type === 'usage') usage = chunk.usage;
-      if (chunk.type === 'finish') finish = chunk.reason;
-    }
-    requireValue(finish === 'stop', 'EXTRACTION_INCOMPLETE', '提炼输出未正常结束，候选未写入。');
-    const text = [...blocks].sort(([a], [b]) => a - b).map(([, value]) => value).join('');
-    return { text, usage };
   }
   async tick(force = false, selectedSpace) {
     if (this.disposed || this.busy) return { busy: true };
@@ -173,38 +164,19 @@ export class TidalRuntime {
         if (!force && Date.now() - (this.workspaceActivity.get(name) ?? this.lastActivity) < this.config.idleMinutes * 60000) {
           results.push({ space: name, waiting: true }); continue;
         }
-        const store = this.space(name);
-        results.push({ space: name, ...store.maintenance() });
-        if (this.config.autoExtract) {
-          const pending = store.db('L0').prepare("SELECT data FROM memories WHERE status='pending' ORDER BY created_at,id LIMIT 200")
-            .all().map(row => JSON.parse(row.data));
-          const routeAgent = agents.find(agent => agent.session.requestHeader()?.config?.model);
-          if (pending.length && routeAgent) {
-            const records = [], limit = 24000;
-            let size = 0, users = 0;
-            for (const record of pending) {
-              if ((record.source.role === 'user' && users >= this.config.captureBatch) || size + record.text.length > limit) break;
-              records.push(record); size += record.text.length; users += Number(record.source.role === 'user');
-            }
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(new Error('Extraction timeout')), 90000);
-            this.controllers.add(controller);
-            try {
-              results.push(await extractBatch(store, records,
-                (system, prompt, signal) => this.generate(routeAgent, system, prompt, signal),
-                controller.signal));
-            } catch (error) {
-              store.logError(error.code ?? 'EXTRACTION_FAILED', '提炼未完成；来源保留，可在修复后重试。');
-              this.noteError(error.code ?? 'EXTRACTION_FAILED', '后台提炼未完成，来源保留。');
-            } finally {
-              clearTimeout(timeout);
-              this.controllers.delete(controller);
-            }
-          }
+        let store;
+        try { store = this.space(name); } catch (error) {
+          if (error.code !== 'SPACE_BUSY') throw error;
+          this.noteError(error.code, error.message);
+          results.push({ space: name, unavailable: true, error: this.spaceErrors.get(name) });
+          continue;
         }
+        const maintenance = store.maintenance();
+        const localOrganization = store.organizePending();
+        this.invalidateSpace(name);
+        results.push({ space: name, ...maintenance, localOrganization });
         if (this.config.autoBackup) automaticBackup(store, this.root);
       }
-      for (const state of this.sessions.values()) state.context = null;
       return { results };
     } finally { this.busy = false; }
   }
@@ -224,9 +196,15 @@ export class TidalRuntime {
     this.syncConfig();
     const spaceName = slug(query.get('space') ?? 'default');
     if (method === 'GET' && path === '/status') {
-      return { version: '0.1.0', root: this.root, spaces: this.names(), ...this.space(spaceName).status(),
-        config: this.config, settingsRevision: this.descriptor()?.revision ?? null, busy: this.busy,
-        error: this.lastError,
+      let details;
+      try { details = this.space(spaceName).status(); } catch (error) {
+        if (error.code !== 'SPACE_BUSY') throw error;
+        details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
+      }
+      return { version: '0.2.0', root: this.root, spaces: this.names(), ...details,
+        config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
+        settingsRevision: this.descriptor()?.revision ?? null, busy: this.busy,
+        error: this.lastError, spaceErrors: Object.fromEntries(this.spaceErrors),
         sessions: [...this.ctx.agents.list()].filter(a => a.session.header.origin !== 'subagent')
           .map(a => ({ id: a.id, cwd: a.session.header.cwd ?? '', status: a.status })) };
     }
@@ -253,20 +231,44 @@ export class TidalRuntime {
       layer: query.get('layer') || undefined, status: query.get('status') || undefined,
       query: query.get('q') ?? '', offset: Number(query.get('offset') ?? 0), limit: 50,
     }, ADMIN);
-    if (method === 'POST' && path === '/memories') return store.create(body, ADMIN);
-    if (method === 'POST' && path === '/update') return store.update(body.id, body.patch, body.revision, ADMIN);
-    if (method === 'POST' && path === '/promote') return store.promote(body.id, body.target, ADMIN);
+    if (method === 'POST' && path === '/memories') {
+      const result = store.create(body, ADMIN);
+      this.invalidateSpace(spaceName);
+      return result;
+    }
+    if (method === 'POST' && path === '/update') {
+      const result = store.update(body.id, body.patch, body.revision, ADMIN);
+      this.invalidateSpace(spaceName);
+      return result;
+    }
+    if (method === 'POST' && path === '/promote') {
+      const result = store.promote(body.id, body.target, ADMIN);
+      this.invalidateSpace(spaceName);
+      return result;
+    }
     if (method === 'POST' && path === '/forget') {
       requireValue(body.confirmation === 'DELETE', 'CONFIRMATION_REQUIRED', '请输入 DELETE 确认删除。');
-      return store.forget(body.id, ADMIN);
+      const result = store.forget(body.id, ADMIN);
+      this.invalidateSpace(spaceName);
+      return result;
     }
-    if (method === 'POST' && path === '/confirm') return store.reinforce(body.id, `ui:${randomUUID()}`, ADMIN);
+    if (method === 'POST' && path === '/confirm') {
+      const result = store.reinforce(body.id, `ui:${randomUUID()}`, ADMIN);
+      this.invalidateSpace(spaceName);
+      return result;
+    }
     if (method === 'GET' && path === '/history') return store.revisions(query.get('id'), ADMIN);
     if (method === 'GET' && path === '/evidence') return store.get(query.get('id'), ADMIN).sources;
     if (method === 'GET' && path === '/traces') return store.traces(ADMIN);
     if (method === 'POST' && path === '/recall') return store.recall(body.query, ADMIN, { includeArchived: body.includeArchived === true });
     if (method === 'POST' && path === '/maintenance') return this.requestMaintenance(true, spaceName);
-    if (method === 'POST' && path === '/rebuild') { store.rebuildViews(); return { rebuilt: true }; }
+    if (method === 'POST' && (path === '/rebuild' || path === '/rebuild/search')) {
+      const result = store.rebuildSearch();
+      if (path === '/rebuild') store.rebuildViews();
+      this.invalidateSpace(spaceName);
+      return result;
+    }
+    if (method === 'POST' && path === '/rebuild/views') { store.rebuildViews(); return { rebuilt: true }; }
     if (method === 'GET' && path === '/private') return store.privateStatus();
     if (method === 'POST' && path === '/private/clear') return store.clearPrivate(ADMIN, body.confirmation);
     if (method === 'POST' && path === '/backup') return { filename: `tidal-${spaceName}-${Date.now()}.${body.password ? 'encrypted' : 'json'}`,
@@ -284,6 +286,7 @@ export class TidalRuntime {
       requireValue(plan && plan.expires >= Date.now() && plan.space === spaceName, 'PREVIEW_EXPIRED', '预览已过期或空间已切换，请重新预览。', 409);
       const result = applyImport(store, plan, body.selected);
       this.plans.delete(body.id);
+      this.invalidateSpace(spaceName);
       return result;
     }
     throw new MemoryError('NOT_FOUND', '没有此接口。', 404);
@@ -328,7 +331,6 @@ export class TidalRuntime {
   }
   async close() {
     this.disposed = true;
-    for (const controller of this.controllers) controller.abort(new Error('Plugin disposed'));
     await Promise.allSettled([...this.jobs]);
     for (const store of this.spaces.values()) store.close();
     this.spaces.clear();
