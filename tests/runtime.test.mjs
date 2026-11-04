@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TidalRuntime, recallQuery } from '../src/runtime.js';
 import { MAX_RECALL_QUERY_LENGTH, MemoryError } from '../src/model.js';
+import { MemorySpace } from '../src/store.js';
+import { automaticBackup, unpackBackup } from '../src/transfer.js';
 
-function fixture(t, overrides = {}) {
+function fixture(t, overrides = {}, runtimeOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tidal-runtime-'));
   const cwd = join(root, 'workspace');
   const config = { dataRoot: root, autoExtract: true, autoBackup: false,
@@ -20,7 +22,7 @@ function fixture(t, overrides = {}) {
     settings: { describe: () => [] }, logger: { warn() {} },
     llm: { stream: () => { modelCalls++; throw new Error('Memory must not call an LLM'); } },
   };
-  const runtime = new TidalRuntime(ctx, config, root);
+  const runtime = new TidalRuntime(ctx, config, root, runtimeOptions);
   t.after(async () => { await runtime.close(); rmSync(root, { recursive: true, force: true }); });
   return { runtime, ctx, agent, agents, config, root, cwd, modelCalls: () => modelCalls };
 }
@@ -34,6 +36,145 @@ test('maintenance uses local rules and never calls the configured model', async 
   assert.equal(store.all().find(r => r.text === '这次任务先不改数据库').layer, 'L1');
   assert.equal(runtime.legacyModelExtractionIgnored, true);
   assert.equal(modelCalls(), 0);
+});
+
+test('daily deep consolidation runs once after the scheduled local time and catches up missed schedules', async t => {
+  const { runtime } = fixture(t, { dailyConsolidateAt: '03:00' });
+  const store = runtime.space('shared');
+  for (const [eventId, day, text] of [
+    ['1', '01', '我更喜欢简洁的回答。'],
+    ['2', '02', '我偏好简明的答复。'],
+  ]) {
+    store.capture({ sessionId: 's', eventId, role: 'user', at: `2026-03-${day}T12:00:00Z`, text });
+  }
+  store.organizePending();
+  runtime.clock = () => new Date('2026-03-03T04:00:00');
+  runtime.lastActivity = runtime.clock().getTime() - 21 * 60000;
+  const first = await runtime.checkDailyConsolidation();
+  assert.equal(first.results[0].promoted, 1);
+  assert.equal(first.results[0].missed, true);
+  assert.equal((await runtime.checkDailyConsolidation()).results[0].alreadyRun, true);
+  runtime.rawConfig.dailyConsolidateAt = '';
+  assert.equal((await runtime.checkDailyConsolidation()).disabled, true);
+});
+
+test('daily scheduling uses local dates, waits for idle, and persists completion across restart', async t => {
+  let now = new Date(2026, 2, 4, 3, 0);
+  const { runtime, ctx, config, root, agent, modelCalls } = fixture(t, {}, { clock: () => now });
+  assert.equal((await runtime.checkDailyConsolidation()).results[0].waiting, true);
+  runtime.lastActivity -= 21 * 60000;
+  agent.status = 'running';
+  assert.equal((await runtime.checkDailyConsolidation()).results[0].waitingForConversation, true);
+  agent.status = 'idle';
+  runtime.busy = true;
+  assert.equal((await runtime.checkDailyConsolidation()).busy, true);
+  runtime.busy = false;
+  const result = await runtime.checkDailyConsolidation();
+  assert.equal(result.results[0].day, '2026-03-04');
+  assert.equal(result.results[0].missed, false);
+  assert.ok(result.results[0].backup);
+  const query = new URLSearchParams({ space: 'shared' });
+  const status = await runtime.api('GET', '/status', query);
+  assert.equal(status.nextDailyConsolidationAt, new Date(2026, 2, 5, 3, 0).toISOString());
+  now = new Date(2026, 2, 5, 1, 0);
+  assert.equal((await runtime.checkDailyConsolidation()).results[0].alreadyRun, true);
+  await runtime.close();
+  const restarted = new TidalRuntime(ctx, config, root, { clock: () => now });
+  try {
+    restarted.lastActivity -= 21 * 60000;
+    assert.equal((await restarted.checkDailyConsolidation()).results[0].alreadyRun, true);
+    now = new Date(2026, 2, 5, 3, 0);
+    assert.equal((await restarted.checkDailyConsolidation()).results[0].day, '2026-03-05');
+  } finally { await restarted.close(); }
+  assert.equal(modelCalls(), 0);
+});
+
+test('startup before 03:00 catches up only the most recent missed day and disabled settings stay off', async t => {
+  const now = new Date(2026, 2, 8, 1, 0);
+  const { runtime, config } = fixture(t, {}, { clock: () => now });
+  runtime.lastActivity -= 21 * 60000;
+  const result = await runtime.checkDailyConsolidation();
+  assert.equal(result.results[0].day, '2026-03-07');
+  assert.equal(result.results[0].missed, true);
+  assert.equal(runtime.space('shared').system.prepare("SELECT count(*) AS n FROM metadata WHERE key LIKE 'daily-consolidation:%'").get().n, 1);
+  config.enabled = false;
+  assert.equal((await runtime.checkDailyConsolidation()).disabled, true);
+  assert.equal((await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }))).nextDailyConsolidationAt, null);
+});
+
+test('manual runs make fresh retained recovery points, drain pending capture, and leave the private journal untouched', async t => {
+  const { runtime, root, agent, modelCalls } = fixture(t, { backupKeep: 1, privateWriters: ['test-author'] });
+  const store = runtime.space('shared');
+  store.appendPrivate('test-author', 'PRIVATE_DEEP_CANARY');
+  const journal = store.privateDb.prepare('SELECT * FROM entries').all();
+  automaticBackup(store, root);
+  store.capture({ sessionId: 's', eventId: '1', text: '我喜欢简短的回答。', at: '2026-03-01T10:00:00Z' });
+  store.capture({ sessionId: 's', eventId: '2', text: '我偏好简明的答复。', at: '2026-03-02T10:00:00Z' });
+  const saved = store.create({ layer: 'L2', text: 'new since ordinary backup' }, { admin: true });
+  const query = new URLSearchParams({ space: 'shared' });
+  agent.status = 'running';
+  await assert.rejects(runtime.api('POST', '/consolidate', query, {}), { code: 'CONVERSATION_BUSY' });
+  agent.status = 'idle';
+  const result = await runtime.api('POST', '/consolidate', query, {});
+  assert.equal(result.localOrganization.inspected, 2);
+  assert.equal(result.promoted, 1);
+  assert.equal(store.dailyConsolidationStatus(), null);
+  assert.equal(store.status().deepConsolidation.manual, true);
+  const file = join(root, 'backups', 'shared', result.backup);
+  assert.ok(existsSync(file));
+  const text = readFileSync(file, 'utf8');
+  const before = unpackBackup(text);
+  assert.ok(before.records.some(record => record.id === saved.id));
+  assert.equal(before.records.some(record => record.layer === 'L3'), false);
+  assert.equal(text.includes('PRIVATE_DEEP_CANARY'), false);
+  const second = await runtime.api('POST', '/consolidate', query, {});
+  assert.notEqual(result.backup, second.backup);
+  assert.deepEqual(readdirSync(join(root, 'backups', 'shared')), [second.backup]);
+  assert.deepEqual(store.privateDb.prepare('SELECT * FROM entries').all(), journal);
+  assert.equal(modelCalls(), 0);
+});
+
+test('a failed daily run leaves no completion marker and retries with recovery after the failure', async t => {
+  const now = new Date(2026, 2, 4, 4, 0);
+  const { runtime } = fixture(t, {}, { clock: () => now });
+  runtime.lastActivity -= 21 * 60000;
+  const store = runtime.space('shared');
+  for (const day of ['01', '02']) store.capture({ sessionId: 's', eventId: day,
+    text: '我喜欢简短回答。', at: `2026-03-${day}T10:00:00Z` });
+  store.failpoint = name => { if (name === 'after-consolidation-prepare') throw new Error('injected failure'); };
+  assert.equal((await runtime.checkDailyConsolidation()).results[0].failed, true);
+  assert.equal(store.dailyConsolidationStatus(), null);
+  assert.equal(runtime.busy, false);
+  store.failpoint = () => {};
+  const retried = await runtime.checkDailyConsolidation();
+  assert.equal(retried.results[0].day, '2026-03-04');
+  assert.equal(store.all().filter(record => record.layer === 'L3').length, 1);
+  assert.equal(runtime.lastError, null);
+});
+
+test('a failed recovery point prevents organizing pending records or marking a day complete', async t => {
+  const { runtime, root } = fixture(t);
+  const store = runtime.space('shared');
+  const source = store.capture({ sessionId: 's', eventId: '1', text: '我喜欢简短回答。' });
+  writeFileSync(join(root, 'backups'), 'synthetic obstruction');
+  await assert.rejects(runtime.api('POST', '/consolidate', new URLSearchParams({ space: 'shared' }), {}));
+  assert.equal(store.get(source.id, { admin: true }).status, 'pending');
+  assert.equal(store.all().filter(record => record.layer !== 'L0').length, 0);
+  assert.equal(store.dailyConsolidationStatus(), null);
+  assert.equal(runtime.busy, false);
+});
+
+test('status remains available under writer contention without opening the space a second time', async t => {
+  const { runtime, root } = fixture(t);
+  const owner = new MemorySpace(root, 'shared');
+  try {
+    const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
+    assert.equal(status.unavailable, true);
+    assert.equal(status.spaceError.code, 'SPACE_BUSY');
+    assert.equal(status.dailyConsolidation, null);
+    assert.equal(status.nextDailyConsolidationAt, null);
+  } finally { owner.close(); }
+  assert.equal((await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }))).space, 'shared');
 });
 
 test('remembering through a session automatically saves explicit and unspecified horizons', t => {

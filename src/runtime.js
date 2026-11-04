@@ -15,11 +15,29 @@ export function recallQuery(text) {
   const half = Math.floor((MAX_RECALL_QUERY_LENGTH - 1) / 2);
   return `${text.slice(0, half)}\n${text.slice(-(MAX_RECALL_QUERY_LENGTH - half - 1))}`.toWellFormed();
 }
+const dateKey = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+function scheduledAt(date, time) {
+  const [hours, minutes] = time.split(':').map(Number);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), hours, minutes, 0, 0);
+}
+function latestScheduledAt(date, time) {
+  const day = new Date(date);
+  if (date < scheduledAt(day, time)) day.setDate(day.getDate() - 1);
+  return scheduledAt(day, time);
+}
+function nextScheduledAt(date, time, lastDay) {
+  const due = latestScheduledAt(date, time);
+  if (!lastDay || lastDay < dateKey(due)) return due.toISOString();
+  const nextDay = new Date(`${lastDay}T12:00:00`);
+  nextDay.setDate(nextDay.getDate() + 1);
+  return scheduledAt(nextDay, time).toISOString();
+}
 
 export class TidalRuntime {
-  constructor(ctx, rawConfig, home) {
+  constructor(ctx, rawConfig, home, { clock = () => new Date() } = {}) {
     this.ctx = ctx;
     this.rawConfig = rawConfig;
+    this.clock = clock;
     const legacyAutoExtract = rawConfig?.autoExtract;
     this.legacyModelExtractionIgnored = (legacyAutoExtract && typeof legacyAutoExtract.get === 'function'
       ? legacyAutoExtract.get() : legacyAutoExtract) === true;
@@ -30,7 +48,7 @@ export class TidalRuntime {
     this.plans = new Map();
     this.sessions = new Map();
     this.jobs = new Set();
-    this.lastActivity = Date.now();
+    this.lastActivity = this.clock().getTime();
     this.workspaceActivity = new Map();
     this.disposed = false;
     this.lastError = null;
@@ -52,7 +70,7 @@ export class TidalRuntime {
     requireValue(!this.disposed, 'CLOSED', '插件已停止。', 503);
     if (!this.spaces.has(name)) {
       try {
-        this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config }));
+        this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config, clock: () => this.clock().getTime() }));
         this.spaceErrors.delete(name);
       } catch (error) {
         this.spaceErrors.set(name, { code: error.code ?? 'OPEN_FAILED',
@@ -100,7 +118,7 @@ export class TidalRuntime {
         if (text.trim()) recent.unshift({ seq: event.seq, text: recallQuery(text) });
       }
       state = { recent, query: recent.at(-1)?.text ?? '', evidenceId: recent.at(-1)?.seq,
-        context: null, turn: null, lastSeen: Date.now(), space };
+        context: null, turn: null, lastSeen: this.clock().getTime(), space };
       this.sessions.set(session.id, state);
     }
     return state;
@@ -120,7 +138,7 @@ export class TidalRuntime {
       if (!binding) return;
       const state = this.sessionState(session, binding.space);
       state.space = binding.space;
-      state.lastSeen = Date.now();
+      state.lastSeen = this.clock().getTime();
       this.lastActivity = state.lastSeen;
       this.workspaceActivity.set(binding.space, state.lastSeen);
       if (event.type === 'turn/start') { state.context = null; state.turn = event.data.turn; }
@@ -197,7 +215,7 @@ export class TidalRuntime {
         if (agents.some(agent => agent.status === 'running')) {
           results.push({ space: name, waitingForConversation: true }); continue;
         }
-        if (!force && Date.now() - (this.workspaceActivity.get(name) ?? this.lastActivity) < this.config.idleMinutes * 60000) {
+        if (!force && this.clock().getTime() - (this.workspaceActivity.get(name) ?? this.lastActivity) < this.config.idleMinutes * 60000) {
           results.push({ space: name, waiting: true }); continue;
         }
         let store;
@@ -224,7 +242,62 @@ export class TidalRuntime {
     return job;
   }
   scheduleTick() {
-    this.requestMaintenance().catch(error => this.noteError(error.code ?? 'MAINTENANCE_FAILED', '后台维护失败，请检查数据目录和设置。'));
+    if (this.disposed) return;
+    const job = this.checkDailyConsolidation().then(() => this.requestMaintenance());
+    this.jobs.add(job);
+    job.then(() => this.jobs.delete(job), error => {
+      this.jobs.delete(job);
+      this.noteError(error.code ?? 'MAINTENANCE_FAILED', '后台维护失败，请检查数据目录和设置。');
+    });
+    return job;
+  }
+  async checkDailyConsolidation(now = this.clock()) {
+    if (this.disposed || this.busy) return { busy: true };
+    this.syncConfig();
+    const time = this.config.dailyConsolidateAt;
+    if (!this.config.enabled || !time) return { disabled: true };
+    const due = latestScheduledAt(now, time);
+    const day = dateKey(due);
+    this.busy = true;
+    try {
+      const results = [];
+      for (const name of this.names()) {
+        let store;
+        try { store = this.space(name); } catch (error) {
+          if (error.code !== 'SPACE_BUSY') throw error;
+          results.push({ space: name, unavailable: true });
+          continue;
+        }
+        if (store.dailyConsolidationStatus()?.day >= day) {
+          results.push({ space: name, alreadyRun: true, day });
+          continue;
+        }
+        const agents = [...this.ctx.agents.list()].filter(agent =>
+          agent.session.header.origin !== 'subagent' &&
+          bindingFor(this.config, agent.session.header.cwd)?.space === name);
+        if (agents.some(agent => agent.status === 'running')) {
+          results.push({ space: name, waitingForConversation: true, day });
+          continue;
+        }
+        if (now.getTime() - (this.workspaceActivity.get(name) ?? this.lastActivity) < this.config.idleMinutes * 60000) {
+          results.push({ space: name, waiting: true, day });
+          continue;
+        }
+        try {
+          const backup = automaticBackup(store, this.root, { force: true });
+          const result = store.dailyConsolidation(day, {
+            missed: now.getTime() - due.getTime() > 60000, backup,
+          });
+          if (this.lastError?.operation === 'consolidation' && this.lastError.space === name) this.lastError = null;
+          results.push({ space: name, ...result });
+        } catch (error) {
+          this.noteError(error.code ?? 'CONSOLIDATION_FAILED', `空间 ${name} 深度整理失败；未记录当日完成，下次检查重试。`,
+            { operation: 'consolidation', space: name });
+          results.push({ space: name, failed: true, error: this.lastError });
+        } finally { this.invalidateSpace(name); }
+      }
+      return { results };
+    } finally { this.busy = false; }
   }
   descriptor() {
     return this.ctx.settings.describe({ redactSecrets: true }).find(row => row.ns === 'tidal-memory');
@@ -238,8 +311,11 @@ export class TidalRuntime {
         if (error.code !== 'SPACE_BUSY') throw error;
         details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
       }
-      return { version: '0.2.1', root: this.root, spaces: this.names(), ...details,
+      return { version: '0.3.0', root: this.root, spaces: this.names(), ...details,
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
+        dailyConsolidation: details.dailyConsolidation ?? null,
+        nextDailyConsolidationAt: this.config.enabled && this.config.dailyConsolidateAt && !details.unavailable ?
+          nextScheduledAt(this.clock(), this.config.dailyConsolidateAt, details.dailyConsolidation?.day) : null,
         settingsRevision: this.descriptor()?.revision ?? null, busy: this.busy,
         error: this.lastError?.space && this.lastError.space !== spaceName ? null : this.lastError,
         spaceErrors: Object.fromEntries(this.spaceErrors),
@@ -300,6 +376,20 @@ export class TidalRuntime {
     if (method === 'GET' && path === '/traces') return store.traces(ADMIN);
     if (method === 'POST' && path === '/recall') return store.recall(body.query, ADMIN, { includeArchived: body.includeArchived === true });
     if (method === 'POST' && path === '/maintenance') return this.requestMaintenance(true, spaceName);
+    if (method === 'POST' && path === '/consolidate') {
+      requireValue(!this.busy, 'MAINTENANCE_BUSY', '整理任务正在运行，请稍后重试。', 409);
+      requireValue(![...this.ctx.agents.list()].some(agent => agent.status === 'running' &&
+        bindingFor(this.config, agent.session.header.cwd)?.space === spaceName),
+      'CONVERSATION_BUSY', '当前空间正在生成回复，请等会话空闲后再整理。', 409);
+      this.busy = true;
+      try {
+        const backup = automaticBackup(store, this.root, { force: true });
+        return store.manualDeepConsolidation(dateKey(this.clock()), { backup });
+      } finally {
+        this.busy = false;
+        this.invalidateSpace(spaceName);
+      }
+    }
     if (method === 'POST' && (path === '/rebuild' || path === '/rebuild/search')) {
       const result = store.rebuildSearch();
       if (path === '/rebuild') store.rebuildViews();

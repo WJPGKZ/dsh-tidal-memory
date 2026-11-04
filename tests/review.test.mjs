@@ -19,12 +19,12 @@ function fixture(t, config = {}) {
 const create = (space, text, extra = {}) => space.create({ layer: 'L3', text, status: 'active', ...extra }, admin);
 const capture = (space, text, eventId = 1) => space.capture({ sessionId: 'a', eventId, text, role: 'user' });
 
-test('four rule families grow recallable memories without a remember prefix, approval or a model', t => {
+test('local rules grow recallable episodes and work memory without a remember prefix, approval or a model', t => {
   const { space } = fixture(t);
   capture(space, '我偏好简短回答。\n我们决定采用 SQLite。\n项目使用 pnpm。\n不对，我用的是 PowerShell。\n这次任务先保持接口不变。');
   assert.equal(space.organizePending().organized, 5);
   const candidates = space.all().filter(r => r.layer !== 'L0');
-  assert.deepEqual(new Set(candidates.map(r => r.source.rule)), new Set(['preference', 'decision', 'fact', 'correction']));
+  assert.deepEqual(new Set(candidates.map(r => r.source.rule)), new Set(['preference', 'decision', 'fact', 'correction', 'active-topic']));
   assert.ok(candidates.every(r => r.status === 'active' && r.text === r.source.excerpt && r.kind === 'user_statement'));
   assert.ok(candidates.some(r => r.layer === 'L1' && r.horizon === 'task'));
   assert.ok(candidates.some(r => r.layer === 'L2'));
@@ -71,7 +71,7 @@ test('automatic correction protects manual corrections and merged user evidence'
   const corrected = space.update(first.id, { text: 'human corrected target' }, first.revision, admin);
   assert.equal(corrected.source.kind, 'manual');
   assert.throws(() => space.update(first.id, { text: 'rewrite' }, corrected.revision, actor), /不能改写/);
-  const other = space.create({ layer: 'L3', text: '项目使用 pnpm。' }, actor);
+  const other = space.create({ layer: 'L2', text: '项目使用 pnpm。', occurredAt: space.now() }, actor);
   capture(space, '项目使用 pnpm。');
   space.organizePending();
   const merged = space.get(other.id, admin);
@@ -136,7 +136,7 @@ test('L0 has no new views or revision copies and never enters new backups', t =>
   space.organizePending();
   assert.deepEqual(readdirSync(join(space.directory, LAYERS.L0.directory, 'views')), []);
   assert.equal(space.db('L0').prepare('SELECT count(*) AS n FROM revisions').get().n, 0);
-  const candidate = space.all().find(r => r.layer === 'L3');
+  const candidate = space.all().find(r => r.layer === 'L2');
   // Simulate old derived provenance that copied the entire source message.
   space.update(candidate.id, { source: { kind: 'derived', parentId: source.id, excerpt: raw } }, candidate.revision, admin);
   for (const password of ['', 'synthetic-password-123']) {

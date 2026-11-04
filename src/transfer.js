@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync, timingSafeEqual, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { atomicFile } from './database.js';
 import { MemorySpace } from './store.js';
@@ -117,22 +117,26 @@ export function restoreBackup(root, name, text, password, config) {
     if (!completed) rmSync(join(root, 'spaces', staging), { recursive: true, force: true });
   }
 }
-export function automaticBackup(space, root) {
+export function automaticBackup(space, root, { force = false } = {}) {
   const day = space.now().slice(0, 10);
   const last = space.system.prepare("SELECT value FROM metadata WHERE key='backup'").get();
-  if (last && JSON.parse(last.value).day === day) return;
+  if (!force && last && JSON.parse(last.value).day === day) return;
   const directory = join(root, 'backups', space.name);
   const snapshot = space.snapshot();
   const { createdAt, ...content } = snapshot;
   const snapshotHash = hash(JSON.stringify(content));
-  if (last && JSON.parse(last.value).hash === snapshotHash) return;
+  if (!force && last && JSON.parse(last.value).hash === snapshotHash) return;
   mkdirSync(directory, { recursive: true });
   const filename = `backup-${day}-${randomUUID()}.json`;
   atomicFile(join(directory, filename), packSnapshot(snapshot));
   space.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
     .run('backup', JSON.stringify({ day, hash: snapshotHash, filename }));
-  const files = readdirSync(directory).filter(name => /^backup-\d{4}-\d{2}-\d{2}-[a-f0-9-]{36}\.json$/.test(name)).sort().reverse();
+  const files = readdirSync(directory).filter(name => /^backup-\d{4}-\d{2}-\d{2}-[a-f0-9-]{36}\.json$/.test(name))
+    .map(name => ({ name, time: statSync(join(directory, name)).mtimeMs }))
+    .sort((a, b) => Number(b.name === filename) - Number(a.name === filename) || b.time - a.time)
+    .map(file => file.name);
   for (const file of files.slice(space.config.backupKeep)) rmSync(join(directory, file));
+  return filename;
 }
 
 const PRIVATE_NAME = /(^|[\\/._ -])(private|私密|私人)([\\/._ -]|$)/i;

@@ -44,6 +44,8 @@ try {
   await page.getByLabel('总预算（UTF-8 字节估算）').fill('48000');
   await page.getByLabel('L3 常驻范围').selectOption('core');
   await page.getByLabel('近期用户消息窗口').fill('4');
+  await page.getByLabel('L1 工作记忆有效时长（小时，0 不自动到期）').fill('48');
+  await page.getByLabel('每日深度整理时间（本机时间，留空关闭）').fill('04:30');
   assert.equal(await page.getByLabel('自动记录并召回用户陈述（本地规则，无需审核）').isChecked(), true);
   assert.equal(await page.getByLabel('额外保存助手全文到短期 L0（默认关闭）').isChecked(), false);
   await page.getByLabel('最低相关性分数').fill('0.5');
@@ -53,7 +55,12 @@ try {
   assert.equal(status.data.config.tokenBudget, 48000);
   assert.equal(status.data.config.residentMode, 'core');
   assert.equal(status.data.config.contextMessages, 4);
+  assert.equal(status.data.config.workingHours, 48);
+  assert.equal(status.data.config.dailyConsolidateAt, '04:30');
   assert.equal(status.data.config.minScore, 0.5);
+  await page.getByRole('button', { name: '立即深度整理一次' }).click();
+  await page.getByRole('status').filter({ hasText: '深度整理完成' }).waitFor();
+  await page.getByText(/上次深度整理：.*手动.*提炼/).waitFor();
   await page.getByRole('button', { name: '重建搜索索引', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '搜索索引已重建' }).waitFor();
   const shared = preview.runtime.space('default').all().find(r => r.text === 'UI 创建的跨会话共享记录');

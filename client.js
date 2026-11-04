@@ -299,6 +299,7 @@ window.__ModuleLoader__.load({
               ['maxRecall', '相关记忆条数（常驻、来源关联另计）', 1, 100],
               ['residentBudget', 'L3 常驻额度（包含在总预算内）', 0, 192000],
               ['contextMessages', '近期用户消息窗口', 1, 10],
+              ['workingHours', 'L1 工作记忆有效时长（小时，0 不自动到期）', 0, 8760],
               ['halfLifeDays', '情景记忆半衰期（天）', 1, 3650],
               ['idleMinutes', '空闲后整理（分钟）', 1, 1440],
               ['bufferHours', '已处理缓冲保留（小时）', 1, 720],
@@ -310,8 +311,19 @@ window.__ModuleLoader__.load({
             ...[['all', '全部有效 L3（默认）'], ['core', '身份、偏好、约定及固定项'], ['pinned', '仅固定项']]
               .map(([value, label]) => h('option', { key: value, value }, label)))),
           h('p', { className: 'muted' }, '常驻不等于已核实；过期、待审核和已被替代的条目不注入。常驻先使用独立额度，但总预算仍是硬上限。近期消息逐条匹配，不用无关内容凑数。'),
-          check('空闲巩固跨日期重复的明确长期陈述', config.autoConsolidate, value => patchConfig('autoConsolidate', value)),
+          check('空闲时执行小整理（纯本地规则）', config.autoConsolidate, value => patchConfig('autoConsolidate', value)),
           check('低重要且未使用的旧 L2 自动归档（保存满八个半衰期，不删除）', config.autoArchive, value => patchConfig('autoArchive', value)),
+          h('div', { className: 'fields' },
+            field('每日深度整理时间（本机时间，留空关闭）', config.dailyConsolidateAt,
+              value => patchConfig('dailyConsolidateAt', value), 'time'),
+            h('div', { className: 'stack' },
+              h('small', null, `上次深度整理：${status.deepConsolidation ?
+                `${new Date(status.deepConsolidation.at).toLocaleString()} · ${status.deepConsolidation.manual ? '手动' : '定时'} · 提炼 ${status.deepConsolidation.promoted} 条` : '尚未运行'}`),
+              h('small', null, `下次预计：${status.nextDailyConsolidationAt ?
+                new Date(status.nextDailyConsolidationAt).toLocaleString() : '已关闭'}`))),
+          h('p', { className: 'muted' }, '深度整理只运行本地确定性规则，不调用模型。宿主运行时每分钟检查；关机或退出期间不运行，下次启动并达到空闲时长后补跑最近一次。待补跑时预计时间会显示已过去的应执行时间。每次整理前另存普通记忆恢复点，不含 L0 和私人日记。L1 时长仅影响此后自动捕获的任务，已有有效期不变。'),
+          button('立即深度整理一次', () => run(() => request(space, '/consolidate', {}),
+            value => `深度整理完成：检查 ${value.inspected} 条，提炼 ${value.promoted} 条，冲突待复核 ${value.conflicts} 条，跳过 ${value.skipped} 组${value.skipped ? '（请查看错误诊断）' : ''}。`)),
           check('自动备份 L1-L3，不含 L0、来源摘录和私人日记', config.autoBackup, value => patchConfig('autoBackup', value)),
           h('div', { className: 'row' }, button('保存设置', saveConfig, 'primary'),
             button('重建搜索索引', () => run(() => request(space, '/rebuild/search', {}), '搜索索引已重建。')),
@@ -357,7 +369,7 @@ window.__ModuleLoader__.load({
 
       return h('main', { className: 'tidal', 'data-plugin': 'tidal-memory' },
         h('div', { className: 'hero' }, h('div', null, h('div', { className: 'eyebrow' }, 'TIDAL MEMORY'),
-          h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, 'v0.2.1')), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
+          h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, 'v0.3.0')), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
           h('div', { className: 'row' }, h('select', { 'aria-label': '记忆空间', disabled: busy, value: space, onChange: e => setSpace(e.target.value) },
             (status?.spaces || ['default']).map(name => h('option', { key: name, value: name }, name))),
             button('刷新', () => run(() => Promise.resolve())))),

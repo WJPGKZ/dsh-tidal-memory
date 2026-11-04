@@ -18,6 +18,9 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   taskKey: string;
   sessionId: string;
   occurredAt: string | null;
+  validFrom: string | null;
+  validUntil: string | null;
+  expiredAt: string | null;
   source: Record<string, unknown>;
   sources: Array<Record<string, unknown>>;
   recallCount: number;

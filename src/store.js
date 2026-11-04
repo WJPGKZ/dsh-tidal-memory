@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicFile, createLayer, openDatabase, transaction } from './database.js';
 import {
-  LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
-  defaultImportance, hash, localCandidates, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms,
+  LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MAX_PROVENANCE_ITEMS, MAX_PROVENANCE_BYTES, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
+  consolidationConflict, consolidationProfile, consolidationSimilarity, defaultImportance, hash, localCandidates, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms,
 } from './model.js';
 
 const parse = row => {
@@ -13,6 +13,7 @@ const parse = row => {
   const record = JSON.parse(row.data);
   record.horizon ??= ({ L1: 'task', L2: 'event', L3: 'long_term' }[record.layer] ?? 'unspecified');
   record.taskKey ??= '';
+  record.expiredAt ??= null;
   return record;
 };
 const adminOnly = actor => requireValue(actor?.admin === true, 'FORBIDDEN', '此操作仅限管理界面。', 403);
@@ -206,9 +207,9 @@ export class MemorySpace {
     return record;
   }
   capture({ sessionId, eventId, text, role = 'user', at }) {
-    const source = { kind: 'session', sessionId, eventId: String(eventId), role };
+    const source = { kind: 'session', sessionId, eventId: String(eventId), role, ...(at ? { at } : {}) };
     return this.create({
-      layer: 'L0', text, scope: 'space', sessionId, source, occurredAt: at,
+      layer: 'L0', text, scope: 'space', sessionId, source, occurredAt: at ?? this.now(),
       kind: role === 'user' ? 'user_statement' : 'observation', status: 'pending', category: 'observation',
     }, { admin: true });
   }
@@ -241,6 +242,10 @@ export class MemorySpace {
               this.create({
                 ...candidate, status: 'active', kind: 'user_statement', sessionId: source.sessionId,
                 occurredAt: source.occurredAt, parents: [source.id],
+                ...(candidate.layer === 'L1' ? {
+                  validUntil: this.config.workingHours ? new Date(Date.parse(source.occurredAt ?? this.now()) +
+                    this.config.workingHours * 3600000).toISOString() : null,
+                } : {}),
                 source: { kind: 'local-rule', rule: candidate.rule, parentId: source.id,
                   original: source.source, excerpt: candidate.text },
               }, { admin: true });
@@ -257,6 +262,11 @@ export class MemorySpace {
       this.promote(source.id, {
         layer: classified.layer, text: classified.text, category: classified.category,
         kind: 'user_statement', status: 'active', horizon: classified.horizon,
+        ...(classified.layer === 'L1' ? {
+          taskKey: hash(terms(classified.text, Infinity).sort().join(' ')).slice(0, 32),
+          validUntil: this.config.workingHours ? new Date(Date.parse(source.occurredAt ?? this.now()) +
+            this.config.workingHours * 3600000).toISOString() : null,
+        } : {}),
       }, { admin: true });
       result.organized++;
     }
@@ -279,9 +289,9 @@ export class MemorySpace {
     }
     const record = normalizeRecord({ ...patch, layer: previous.layer }, this.now(), previous);
     if (!record.sources.some(source => JSON.stringify(source) === JSON.stringify(record.source))) {
-      requireValue(record.sources.length < 256, 'PROVENANCE_LIMIT', '修订来源数量达到上限，本次修订未保存。', 409);
+      requireValue(record.sources.length < MAX_PROVENANCE_ITEMS, 'PROVENANCE_LIMIT', '修订来源数量达到上限，本次修订未保存。', 409);
       record.sources = [...record.sources, record.source];
-      requireValue(JSON.stringify(record.sources).length <= 512000, 'PROVENANCE_LIMIT', '修订来源集合过大，本次修订未保存。', 409);
+      requireValue(JSON.stringify(record.sources).length <= MAX_PROVENANCE_BYTES, 'PROVENANCE_LIMIT', '修订来源集合过大，本次修订未保存。', 409);
     }
     requireValue(typeof record.pinned === 'boolean', 'INVALID_INPUT', '保护标记必须是布尔值。');
     for (const parent of record.parents) this.get(parent, actor);
@@ -304,11 +314,18 @@ export class MemorySpace {
     for (const source of incoming.sources ?? [incoming.source]) {
       if (!sources.some(value => JSON.stringify(value) === JSON.stringify(source))) sources.push(source);
     }
-    const merged = normalizeRecord({}, this.now(), existing);
+    const newEvidence = sources.length > (existing.sources ?? [existing.source]).length;
+    const renew = newEvidence && existing.layer === 'L1' && existing.validUntil && incoming.validUntil &&
+      Date.parse(incoming.validUntil) > Date.parse(existing.validUntil) &&
+      (existing.status === 'active' || existing.status === 'archived' && existing.expiredAt) &&
+      incoming.kind === 'user_statement';
+    const merged = normalizeRecord(renew ? {
+      status: 'active', expiredAt: null, validUntil: incoming.validUntil, occurredAt: incoming.occurredAt,
+    } : {}, this.now(), existing);
     merged.sources = sources;
     merged.parents = [...new Set([...existing.parents, ...incoming.parents])];
     if (sources.length === (existing.sources ?? [existing.source]).length && merged.parents.length === existing.parents.length) return existing;
-    requireValue(merged.sources.length <= 256 && merged.parents.length <= 40 && JSON.stringify(merged.sources).length <= 512000,
+    requireValue(merged.sources.length <= MAX_PROVENANCE_ITEMS && merged.parents.length <= MAX_PROVENANCE_ITEMS && JSON.stringify(merged.sources).length <= MAX_PROVENANCE_BYTES,
       'PROVENANCE_LIMIT', '来源数量达到上限，请人工整理；本次来源仍保留在缓冲中。', 409);
     return merged;
   }
@@ -355,6 +372,17 @@ export class MemorySpace {
         const saved = this.raw(record.id);
         this.system.prepare('INSERT OR IGNORE INTO reinforcements VALUES(?,?)').run(record.id, evidenceId);
         this.writeView(saved);
+      }
+    } else if (operation.kind === 'consolidate') {
+      if (operation.sourceIds.every(sourceId => this.raw(sourceId) &&
+          !this.system.prepare('SELECT 1 FROM tombstones WHERE id=?').get(sourceId))) {
+        for (const record of operation.records) {
+          if (this.system.prepare('SELECT 1 FROM tombstones WHERE id=?').get(record.id)) continue;
+          const current = this.raw(record.id);
+          if (!current || current.revision < record.revision) this.persist(record);
+          this.failpoint('after-consolidation-write');
+          this.writeView(this.raw(record.id));
+        }
       }
     } else {
       const { sourceId, target } = operation;
@@ -661,62 +689,181 @@ export class MemorySpace {
     }
     return { rebuilt: true, version: SEARCH_VERSION, layers };
   }
-  consolidate(limit = 200) {
-    number(limit, 1, 1000, '巩固批量', true);
+  consolidate(limit = 200, { deep = false } = {}) {
+    number(limit, 1, Number.MAX_SAFE_INTEGER, '巩固批量', true);
     this.recover();
-    const cursor = this.system.prepare("SELECT value FROM metadata WHERE key='consolidation-cursor'").get()?.value ?? '';
+    const cursor = deep ? '' :
+      (this.system.prepare("SELECT value FROM metadata WHERE key='consolidation-cursor'").get()?.value ?? '');
     const db = this.db('L2');
-    const batch = db.prepare("SELECT data FROM memories WHERE status='active' AND id>? ORDER BY id LIMIT ?")
-      .all(cursor, limit).map(parse);
-    const result = { inspected: batch.length, promoted: 0, conflicts: 0 };
-    const handled = new Set();
-    for (const record of batch) {
-      if (handled.has(record.text) || record.kind !== 'user_statement' ||
-          !['unspecified', 'long_term'].includes(record.horizon) ||
-          (record.validFrom && Date.parse(record.validFrom) > this.clock()) ||
-          (record.validUntil && Date.parse(record.validUntil) <= this.clock())) continue;
-      const rule = localCandidates(record.text).find(item => item.text === record.text && item.layer === 'L3');
-      if (!rule && (record.horizon !== 'long_term' || record.importance < 0.75 ||
-          !['preference', 'agreement', 'identity', 'knowledge'].includes(record.category))) continue;
-      handled.add(record.text);
-      const group = db.prepare("SELECT data FROM memories WHERE json_extract(data,'$.text')=? AND status='active' ORDER BY id LIMIT ?")
-        .all(record.text, Math.max(0, 40 - record.parents.length)).map(parse).filter(item => item.kind === 'user_statement' &&
-          item.horizon === record.horizon && item.category === record.category && item.factKey === record.factKey &&
-          (!item.validFrom || Date.parse(item.validFrom) <= this.clock()) &&
-          (!item.validUntil || Date.parse(item.validUntil) > this.clock()));
-      const evidence = new Set(), days = new Set();
+    const batch = deep
+      ? db.prepare("SELECT data FROM memories WHERE status='active' ORDER BY id").all().map(parse)
+      : db.prepare("SELECT data FROM memories WHERE status='active' AND id>? ORDER BY id LIMIT ?")
+        .all(cursor, limit + 1).map(parse);
+    const truncated = !deep && batch.length > limit;
+    if (!deep) batch.length = Math.min(batch.length, limit);
+    const result = { inspected: batch.length, promoted: 0, conflicts: 0, skipped: 0, deep, truncated };
+    const stableCategories = new Set(['preference', 'agreement', 'knowledge', 'identity', 'self']);
+    const eligible = record => record.kind === 'user_statement' &&
+      stableCategories.has(record.category) && ['unspecified', 'long_term'].includes(record.horizon) &&
+      (!record.validFrom || Date.parse(record.validFrom) <= this.clock()) &&
+      (!record.validUntil || Date.parse(record.validUntil) > this.clock());
+    const records = new Map(batch.filter(eligible).map(record => [record.id, record]));
+    if (!deep) {
+      for (const text of new Set([...records.values()].map(record => record.text))) {
+        for (const record of db.prepare("SELECT data FROM memories WHERE status='active' AND json_extract(data,'$.text')=?")
+          .all(text).map(parse).filter(eligible)) records.set(record.id, record);
+      }
+    }
+    const profiles = new Map();
+    const profileOf = record => {
+      if (!profiles.has(record.text)) profiles.set(record.text, consolidationProfile(record.text));
+      return profiles.get(record.text);
+    };
+    const groupKey = record => JSON.stringify([record.category, record.factKey,
+      deep ? profileOf(record).key : profileOf(record).exact]);
+    const groups = new Map();
+    for (const record of records.values()) {
+      const key = groupKey(record);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(record);
+    }
+    const longTerm = this.db('L3').prepare("SELECT data FROM memories WHERE status IN ('active','review')")
+      .all().map(parse).filter(record => (!record.validFrom || Date.parse(record.validFrom) <= this.clock()) &&
+        (!record.validUntil || Date.parse(record.validUntil) > this.clock()));
+    const targets = new Map();
+    for (const record of longTerm) {
+      const key = groupKey(record);
+      if (!targets.has(key)) targets.set(key, []);
+      targets.get(key).push(record);
+    }
+    const conflictIds = new Set();
+    const commit = (updates, sourceIds) => {
+      const op = randomUUID();
+      this.system.prepare('INSERT INTO operations VALUES(?,?,?,?)')
+        .run(op, JSON.stringify({ kind: 'consolidate', records: updates, sourceIds }), 'pending', this.now());
+      this.failpoint('after-consolidation-prepare');
+      this.completeOperation(op);
+    };
+    const buckets = new Map();
+    const reviewed = db.prepare("SELECT data FROM memories WHERE status='review'").all().map(parse).filter(eligible);
+    for (const record of [...records.values(), ...reviewed, ...longTerm]) {
+      const profile = profileOf(record);
+      const key = JSON.stringify(record.factKey ? ['fact', record.factKey] :
+        ['text', record.category, profile.conflictKey]);
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push({ record, profile });
+    }
+    for (const bucket of buckets.values()) {
+      if (!bucket.some(({ record }) => records.has(record.id))) continue;
+      const first = bucket[0];
+      if (!bucket.some(entry => (entry.record.factKey && entry.profile.key !== first.profile.key) ||
+          consolidationConflict(first.profile, entry.profile))) continue;
+      for (const { record } of bucket) conflictIds.add(record.id);
+    }
+    const updates = [...conflictIds].map(id => this.raw(id)).filter(record => record.status === 'active')
+      .map(record => normalizeRecord({ status: 'review' }, this.now(), record));
+    if (updates.length) commit(updates, updates.map(record => record.id));
+    result.conflicts = updates.length;
+    for (const group of groups.values()) {
+      if (group.some(record => conflictIds.has(record.id))) continue;
+      const evidence = new Map(), days = new Set();
       for (const item of group) {
-        for (let source of item.sources) {
-          while (source?.original) source = source.original;
-          if (source?.kind === 'session' && source.role === 'user' && source.eventId !== undefined) {
-            evidence.add(`${source.sessionId}:${source.eventId}`);
-            if (item.occurredAt) days.add(item.occurredAt.slice(0, 10));
+        for (const source of item.sources) {
+          let origin = source;
+          while (origin && origin.kind !== 'session') origin = origin.original;
+          if (origin?.kind === 'session' && origin.role === 'user' && origin.sessionId && origin.eventId !== undefined) {
+            const evidenceId = JSON.stringify([origin.sessionId, origin.eventId]);
+            const occurred = origin.at ?? item.occurredAt;
+            if (!evidence.has(evidenceId) && occurred) {
+              evidence.set(evidenceId, item);
+              days.add(new Date(occurred).toISOString().slice(0, 10));
+            }
           }
         }
       }
       if (evidence.size < 2 || days.size < 2) continue;
-      const previous = this.db('L3').prepare("SELECT data FROM memories WHERE json_extract(data,'$.text')=?")
-        .all(record.text).map(parse).find(item => item.factKey === record.factKey);
-      if (previous && group.every(item => previous.parents.includes(item.id))) continue;
+      const representative = [...group].sort((a, b) =>
+        a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
+      const matching = targets.get(groupKey(representative)) ?? [];
+      if (matching.some(item => item.status !== 'active' || conflictIds.has(item.id))) continue;
+      const target = matching[0];
+      if (target && group.every(source => target.parents.includes(source.id))) continue;
       try {
-        const category = rule?.category ?? record.category;
-        let target = this.promote(record.id, { layer: 'L3', status: 'active', horizon: 'long_term', category,
-          importance: Math.max(record.importance, defaultImportance(category)) }, { admin: true });
-        for (const item of group) target = this.mergeSources(target, { ...item, parents: [item.id] });
-        const saved = this.raw(target.id);
-        if (saved.revision !== target.revision) { this.persist(target); this.writeView(target); }
-        if (target.status === 'review') result.conflicts++;
-        else if (target.status === 'active') result.promoted++;
+        let promoted = target ?? normalizeRecord({
+          ...representative, layer: 'L3', horizon: 'long_term',
+          validFrom: group.map(item => item.validFrom).filter(Boolean).sort().at(-1) ?? null,
+          validUntil: group.map(item => item.validUntil).filter(Boolean).sort()[0] ?? null,
+          pinned: false, parents: [representative.id],
+          source: { kind: 'derived', parentId: representative.id, original: representative.source,
+            excerpt: representative.text },
+          importance: Math.max(representative.importance, defaultImportance(representative.category)),
+        }, this.now());
+        const duplicate = parse(this.db('L3').prepare('SELECT data FROM memories WHERE dedupe_key=?').get(promoted.dedupeKey));
+        if (!target && duplicate) continue;
+        requireValue(!this.system.prepare('SELECT 1 FROM forgotten_keys WHERE dedupe_key=?').get(promoted.dedupeKey) &&
+          !this.system.prepare('SELECT 1 FROM tombstones WHERE dedupe_key=?').get(promoted.dedupeKey),
+        'FORGOTTEN', '已遗忘内容不能重新巩固。', 409);
+        if (promoted.factKey && [...records.values(), ...longTerm].some(other =>
+          other.status === 'active' && other.factKey === promoted.factKey &&
+          consolidationSimilarity(other.text, promoted.text) !== 1)) {
+          result.skipped++;
+          this.logError('CONSOLIDATION_CONFLICT', '同一事实键存在不同内容，未自动提炼。');
+          continue;
+        }
+        const sources = [...new Map([...(promoted.sources ?? []), ...group.flatMap(item => item.sources)]
+          .map(source => [JSON.stringify(source), source])).values()];
+        const parents = [...new Set([...promoted.parents, ...group.map(item => item.id)])];
+        promoted = normalizeRecord({ parents }, this.now(), { ...promoted, sources });
+        commit([promoted], group.map(item => item.id));
+        if (!target) longTerm.push(promoted);
+        result.promoted++;
       } catch (error) {
-        if (error.code !== 'FORGOTTEN') throw error;
-        this.logError('FORGOTTEN_CONSOLIDATION', '已遗忘的内容不会通过后台巩固重新生成。');
+        if (!['FORGOTTEN', 'PROVENANCE_LIMIT', 'INVALID_PARENTS', 'INVALID_SOURCE'].includes(error.code)) throw error;
+        result.skipped++;
+        this.logError(error.code, `本组未提炼，原始证据保留：${error.message}`);
       }
     }
-    this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
-      .run('consolidation-cursor', batch.length === limit ? batch.at(-1).id : '');
+    if (!deep) this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
+      .run('consolidation-cursor', truncated ? batch.at(-1).id : '');
     this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
       .run('consolidation', JSON.stringify({ at: this.now(), ...result }));
     return result;
+  }
+  deepConsolidation(day, { missed = false, manual = false, backup } = {}) {
+    requireValue(/^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(`${day}T00:00:00Z`)) &&
+      new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day,
+      'INVALID_DATE', '每日整理日期无效。');
+    const key = `daily-consolidation:${day}`;
+    const existing = this.system.prepare('SELECT value FROM metadata WHERE key=?').get(key)?.value;
+    if (!manual && existing) return { ...JSON.parse(existing), alreadyRun: true };
+    const localOrganization = { inspected: 0, organized: 0 };
+    let batch;
+    do {
+      batch = this.organizePending(1000);
+      localOrganization.inspected += batch.inspected;
+      localOrganization.organized += batch.organized;
+    } while (batch.inspected === 1000);
+    const result = this.consolidate(200, { deep: true });
+    const entry = { day, at: this.now(), missed, manual, backup, localOrganization, ...result };
+    transaction(this.system, () => {
+      const save = this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)');
+      if (!manual) {
+        save.run(key, JSON.stringify(entry));
+        save.run('daily-consolidation', JSON.stringify(entry));
+      }
+      save.run('deep-consolidation', JSON.stringify(entry));
+    });
+    return entry;
+  }
+  dailyConsolidation(day, options = {}) {
+    return this.deepConsolidation(day, options);
+  }
+  manualDeepConsolidation(day, options = {}) {
+    return this.deepConsolidation(day, { ...options, manual: true });
+  }
+  dailyConsolidationStatus() {
+    const latest = this.system.prepare("SELECT value FROM metadata WHERE key='daily-consolidation'").get()?.value;
+    return latest ? JSON.parse(latest) : null;
   }
   maintenance() {
     this.recover();
@@ -737,7 +884,7 @@ export class MemorySpace {
     }
     for (const db of this.dbs.values()) {
       const records = db.prepare("SELECT data FROM memories WHERE status='active' AND valid_until<=? LIMIT 500").all(this.now()).map(parse);
-      for (const record of records) this.update(record.id, { status: 'archived' }, record.revision, { admin: true });
+      for (const record of records) this.update(record.id, { status: 'archived', expiredAt: this.now() }, record.revision, { admin: true });
     }
     let forgottenEpisodes = 0;
     if (this.config.autoArchive) {
@@ -794,6 +941,8 @@ export class MemorySpace {
     return { space: this.name, directory: this.directory, layers, errors: this.errors, searchIndex: this.searchIndexStatus(),
       private: this.privateStatus(),
       maintenance: JSON.parse(this.system.prepare("SELECT value FROM metadata WHERE key='maintenance'").get()?.value ?? 'null'),
+      dailyConsolidation: this.dailyConsolidationStatus(),
+      deepConsolidation: JSON.parse(this.system.prepare("SELECT value FROM metadata WHERE key='deep-consolidation'").get()?.value ?? 'null'),
     };
   }
   snapshot({ includePrivate = false } = {}) {
