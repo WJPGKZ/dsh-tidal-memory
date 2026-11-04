@@ -1,6 +1,6 @@
 {
   "name": "dsh-tidal-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "四层独立存储、证据召回与受限私人记录的 DeepSeek Harness 记忆插件。",
   "type": "module",
   "packageManager": "pnpm@11.28.5",
@@ -16,7 +16,7 @@
   "engines": {"node": ">=24.0.0", "dsh": "0.2.1-rc.5"},
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:unit": "node --test tests/memory.test.mjs tests/runtime.test.mjs tests/review.test.mjs",
+    "test:unit": "node --test tests/memory.test.mjs tests/runtime.test.mjs tests/review.test.mjs tests/effectiveness.test.mjs",
     "test:host": "node --test tests/host*.test.mjs",
     "install:host": "pnpm --dir tests/host-fixture install --ignore-workspace --config.auto-install-peers=true --ignore-scripts --frozen-lockfile",
     "check": "node scripts/check.mjs",

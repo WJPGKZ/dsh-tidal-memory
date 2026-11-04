@@ -55,6 +55,9 @@ export function createLayer(db) {
     }
     db.exec(`CREATE INDEX IF NOT EXISTS by_status_pinned ON memories(status,pinned);
       CREATE INDEX IF NOT EXISTS by_status_updated ON memories(status,updated_at);
+      CREATE INDEX IF NOT EXISTS by_status_created ON memories(status,created_at);
+      CREATE INDEX IF NOT EXISTS by_exact_text ON memories(json_extract(data,'$.text'));
+      CREATE INDEX IF NOT EXISTS by_has_parents ON memories(id) WHERE json_array_length(data,'$.parents')>0;
       CREATE INDEX IF NOT EXISTS by_status_expiry ON memories(status,valid_until);
       PRAGMA user_version=3;`);
   });

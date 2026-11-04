@@ -180,7 +180,7 @@ test('startup leaves existing projections untouched; maintenance does not scan a
 });
 
 test('absolute and relative recall gates exclude weak matches without losing exact ones', t => {
-  const { space } = fixture(t, { relativeFloor: 0.95 });
+  const { space } = fixture(t, { relativeFloor: 0.95, residentMode: 'pinned' });
   const best = create(space, 'alpha beta gamma delta');
   const weak = create(space, 'alpha beta unrelated');
   const result = space.recall('alpha beta gamma delta', admin);
@@ -193,7 +193,7 @@ test('absolute and relative recall gates exclude weak matches without losing exa
 });
 
 test('corpus-wide common words do not qualify solely by matching a one-word query', t => {
-  const { space } = fixture(t);
+  const { space } = fixture(t, { residentMode: 'pinned' });
   for (let i = 0; i < 20; i++) create(space, `routine commonword record ${i}`);
   const distinctive = create(space, 'uniqueidentifier exceptional');
   assert.equal(space.recall('commonword', admin).picked.length, 0);
@@ -201,7 +201,7 @@ test('corpus-wide common words do not qualify solely by matching a one-word quer
 });
 
 test('labeled lexical and abstention fixtures remain reproducible on a small corpus', t => {
-  const { space } = fixture(t);
+  const { space } = fixture(t, { residentMode: 'pinned' });
   const keys = new Map();
   for (const item of corpus(100)) keys.set(create(space, item.text, { layer: item.layer }).id, item.key);
   for (const [query, expected, group] of probes) {

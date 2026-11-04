@@ -41,14 +41,18 @@ try {
   const rejected = await page.request.post(`${preview.url}/tidal-memory/memories`, { data: { text: 'csrf' } });
   assert.equal(rejected.status(), 403);
   await page.getByRole('tab', { name: '设置与迁移' }).click();
-  await page.getByLabel('上下文预算（保守估算）').fill('2048');
+  await page.getByLabel('总预算（UTF-8 字节估算）').fill('48000');
+  await page.getByLabel('L3 常驻范围').selectOption('core');
+  await page.getByLabel('近期用户消息窗口').fill('4');
   assert.equal(await page.getByLabel('自动记录并召回用户陈述（本地规则，无需审核）').isChecked(), true);
   assert.equal(await page.getByLabel('额外保存助手全文到短期 L0（默认关闭）').isChecked(), false);
   await page.getByLabel('最低相关性分数').fill('0.5');
   await page.getByRole('button', { name: '保存设置', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
   const status = await (await page.request.get(`${preview.url}/tidal-memory/status?space=default`)).json();
-  assert.equal(status.data.config.tokenBudget, 2048);
+  assert.equal(status.data.config.tokenBudget, 48000);
+  assert.equal(status.data.config.residentMode, 'core');
+  assert.equal(status.data.config.contextMessages, 4);
   assert.equal(status.data.config.minScore, 0.5);
   await page.getByRole('button', { name: '重建搜索索引', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '搜索索引已重建' }).waitFor();
@@ -70,6 +74,23 @@ try {
   owner.close();
   await page.getByRole('button', { name: '重试打开空间', exact: true }).click();
   await page.getByText('当前空间不可用，未保存或召回记忆', { exact: true }).waitFor({ state: 'hidden' });
+  preview.runtime.rawConfig.bindings = preview.runtime.rawConfig.bindings.filter(binding => binding.space === 'workspace-b');
+  preview.runtime.space('workspace-b').appendPrivate('demo-author', 'PRIVATE_SINGLE_SPACE_CANARY');
+  const singleSpacePage = await browser.newPage();
+  singleSpacePage.on('pageerror', error => errors.push(error.message));
+  await singleSpacePage.goto(preview.url);
+  await singleSpacePage.getByRole('button', { name: '设置', exact: true }).click();
+  await singleSpacePage.getByRole('button', { name: '潮汐记忆', exact: true }).click();
+  await singleSpacePage.waitForFunction(() =>
+    document.querySelector('select[aria-label="记忆空间"]')?.value === 'workspace-b');
+  await singleSpacePage.getByRole('tab', { name: '私人日记' }).click();
+  await singleSpacePage.getByText(/^1 篇 ·/).waitFor();
+  assert.equal((await singleSpacePage.locator('body').innerText()).includes('PRIVATE_SINGLE_SPACE_CANARY'), false);
+  await singleSpacePage.getByRole('combobox', { name: '记忆空间' }).selectOption('default');
+  await singleSpacePage.getByRole('button', { name: '刷新', exact: true }).click();
+  await singleSpacePage.getByText('空间：default', { exact: true }).waitFor();
+  assert.equal(await singleSpacePage.getByRole('combobox', { name: '记忆空间' }).inputValue(), 'default');
+  await singleSpacePage.close();
   assert.deepEqual(errors, []);
   console.log('Browser UI checks passed: CRUD, workspace sharing/isolation, settings, privacy, index repair, lock retry, CSRF.');
 } finally {

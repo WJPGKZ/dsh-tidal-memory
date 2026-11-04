@@ -7,10 +7,14 @@ export const LAYERS = Object.freeze({
   L2: { name: '情景记忆', directory: 'L2-episodes', file: 'episodes.sqlite3' },
   L3: { name: '长期知识', directory: 'L3-long-term', file: 'long-term.sqlite3' },
 });
+export const MAX_RECALL_QUERY_LENGTH = 16000;
+export const MAX_CONTEXT_BUDGET = 192000;
 export const DEFAULTS = Object.freeze({
-  enabled: true, dataRoot: '', bindings: [], tokenBudget: 3072, maxRecall: 6,
+  enabled: true, dataRoot: '', bindings: [], tokenBudget: 48000, maxRecall: 30,
+  residentMode: 'all', residentBudget: 16000, contextMessages: 5,
+  autoConsolidate: true, autoArchive: false,
   halfLifeDays: 30, bufferHours: 72, idleMinutes: 20,
-  autoCandidates: true, captureAssistant: false, minScore: 0.45, relativeFloor: 0.6,
+  autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
   injectContext: true, autoBackup: true, backupKeep: 14, privateWriters: [],
 });
 export class MemoryError extends Error {
@@ -55,10 +59,12 @@ export function configOf(raw = {}) {
   delete result.captureBatch;
   delete result.maxModelCallsPerDay;
   delete result.maxModelOutputTokens;
-  for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
+  for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant', 'autoConsolidate', 'autoArchive']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
+  choice(result.residentMode, ['all', 'core', 'pinned'], 'L3 常驻模式');
   for (const key of ['minScore', 'relativeFloor']) number(result[key], 0, 1, key);
   for (const [key, min, max] of [
-    ['tokenBudget', 256, 12000], ['maxRecall', 1, 20], ['halfLifeDays', 1, 3650],
+    ['tokenBudget', 256, MAX_CONTEXT_BUDGET], ['maxRecall', 1, 100],
+    ['residentBudget', 0, MAX_CONTEXT_BUDGET], ['contextMessages', 1, 10], ['halfLifeDays', 1, 3650],
     ['bufferHours', 1, 720], ['idleMinutes', 1, 1440], ['backupKeep', 1, 90],
   ]) number(result[key], min, max, key, true);
   requireValue(typeof result.dataRoot === 'string' && (result.dataRoot === '' || isAbsolute(result.dataRoot)), 'INVALID_CONFIG', '数据根目录必须是绝对路径。');
@@ -98,6 +104,14 @@ export function validateSource(source) {
   }
   return source;
 }
+export function defaultImportance(category) {
+  return ({ identity: 0.9, agreement: 0.9, preference: 0.85, knowledge: 0.65,
+    task: 0.7, self: 0.6, event: 0.5, observation: 0.4 })[category] ?? 0.5;
+}
+export function residentMemory(record, mode) {
+  return record.layer === 'L3' && (record.pinned || mode === 'all' ||
+    (mode === 'core' && ['identity', 'preference', 'agreement'].includes(record.category)));
+}
 export function normalizeRecord(input, now, existing) {
   const field = name => Object.hasOwn(input, name) ? input[name] : existing?.[name];
   const layer = choice(input.layer ?? existing?.layer, Object.keys(LAYERS), '层级');
@@ -136,12 +150,14 @@ export function normalizeRecord(input, now, existing) {
     source, sources, tags: [...new Set(tags)], parents: [...new Set(parents)],
     factKey, horizon, taskKey, occurredAt,
     validFrom, validUntil,
-    importance: number(input.importance ?? existing?.importance ?? 0.5, 0, 1, '重要度'),
+    importance: number(input.importance ?? existing?.importance ?? defaultImportance(category), 0, 1, '重要度'),
     pinned: input.pinned ?? existing?.pinned ?? false,
     createdAt: existing?.createdAt ?? now, updatedAt: now,
     revision: (existing?.revision ?? 0) + 1,
     stability: existing?.stability ?? 1, reinforcedAt: existing?.reinforcedAt ?? null,
     lastEvidenceId: existing?.lastEvidenceId ?? null,
+    recallCount: number(existing?.recallCount ?? 0, 0, Number.MAX_SAFE_INTEGER, '召回次数', true),
+    lastRecalledAt: timestamp(existing?.lastRecalledAt, '最近召回时间'),
     dedupeKey: hash(JSON.stringify([layer, canonicalText, factKey, eventKey])),
   };
 }
@@ -172,13 +188,13 @@ export function localCandidates(text) {
   const result = [];
   for (const match of plain.matchAll(/[^\n。！？!?]+[。！？!?]?/g)) {
     const quote = match[0].trim();
-    if (quote.length < 4 || quote.length > 500 || /^[>"“「]/.test(quote) ||
+    if (quote.length < 4 || quote.length > 1500 || /^[>"“「]/.test(quote) ||
       /[?？]|(?:假设|假如|如果|例如|比如|举例|示例|引用|他说|她说|不要记|不用记|别记)/.test(quote)) continue;
     let rule, layer = 'L3', category = 'knowledge';
     if (/^(?:不对[，,：:]|更正[：:]|纠正[：:]|我说错了[，,：:]|correction:)/i.test(quote)) rule = 'correction';
-    else if (/^(?:我(?:更)?(?:喜欢|不喜欢|偏好|习惯)|I (?:prefer|like|dislike)\b)/i.test(quote)) {
+    else if (/^(?:我(?:更)?(?:喜欢|不喜欢|偏好|习惯|讨厌|不习惯|希望你)|对我来说|I (?:prefer|like|dislike)\b)/i.test(quote)) {
       rule = 'preference'; category = 'preference';
-    } else if (/^(?:我们(?:约定|说好)|约定[：:]|(?:以后|今后|默认|每次都)|请(?:以后|始终|默认|每次))/i.test(quote)) {
+    } else if (/^(?:我们(?:约定|说好)|(?:约定|规矩|教训)[：:]|(?:以后|今后|默认|每次都)|请(?:以后|始终|默认|每次))/i.test(quote)) {
       rule = 'agreement'; category = 'agreement';
     } else if (/^(?:(?:我们|我)?(?:决定|已决定|确定采用|选择)|(?:本次|这次|当前)任务|we decided\b)/i.test(quote)) {
       rule = 'decision'; layer = 'L2'; category = 'event';
@@ -187,7 +203,7 @@ export function localCandidates(text) {
     if (TASK_CUE.test(quote)) { layer = 'L1'; category = 'task'; }
     result.push({ text: quote, rule, layer, category,
       horizon: { L1: 'task', L2: 'event', L3: 'long_term' }[layer] });
-    if (result.length === 8) break;
+    if (result.length === 32) break;
   }
   return result;
 }
@@ -202,13 +218,19 @@ export function terms(text, limit = 64) {
 export function estimatedTokens(text) {
   return Buffer.byteLength(text, 'utf8');
 }
+const EVIDENCE_STOP = new Set(['到', '在', '有', '对', '把', '从', '以', '和', '与', '还', '吗', '呢', '吧', '啊',
+  '请', '可以', '一下', 'can', 'you', 'please', 'to', 'for', 'with']);
 export function rankMemory(memory, queryTerms, now, halfLifeDays, idf = new Map(), idfCeiling = 0) {
+  queryTerms = queryTerms.filter(word => !EVIDENCE_STOP.has(word));
   const words = terms(memory.text + ' ' + memory.tags.join(' '), Infinity);
   const hits = queryTerms.filter(word => words.includes(word));
   const weight = word => idf.get(word) ?? 1;
   const totalWeight = queryTerms.reduce((sum, word) => sum + weight(word), 0);
-  const direct = hits.reduce((sum, word) => sum + weight(word), 0) / Math.max(Number.EPSILON, totalWeight);
-  const age = Math.max(0, now - Date.parse(memory.reinforcedAt ?? memory.occurredAt ?? memory.createdAt)) / 86400000;
+  const hitWeight = hits.reduce((sum, word) => sum + weight(word), 0);
+  const coverage = hitWeight / Math.max(Number.EPSILON, totalWeight);
+  const evidence = 1 - Math.exp(-hitWeight / Math.max(1, idfCeiling));
+  const direct = 0.55 * coverage + 0.45 * evidence;
+  const age = Math.max(0, now - Date.parse(memory.lastRecalledAt ?? memory.reinforcedAt ?? memory.occurredAt ?? memory.createdAt)) / 86400000;
   const freshness = memory.pinned || memory.layer === 'L3' ? 1 : 2 ** (-age / (halfLifeDays * memory.stability));
   const specificity = idfCeiling > 0 ? Math.min(1, Math.max(0, ...hits.map(weight)) / idfCeiling) : 1;
   return { score: direct * specificity * (0.65 + 0.2 * freshness + 0.15 * memory.importance), hits, freshness, specificity };

@@ -11,6 +11,7 @@ prepareHost();
 for (const scenario of [
   { name: 'ordinary context', expected: true },
   { name: 'complete prompt', complete: true, expected: true },
+  { name: 'long user message', long: true, expected: true },
   { name: 'explicit runtime suppression', complete: true, suppressed: true, expected: false },
   { name: 'plugin injection disabled', disabled: true, expected: false },
 ]) {
@@ -55,7 +56,8 @@ for (const scenario of [
       const memory = ctx.tidalMemory.forAgent(agent).proposeMemory({ layer: 'L3', text: canary });
       assert.equal(memory.status, 'active');
       for (let turn = 0; turn < 2; turn++) {
-        agent.followup(createUserMessage({ content: [{ type: 'text', text: 'omega protocol' }], source: { kind: 'user' } }));
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: scenario.long
+          ? 'omega protocol '.repeat(300) : 'omega protocol' }], source: { kind: 'user' } }));
         await agent.whenIdle();
       }
       assert.equal(requests.length, 2, JSON.stringify(agent.session.snapshotEvents()));

@@ -98,11 +98,19 @@ window.__ModuleLoader__.load({
       const [newCwd, setNewCwd] = React.useState('');
       const [newSpace, setNewSpace] = React.useState('');
       const generation = React.useRef(0);
+      const initialSpace = React.useRef(true);
 
       async function refresh() {
         const version = ++generation.current;
         const data = await request(space, '/status');
         if (version !== generation.current) return;
+        if (initialSpace.current) {
+          initialSpace.current = false;
+          if (data.config.bindings.length === 1 && data.config.bindings[0].space !== space) {
+            setSpace(data.config.bindings[0].space);
+            return;
+          }
+        }
         setStatus(data); setConfig(data.config);
       }
       React.useEffect(() => {
@@ -225,7 +233,7 @@ window.__ModuleLoader__.load({
               })) : null,
               draft.id ? button('人工确认 / 强化（可选）', () => run(async () => {
                 const saved = await request(space, '/confirm', { id: draft.id }); setDraft(saved); return saved;
-              }, '已记录一次人工确认；不会因自动召回而强化。')) : null),
+              }, '已记录一次人工确认；实际召回的轻量强化另行计数，不冒充人工确认。')) : null),
             draft.id ? h('div', { className: 'row' },
               ...['L1', 'L2', 'L3'].filter(id => id !== draft.layer).map(id => button(`归类到 ${id}`, () => run(() =>
                 request(space, '/promote', { id: draft.id, target: { layer: id, text: promotionText(),
@@ -287,14 +295,23 @@ window.__ModuleLoader__.load({
             field('相对最高分门槛', config.relativeFloor, value => patchConfig('relativeFloor', value), 'number', { min: 0, max: 1, step: 0.05 })),
           h('div', { className: 'fields' },
             ...[
-              ['tokenBudget', '上下文预算（保守估算）', 256, 12000],
-              ['maxRecall', '最多召回条数', 1, 20],
+              ['tokenBudget', '总预算（UTF-8 字节估算）', 256, 192000],
+              ['maxRecall', '相关记忆条数（常驻、来源关联另计）', 1, 100],
+              ['residentBudget', 'L3 常驻额度（包含在总预算内）', 0, 192000],
+              ['contextMessages', '近期用户消息窗口', 1, 10],
               ['halfLifeDays', '情景记忆半衰期（天）', 1, 3650],
               ['idleMinutes', '空闲后整理（分钟）', 1, 1440],
               ['bufferHours', '已处理缓冲保留（小时）', 1, 720],
               ['backupKeep', '自动恢复点保留数量', 1, 90],
             ].map(([key, label, min, max]) => h(React.Fragment, { key },
               field(label, config[key], value => patchConfig(key, value), 'number', { min, max })))),
+          h('label', null, 'L3 常驻范围', h('select', { value: config.residentMode,
+            onChange: event => patchConfig('residentMode', event.target.value) },
+            ...[['all', '全部有效 L3（默认）'], ['core', '身份、偏好、约定及固定项'], ['pinned', '仅固定项']]
+              .map(([value, label]) => h('option', { key: value, value }, label)))),
+          h('p', { className: 'muted' }, '常驻不等于已核实；过期、待审核和已被替代的条目不注入。常驻先使用独立额度，但总预算仍是硬上限。近期消息逐条匹配，不用无关内容凑数。'),
+          check('空闲巩固跨日期重复的明确长期陈述', config.autoConsolidate, value => patchConfig('autoConsolidate', value)),
+          check('低重要且未使用的旧 L2 自动归档（保存满八个半衰期，不删除）', config.autoArchive, value => patchConfig('autoArchive', value)),
           check('自动备份 L1-L3，不含 L0、来源摘录和私人日记', config.autoBackup, value => patchConfig('autoBackup', value)),
           h('div', { className: 'row' }, button('保存设置', saveConfig, 'primary'),
             button('重建搜索索引', () => run(() => request(space, '/rebuild/search', {}), '搜索索引已重建。')),
@@ -340,7 +357,7 @@ window.__ModuleLoader__.load({
 
       return h('main', { className: 'tidal', 'data-plugin': 'tidal-memory' },
         h('div', { className: 'hero' }, h('div', null, h('div', { className: 'eyebrow' }, 'TIDAL MEMORY'),
-          h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, 'v0.2.0')), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
+          h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, 'v0.2.1')), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
           h('div', { className: 'row' }, h('select', { 'aria-label': '记忆空间', disabled: busy, value: space, onChange: e => setSpace(e.target.value) },
             (status?.spaces || ['default']).map(name => h('option', { key: name, value: name }, name))),
             button('刷新', () => run(() => Promise.resolve())))),

@@ -74,7 +74,7 @@ test('optimistic revision checks reject stale edits and preserve history', t => 
   assert.throws(() => space.update(a.id, { text: '不应覆盖' }, 1, admin), /已被修改/);
   assert.equal(space.revisions(a.id, admin).length, 2);
 });
-test('only manual confirmation reinforces; passive recall never reinforces', t => {
+test('passive previews never reinforce; manual confirmation is idempotent', t => {
   const { space } = fixture(t);
   const a = create(space, '蓝色主题');
   space.recall('蓝色主题', { sessionId: 'a' });
@@ -158,7 +158,9 @@ test('private text never occurs in ordinary search, views, traces, or plain back
   space.appendPrivate('test-author', secret);
   create(space, 'ordinary record');
   assert.equal(space.list({ query: secret }, admin).total, 0);
-  assert.equal(space.recall(secret, admin).text, '');
+  const recalled = space.recall(secret, admin);
+  assert.equal(recalled.text.includes(secret), false);
+  assert.ok(recalled.picked.every(item => item.channel === 'resident'));
   assert.equal(packBackup(space).includes(secret), false);
   assert.equal(JSON.stringify(space.status()).includes(secret), false);
   assert.equal(JSON.stringify(space.traces(admin)).includes(secret), false);

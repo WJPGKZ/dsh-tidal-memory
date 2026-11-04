@@ -21,7 +21,8 @@ async function worker(source, root, count) {
   const { MemorySpace } = await import(pathToFileURL(join(source, 'src', 'store.js')));
   const model = await import(pathToFileURL(join(source, 'src', 'model.js')));
   const keys = new Map();
-  let space = new MemorySpace(root, 'bench', { clock: () => now });
+  const options = { clock: () => now, config: { residentMode: 'pinned', maxRecall: 6 } };
+  let space = new MemorySpace(root, 'bench', options);
   try {
     const data = corpus(count);
     // Bulk seed is setup, NOT a measurement of the production write pipeline.
@@ -54,7 +55,7 @@ async function worker(source, root, count) {
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     }
     space.close();
-    const startupMs = elapsed(() => { space = new MemorySpace(root, 'bench', { clock: () => now }); });
+    const startupMs = elapsed(() => { space = new MemorySpace(root, 'bench', options); });
     const captureMs = Array.from({ length: 20 }, (_, i) => elapsed(() =>
       space.capture({ sessionId: 'bench', eventId: i, text: `合成普通会话 ${i}`, role: 'user' })));
     const maintenanceMs = Array.from({ length: 5 }, () => elapsed(() => space.maintenance()));
@@ -122,6 +123,7 @@ if (process.argv[2] === '--worker') {
         'Separate processes; warm p95 from two rounds after one warmup; startup is one measurement.',
         'precisionReturned uses the number returned, not a fixed denominator of six; empty results score zero.',
         'Default baseline is the original 0.1.0 commit; current is the working tree. Bulk fixture loading is excluded.',
+        'Lexical benchmark uses pinned-only residency and maxRecall=6, not the new all-L3/30-item product defaults.',
       ], baseline: run('old-data', baseline), current: run('new-data', repo) };
     mkdirSync(join(repo, '.preview'), { recursive: true });
     writeFileSync(join(repo, '.preview', 'benchmark.json'), JSON.stringify(report, null, 2));

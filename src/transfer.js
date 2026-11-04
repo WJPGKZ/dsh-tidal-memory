@@ -137,6 +137,50 @@ export function automaticBackup(space, root) {
 
 const PRIVATE_NAME = /(^|[\\/._ -])(private|私密|私人)([\\/._ -]|$)/i;
 const FORBIDDEN_NAME = /(^|[\\/])(\.env[^\\/]*|\.credentials[^\\/]*|credentials\.[^\\/]*|id_rsa[^\\/]*|[^\\/]*\.pem)$/i;
+function headingCategory(heading) {
+  if (/身份|个人资料|称呼|identity/i.test(heading)) return 'identity';
+  if (/偏好|喜好|preference/i.test(heading)) return 'preference';
+  if (/约定|规则|agreement/i.test(heading)) return 'agreement';
+  if (/知识|经验|工具|knowledge/i.test(heading)) return 'knowledge';
+  return 'event';
+}
+function markdownSections(content) {
+  const sections = [];
+  let heading = '', lines = [], fence = null;
+  const flush = () => {
+    const body = lines.join('\n').trim();
+    lines = [];
+    if (!body) return;
+    let chunk = '', size = 0;
+    const emit = () => {
+      if (chunk.trim()) sections.push({ text: chunk.trim(), heading, at: null, oldId: String(sections.length) });
+      chunk = ''; size = 0;
+    };
+    for (const paragraph of body.split(/\n\s*\n/)) {
+      const part = `${chunk ? '\n\n' : ''}${paragraph}`;
+      if (size >= 2000 && size + Buffer.byteLength(part) > 4000) emit();
+      const value = `${chunk ? '\n\n' : ''}${paragraph}`;
+      for (const char of value) {
+        const bytes = Buffer.byteLength(char);
+        if (size + bytes > 4000) emit();
+        chunk += char; size += bytes;
+      }
+    }
+    emit();
+  };
+  for (const line of content.replaceAll('\r\n', '\n').split('\n')) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker && (!fence || (marker[0] === fence[0] && marker.length >= fence.length))) {
+      fence = fence ? null : marker;
+      lines.push(line); continue;
+    }
+    const title = !fence && /^#{1,6}\s+(.+?)\s*#*\s*$/.exec(line);
+    if (title) { flush(); heading = title[1]; }
+    else lines.push(line);
+  }
+  flush();
+  return sections;
+}
 export function importPreview(files) {
   requireValue(Array.isArray(files) && files.length > 0 && files.length <= 100, 'INVALID_IMPORT', '每次导入 1–100 个文本文件。');
   let total = 0;
@@ -157,25 +201,18 @@ export function importPreview(files) {
     if (/\.json$/i.test(name)) {
       const parsed = JSON.parse(content);
       requireValue(Array.isArray(parsed.memories), 'IMPORT_FORMAT', 'JSON 必须是包含 memories 数组的 fish-memory 数据。');
-      sections = parsed.memories.map((m, i) => ({ text: string(m.text, '旧记忆正文'), at: m.at ?? null, oldId: String(m.id ?? i), heading: '' }));
+      sections = parsed.memories.map((m, i) => ({ text: string(m.text, '旧记忆正文'), at: m.at ?? null,
+        oldId: String(m.id ?? i), heading: '', category: m.category, importance: m.importance }));
     } else {
-      let heading = '';
-      sections = [];
-      for (const paragraph of content.split(/\r?\n\s*\r?\n/)) {
-        const trimmed = paragraph.trim();
-        if (!trimmed) continue;
-        const first = trimmed.split(/\r?\n/)[0];
-        if (/^#{1,6}\s/.test(first)) heading = first.replace(/^#+\s*/, '');
-        for (let i = 0; i < [...trimmed].length; i += 4000) {
-          sections.push({ text: [...trimmed].slice(i, i + 4000).join(''), heading, at: null, oldId: String(sections.length) });
-        }
-      }
+      sections = markdownSections(content);
     }
     for (const section of sections) {
-      const stable = /偏好|约定|知识|经验|工具/.test(section.heading);
+      const category = ['identity', 'preference', 'agreement', 'knowledge', 'event', 'task', 'self', 'observation']
+        .includes(section.category) ? section.category : headingCategory(section.category ?? section.heading);
+      const stable = ['identity', 'preference', 'agreement', 'knowledge'].includes(category);
       candidates.push({
         importId: hash(`${fingerprint}:${section.oldId}`), layer: stable ? 'L3' : 'L2',
-        category: stable ? 'knowledge' : 'event', kind: 'historical', status: 'candidate',
+        category, importance: section.importance, kind: 'historical', status: 'candidate',
         text: section.text, scope: 'space', sessionId: '',
         occurredAt: section.at && Number.isFinite(Date.parse(section.at)) ? new Date(section.at).toISOString() : null,
         source: { kind: 'import', file: basename(name.replaceAll('\\', '/')), fingerprint,

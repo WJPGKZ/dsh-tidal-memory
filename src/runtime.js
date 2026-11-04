@@ -3,13 +3,18 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemorySpace } from './store.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
-import { bindingFor, configOf, MemoryError, requireValue, slug, string } from './model.js';
+import { bindingFor, configOf, MAX_RECALL_QUERY_LENGTH, MemoryError, requireValue, slug, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
 const MAX_BODY = 12 * 1024 * 1024;
 const textOf = message => (message?.content ?? []).filter(block => block.type === 'text')
   .map(block => block.text).join('\n').toWellFormed();
+export function recallQuery(text) {
+  if (text.length <= MAX_RECALL_QUERY_LENGTH) return text.toWellFormed();
+  const half = Math.floor((MAX_RECALL_QUERY_LENGTH - 1) / 2);
+  return `${text.slice(0, half)}\n${text.slice(-(MAX_RECALL_QUERY_LENGTH - half - 1))}`.toWellFormed();
+}
 
 export class TidalRuntime {
   constructor(ctx, rawConfig, home) {
@@ -35,8 +40,10 @@ export class TidalRuntime {
     const config = configOf(this.rawConfig);
     requireValue(!config.dataRoot || resolve(config.dataRoot) === this.root, 'ROOT_RESTART_REQUIRED', '数据目录已变化。请停止插件并迁移数据后重新启动。', 409);
     const changed = JSON.stringify(config) !== JSON.stringify(this.config);
+    const windowChanged = config.contextMessages !== this.config.contextMessages;
     this.config = config;
     for (const store of this.spaces.values()) store.setConfig(config);
+    if (windowChanged) this.sessions.clear();
     if (changed) for (const state of this.sessions.values()) state.context = null;
     return this.config;
   }
@@ -77,9 +84,32 @@ export class TidalRuntime {
       if (state.space === name) state.context = null;
     }
   }
-  noteError(code, message) {
-    this.lastError = { code, message, at: new Date().toISOString() };
+  noteError(code, message, details = {}) {
+    this.lastError = { code, message, at: new Date().toISOString(), ...details };
     this.ctx.logger?.warn?.(`[tidal-memory] ${code}: ${message}`);
+  }
+  sessionState(session, space) {
+    let state = this.sessions.get(session.id);
+    if (!state || state.space !== space) {
+      const recent = [];
+      const events = session.snapshotEvents?.() ?? [];
+      for (let i = events.length - 1; i >= 0 && recent.length < this.config.contextMessages; i--) {
+        const event = events[i];
+        if (event.type !== 'user/message' || event.data.source?.kind !== 'user') continue;
+        const text = textOf(event.data);
+        if (text.trim()) recent.unshift({ seq: event.seq, text: recallQuery(text) });
+      }
+      state = { recent, query: recent.at(-1)?.text ?? '', evidenceId: recent.at(-1)?.seq,
+        context: null, turn: null, lastSeen: Date.now(), space };
+      this.sessions.set(session.id, state);
+    }
+    return state;
+  }
+  recallForAgent(agent, query, options = {}) {
+    const { store, actor, space } = this.forAgent(agent);
+    const state = this.sessionState(agent.session, space);
+    return store.recall(query, actor, { ...options,
+      evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
   }
   onEvent(session, event) {
     if (this.disposed) return;
@@ -88,11 +118,7 @@ export class TidalRuntime {
       if (!this.config.enabled || session.header.origin === 'subagent') return;
       const binding = bindingFor(this.config, session.header.cwd);
       if (!binding) return;
-      let state = this.sessions.get(session.id);
-      if (!state) {
-        state = { query: '', context: null, turn: null, lastSeen: Date.now(), space: binding.space };
-        this.sessions.set(session.id, state);
-      }
+      const state = this.sessionState(session, binding.space);
       state.space = binding.space;
       state.lastSeen = Date.now();
       this.lastActivity = state.lastSeen;
@@ -106,19 +132,23 @@ export class TidalRuntime {
       if (message.role === 'assistant' && !this.config.captureAssistant) return;
       const text = textOf(message);
       if (!text.trim()) return;
+      if (message.role === 'user') {
+        state.query = text;
+        state.recent = [...(state.recent ?? []).filter(item => item.seq !== event.seq),
+          { seq: event.seq, text: recallQuery(text) }].slice(-this.config.contextMessages);
+        state.evidenceId = event.seq;
+        state.context = null;
+      }
       if (text.length > 16000) {
         this.noteError('CAPTURE_TOO_LARGE', '一条消息超过缓冲上限，未保存；原文仍由 DSH 管理。');
         return;
       }
-      if (message.role === 'user') { state.query = text; state.context = null; }
       const store = this.space(binding.space);
       const source = store.capture({
         sessionId: session.id, eventId: event.seq, text, role: message.role,
         at: new Date(event.time).toISOString(),
       });
       if (message.role === 'user') {
-        state.query = text;
-        state.context = null;
         if (store.organizePending(1, source.id).organized) this.invalidateSpace(binding.space);
       }
     } catch (error) {
@@ -126,24 +156,30 @@ export class TidalRuntime {
     }
   }
   context({ agent }) {
+    let selectedSpace;
     try {
       this.syncConfig();
       if (!this.config.enabled || !agent?.session || agent.session.header.origin === 'subagent') return '';
       if (!this.config.injectContext) return '';
-      if (!bindingFor(this.config, agent.session.header.cwd)) return '';
+      const binding = bindingFor(this.config, agent.session.header.cwd);
+      if (!binding) return '';
+      selectedSpace = binding.space;
       const { store, actor, space } = this.forAgent(agent);
-      let state = this.sessions.get(agent.id);
-      if (!state) {
-        const events = agent.session.snapshotEvents();
-        const last = [...events].reverse().find(e => e.type === 'user/message' && e.data.source?.kind === 'user');
-        state = { query: last ? textOf(last.data) : '', context: null, turn: null, lastSeen: Date.now(), space };
-        this.sessions.set(agent.id, state);
-      }
+      const state = this.sessionState(agent.session, space);
       state.space = space;
-      if (state.context === null) state.context = store.recall(state.query, actor).text;
+      if (state.context === null) {
+        const query = recallQuery(state.query);
+        const contextQueries = (state.recent ?? []).slice(-this.config.contextMessages, -1)
+          .reverse().map(item => item.text);
+        state.context = store.recall(query, actor, { contextQueries,
+          evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` }).text;
+        if (this.lastError?.operation === 'recall' && this.lastError.space === space) this.lastError = null;
+      }
       return state.context;
     } catch (error) {
-      this.noteError(error.code ?? 'RECALL_FAILED', '记忆召回不可用，不应声称已经读取历史。');
+      this.noteError(error.code ?? 'RECALL_FAILED',
+        error instanceof MemoryError ? `记忆召回不可用：${error.message}` : '记忆召回不可用，不应声称已经读取历史。',
+        { operation: 'recall', space: selectedSpace });
       return '[潮汐记忆暂不可用：请勿声称已检索到历史记录。]';
     }
   }
@@ -171,10 +207,11 @@ export class TidalRuntime {
           results.push({ space: name, unavailable: true, error: this.spaceErrors.get(name) });
           continue;
         }
-        const maintenance = store.maintenance();
         const localOrganization = store.organizePending();
+        const consolidation = this.config.autoConsolidate ? store.consolidate() : { disabled: true };
+        const maintenance = store.maintenance();
         this.invalidateSpace(name);
-        results.push({ space: name, ...maintenance, localOrganization });
+        results.push({ space: name, ...maintenance, localOrganization, consolidation });
         if (this.config.autoBackup) automaticBackup(store, this.root);
       }
       return { results };
@@ -201,10 +238,11 @@ export class TidalRuntime {
         if (error.code !== 'SPACE_BUSY') throw error;
         details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
       }
-      return { version: '0.2.0', root: this.root, spaces: this.names(), ...details,
+      return { version: '0.2.1', root: this.root, spaces: this.names(), ...details,
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
         settingsRevision: this.descriptor()?.revision ?? null, busy: this.busy,
-        error: this.lastError, spaceErrors: Object.fromEntries(this.spaceErrors),
+        error: this.lastError?.space && this.lastError.space !== spaceName ? null : this.lastError,
+        spaceErrors: Object.fromEntries(this.spaceErrors),
         sessions: [...this.ctx.agents.list()].filter(a => a.session.header.origin !== 'subagent')
           .map(a => ({ id: a.id, cwd: a.session.header.cwd ?? '', status: a.status })) };
     }

@@ -20,6 +20,8 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   occurredAt: string | null;
   source: Record<string, unknown>;
   sources: Array<Record<string, unknown>>;
+  recallCount: number;
+  lastRecalledAt: string | null;
 }
 export interface RecallResult {
   text: string;
@@ -28,8 +30,11 @@ export interface RecallResult {
   accounting: string;
   threshold: number;
   bestScore: number;
+  residentBytes: number;
+  contextQueries: number;
   excluded: Array<{ id: string; reason: string; score?: number }>;
-  picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[] }>;
+  picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[];
+    channel: 'resident' | 'query' | 'association' }>;
 }
 export interface TidalMemoryService {
   readonly version: 1;
