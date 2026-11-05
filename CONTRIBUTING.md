@@ -1,12 +1,12 @@
 # Contributing
 
-Tidal Memory is being optimized around workspace-shared, four-layer memory for DeepSeek Harness rc5. The current implementation is local-first: capture, deterministic classification, SQLite/FTS5 retrieval, and persistence do not call a model.
+Tidal Memory uses workspace-shared, four-layer memory for DeepSeek Harness rc5. Capture, deterministic classification and consolidation do not call a model. Optional embedding inference is entirely local, with BGE-small CPU and Qwen3/Vulkan packs kept outside plugin code.
 
 ## Areas where help is welcome
 
 - Tests and labeled, synthetic benchmarks for local classification and recall.
 - Chinese and mixed-language rule coverage, especially false-positive and conflicting-memory cases.
-- An optional, fully local embedding retrieval backend. It must remain optional, preserve FTS5 fallback, isolate indexes by workspace, and never decide whether a memory is true, current, or safe to merge.
+- Local embedding adapters and quality benchmarks. Preserve the model-free edition, explicit lexical fallback, workspace-isolated indexes, and source/time checks. Vectors must never decide whether a memory is true or safe to merge.
 - Future memory-organizer adapters. No `MemoryModelProvider` registration or execution interface exists yet. Design it explicitly; adapters must be opt-in, return proposals rather than write directly, and document exactly what data leaves the machine. Host-model extraction and query expansion are deferred, not silently enabled by the reference plan.
 
 New local-rule and tool memories are automatically recallable; human approval is not a normal ingestion prerequisite. Automatic eligibility must not imply verified truth. Preserve provenance, conflict isolation, optional human correction, and protection against tools rewriting user statements. Future adapters must use the same validated store boundary rather than mutate databases directly.

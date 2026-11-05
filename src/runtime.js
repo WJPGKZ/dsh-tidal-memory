@@ -1,13 +1,27 @@
 import { readdirSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { MemorySpace } from './store.js';
+import { LocalEmbedding, modelInventory } from './embedding.js';
+import { SemanticIndex, semanticChunks, clearSemanticFiles } from './semantic-index.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
 import { bindingFor, classifyRememberDirective, configOf, MAX_RECALL_QUERY_LENGTH, MemoryError, requireValue, slug, splitCapture, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
 const MAX_BODY = 12 * 1024 * 1024;
+async function waitForLocal(promise, timeout, signal) {
+  let timer, onAbort;
+  const stopped = new Promise((_, reject) => {
+    onAbort = () => reject(new MemoryError('SEMANTIC_CANCELLED', '当前语义检索已取消。', 409));
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => reject(new MemoryError('SEMANTIC_TIMEOUT', '本地语义准备超时，本轮仅使用词面检索。', 503)), timeout);
+  });
+  try { return await Promise.race([promise, stopped]); }
+  finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); }
+}
 const textOf = message => (message?.content ?? []).filter(block => block.type === 'text')
   .map(block => block.text).join('\n').toWellFormed();
 export function recallQuery(text) {
@@ -34,7 +48,7 @@ function nextScheduledAt(date, time, lastDay) {
 }
 
 export class TidalRuntime {
-  constructor(ctx, rawConfig, home, { clock = () => new Date() } = {}) {
+  constructor(ctx, rawConfig, home, { clock = () => new Date(), embedding } = {}) {
     this.ctx = ctx;
     this.rawConfig = rawConfig;
     this.clock = clock;
@@ -43,6 +57,9 @@ export class TidalRuntime {
       ? legacyAutoExtract.get() : legacyAutoExtract) === true;
     this.config = configOf(rawConfig);
     this.root = resolve(this.config.dataRoot || join(home, 'tidal-memory'));
+    this.embedding = embedding ?? new LocalEmbedding(this.root);
+    this.embedding.configure(this.config);
+    this.semanticQueries = new Map();
     this.spaces = new Map();
     this.spaceErrors = new Map();
     this.plans = new Map();
@@ -60,9 +77,12 @@ export class TidalRuntime {
     const changed = JSON.stringify(config) !== JSON.stringify(this.config);
     const windowChanged = config.contextMessages !== this.config.contextMessages;
     this.config = config;
+    const modelKey = this.embedding.key;
+    this.embedding.configure(config);
+    if (modelKey !== this.embedding.key) this.semanticQueries.clear();
     for (const store of this.spaces.values()) store.setConfig(config);
     if (windowChanged) this.sessions.clear();
-    if (changed) for (const state of this.sessions.values()) state.context = null;
+    if (changed) for (const state of this.sessions.values()) { state.context = null; state.semantic = null; }
     return this.config;
   }
   space(name) {
@@ -71,6 +91,7 @@ export class TidalRuntime {
     if (!this.spaces.has(name)) {
       try {
         this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config, clock: () => this.clock().getTime() }));
+        this.spaces.get(name).onForget = () => { this.semanticQueries.clear(); this.invalidateSpace(name); };
         this.spaceErrors.delete(name);
       } catch (error) {
         this.spaceErrors.set(name, { code: error.code ?? 'OPEN_FAILED',
@@ -99,7 +120,7 @@ export class TidalRuntime {
   }
   invalidateSpace(name) {
     for (const state of this.sessions.values()) {
-      if (state.space === name) state.context = null;
+      if (state.space === name) { state.context = null; state.semantic = null; }
     }
   }
   noteError(code, message, details = {}) {
@@ -126,8 +147,101 @@ export class TidalRuntime {
   recallForAgent(agent, query, options = {}) {
     const { store, actor, space } = this.forAgent(agent);
     const state = this.sessionState(agent.session, space);
-    return store.recall(query, actor, { ...options,
+    const cached = this.cachedSemantic(store, query, options.contextQueries ?? [], state);
+    return store.recall(query, actor, { ...options, ...cached,
       evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
+  }
+  queryWindow(state) {
+    const pending = state.pendingQueries ?? [];
+    const queries = pending.length ? [...(state.recent ?? []).map(item => item.text), ...pending]
+      .slice(-this.config.contextMessages) : (state.recent ?? []).map(item => item.text);
+    return { query: pending.length ? pending.at(-1) : recallQuery(state.query),
+      contextQueries: queries.slice(-this.config.contextMessages, -1).reverse(), pending: pending.length > 0 };
+  }
+  semanticKey(store, query, contextQueries) {
+    return JSON.stringify([this.embedding.key, store.name, query, contextQueries]);
+  }
+  cachedSemantic(store, query, contextQueries, state) {
+    if (this.config.embeddingMode === 'off') return { semantic: [], semanticStatus: { mode: 'off', state: 'disabled' } };
+    const cached = state?.semantic;
+    if (cached?.key === this.semanticKey(store, query, contextQueries) && cached.generation === store.generation)
+      return { semantic: cached.hits, semanticStatus: cached.status };
+    return { semantic: [], semanticStatus: { mode: this.config.embeddingMode, state: 'lexical',
+      code: 'SEMANTIC_NOT_PREPARED', message: '语义线索尚未就绪或记忆已经变化，本次只使用词面检索。' } };
+  }
+  async prepareSemantic(store, actor, query, options = {}, signal) {
+    const contextQueries = options.contextQueries ?? [];
+    string(query, '查询', MAX_RECALL_QUERY_LENGTH, true);
+    requireValue(Array.isArray(contextQueries) && contextQueries.length <= 10, 'INVALID_INPUT', '情境窗最多 10 条消息。');
+    contextQueries.forEach(text => string(text, '情境线索', MAX_RECALL_QUERY_LENGTH, true));
+    store.recallScope(actor, options);
+    const mode = this.config.embeddingMode;
+    const key = this.semanticKey(store, query, contextQueries);
+    if (mode === 'off') return { key, generation: store.generation, hits: [], status: { mode, state: 'disabled' } };
+    if (signal?.aborted) throw new MemoryError('SEMANTIC_CANCELLED', '当前语义检索已取消。', 409);
+    const modelKey = this.embedding.key;
+    const job = (async () => {
+      store.semanticIndex ??= new SemanticIndex(store);
+      await store.semanticIndex.sync(this.embedding);
+      const pack = await this.embedding.ready();
+      let queries = this.semanticQueries.get(key);
+      if (!queries) {
+        const chunks = [query, ...contextQueries].flatMap((text, contextIndex) =>
+          text.trim() ? semanticChunks(text, pack.chunkSize).map(text => ({ text, contextIndex })) : []);
+        queries = [];
+        for (let offset = 0; offset < chunks.length; offset += 16) {
+          const batch = chunks.slice(offset, offset + 16);
+          const vectors = await this.embedding.embed(batch.map(item => item.text), 'query');
+          queries.push(...vectors.map((vector, index) => ({ vector, contextIndex: batch[index].contextIndex })));
+        }
+        requireValue(modelKey === this.embedding.key && !this.disposed, 'MODEL_CHANGED', '本地模型已切换或停止。', 409);
+        if (this.semanticQueries.size >= 64) this.semanticQueries.delete(this.semanticQueries.keys().next().value);
+        this.semanticQueries.set(key, queries);
+      }
+      const policy = { ...pack,
+        minScore: this.config.embeddingMinScore === -1 ? pack.minScore : this.config.embeddingMinScore,
+        relativeFloor: this.config.embeddingRelativeFloor === -1 ? pack.relativeFloor : this.config.embeddingRelativeFloor };
+      const hits = queries.length ? store.semanticIndex.search(queries, policy,
+        { accept: store.recallScope(actor, options).accept, limit: Math.max(60, this.config.maxRecall * 4) }) : [];
+      const index = store.semanticIndex.status();
+      return { key, generation: store.generation, hits, status: { mode, state: index.pending ? 'partial' : 'ready',
+        model: pack.modelId, fingerprint: pack.fingerprint, candidates: hits.length, index,
+        minScore: policy.minScore, relativeFloor: policy.relativeFloor } };
+    })();
+    this.jobs.add(job);
+    job.then(() => this.jobs.delete(job), () => this.jobs.delete(job));
+    try {
+      const result = await waitForLocal(job, this.config.embeddingTimeoutSeconds * 1000, signal);
+      if (result.status.state === 'ready' && this.lastError?.operation === 'semantic' && this.lastError.space === store.name)
+        this.lastError = null;
+      return result;
+    }
+    catch (error) {
+      this.noteError(error.code ?? 'SEMANTIC_FAILED', `本地语义检索未完成：${error.message}`,
+        { operation: 'semantic', space: store.name });
+      return { key, generation: store.generation, hits: [], status: { mode, state: 'degraded',
+        code: error.code ?? 'SEMANTIC_FAILED', message: error.message } };
+    }
+  }
+  async recallAsync(store, actor, query, options = {}, signal) {
+    const result = await this.prepareSemantic(store, actor, query, options, signal);
+    requireValue(!this.disposed, 'CLOSED', '插件已停止。', 503);
+    this.syncConfig();
+    requireValue(!signal?.aborted && result.key === this.semanticKey(store, query, options.contextQueries ?? []),
+      'SEMANTIC_OBSOLETE', '查询已取消或模型配置已变化，请重新检索。', 409);
+    return store.recall(query, actor, { ...options, semantic: result.hits, semanticStatus: result.status });
+  }
+  async recallForAgentAsync(agent, query, options = {}, signal) {
+    const { store, actor, space } = this.forAgent(agent);
+    const state = this.sessionState(agent.session, space);
+    const evidenceId = state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}`;
+    const result = await this.prepareSemantic(store, actor, query, options, signal);
+    const current = this.forAgent(agent);
+    requireValue(current.store === store && !signal?.aborted &&
+      result.key === this.semanticKey(store, query, options.contextQueries ?? []),
+    'SEMANTIC_OBSOLETE', '查询范围、模型或会话状态已变化，请重新检索。', 409);
+    return store.recall(query, current.actor, { ...options, evidenceId,
+      semantic: result.hits, semanticStatus: result.status });
   }
   async preStep({ agent, signal }, next) {
     const decision = await next();
@@ -143,6 +257,18 @@ export class TidalRuntime {
       state.pendingQueries = decision.messages.filter(message => message.source?.kind === 'user')
         .map(textOf).filter(text => text.trim()).map(recallQuery);
       state.context = null;
+      if (this.config.injectContext && this.config.embeddingMode !== 'off') {
+        const token = Symbol('semantic-request');
+        state.semanticRequest = token;
+        const { query, contextQueries } = this.queryWindow(state);
+        const { store, actor } = this.forAgent(agent);
+        const result = await this.prepareSemantic(store, actor, query, { contextQueries }, signal);
+        if (!signal?.aborted && !this.disposed && this.sessions.get(agent.id) === state &&
+          state.semanticRequest === token && result.key === this.semanticKey(store, query, contextQueries)) {
+          state.semantic = result;
+          state.context = null;
+        }
+      }
     } catch (error) {
       this.noteError(error.code ?? 'PRESTEP_FAILED', '当前轮次记忆线索准备失败，未确认完整召回。');
     }
@@ -213,15 +339,13 @@ export class TidalRuntime {
       const state = this.sessionState(agent.session, space);
       state.space = space;
       if (state.context === null || state.generation !== store.generation) {
-        const pending = state.pendingQueries ?? [];
-        const queries = pending.length ? [...(state.recent ?? []).map(item => item.text), ...pending]
-          .slice(-this.config.contextMessages) : (state.recent ?? []).map(item => item.text);
-        const query = pending.length ? pending.at(-1) : recallQuery(state.query);
-        const contextQueries = queries.slice(-this.config.contextMessages, -1).reverse();
+        const { query, contextQueries, pending } = this.queryWindow(state);
         const recalled = store.recall(query, actor, { contextQueries,
-          evidenceId: pending.length || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
-        state.context = recalled.text;
-        if (pending.length) state.pendingRecall = { query,
+          ...this.cachedSemantic(store, query, contextQueries, state),
+          evidenceId: pending || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
+        const incomplete = this.config.embeddingMode !== 'off' && recalled.semanticStatus?.state !== 'ready';
+        state.context = recalled.text + (incomplete ? '\n[本地语义联想尚未完整就绪，召回可能遗漏；不要据此断言不存在相关历史。]' : '');
+        if (pending) state.pendingRecall = { query,
           ids: recalled.picked.filter(item => item.matched).map(item => item.id) };
         state.generation = store.generation;
         if (this.lastError?.operation === 'recall' && this.lastError.space === space) this.lastError = null;
@@ -344,7 +468,17 @@ export class TidalRuntime {
         if (error.code !== 'SPACE_BUSY') throw error;
         details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
       }
-      return { version: '0.3.1', root: this.root, spaces: this.names(), ...details,
+      const quote = value => process.platform === 'win32' ? `'${value.replaceAll("'", "''")}'` :
+        `'${value.replaceAll("'", "'\\''")}'`;
+      const command = `${process.platform === 'win32' ? '& ' : ''}${quote(process.execPath)} ${quote(fileURLToPath(
+        new URL('../scripts/setup-model.mjs', import.meta.url)))}`;
+      return { version: '0.4.0', root: this.root, spaces: this.names(), ...details,
+        paths: { plugin: fileURLToPath(new URL('../', import.meta.url)), models: join(this.root, 'models'),
+          semanticIndex: join(this.root, 'spaces', spaceName, 'indexes', 'semantic.sqlite3'),
+          backups: join(this.root, 'backups', spaceName) },
+        modelPacks: modelInventory(this.root).map(item => ({ ...item,
+          installCommand: `${command} --edition ${item.edition} --root ${quote(this.root)}` })),
+        semantic: { ...this.embedding.state, index: this.spaces.get(spaceName)?.semanticIndex?.status() ?? null },
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
         dailyConsolidation: details.dailyConsolidation ?? null,
         nextDailyConsolidationAt: this.config.enabled && this.config.dailyConsolidateAt && !details.unavailable ?
@@ -396,6 +530,7 @@ export class TidalRuntime {
     if (method === 'POST' && path === '/forget') {
       requireValue(body.confirmation === 'DELETE', 'CONFIRMATION_REQUIRED', '请输入 DELETE 确认删除。');
       const result = store.forget(body.id, ADMIN);
+      this.semanticQueries.clear();
       this.invalidateSpace(spaceName);
       return result;
     }
@@ -407,8 +542,29 @@ export class TidalRuntime {
     if (method === 'GET' && path === '/history') return store.revisions(query.get('id'), ADMIN);
     if (method === 'GET' && path === '/evidence') return store.get(query.get('id'), ADMIN).sources;
     if (method === 'GET' && path === '/traces') return store.traces(ADMIN);
-    if (method === 'POST' && path === '/recall') return store.recall(body.query, ADMIN, {
+    if (method === 'POST' && path === '/recall') return this.recallAsync(store, ADMIN, body.query, {
       includeArchived: body.includeArchived === true, mode: body.mode ?? 'current', asOf: body.asOf });
+    if (method === 'POST' && path === '/semantic/prepare') {
+      requireValue(this.config.embeddingMode !== 'off', 'SEMANTIC_DISABLED', '请先选择并保存本地语义组合。');
+      const result = await this.prepareSemantic(store, ADMIN, '');
+      requireValue(result.status.state === 'ready', result.status.code ?? 'SEMANTIC_FAILED',
+        result.status.message ?? '语义索引未准备完成。', 503);
+      return result.status;
+    }
+    if (method === 'POST' && path === '/semantic/rebuild') {
+      requireValue(!this.jobs.size, 'SEMANTIC_BUSY', '语义任务正在运行，请稍后重建。', 409);
+      requireValue(this.config.embeddingMode !== 'off', 'SEMANTIC_DISABLED', '请先启用语义组合。');
+      store.semanticIndex?.close();
+      store.semanticIndex = null;
+      clearSemanticFiles(store.directory);
+      this.embedding.reload();
+      this.semanticQueries.clear();
+      this.invalidateSpace(spaceName);
+      const result = await this.prepareSemantic(store, ADMIN, '');
+      requireValue(result.status.state === 'ready', result.status.code ?? 'SEMANTIC_FAILED',
+        result.status.message ?? '请先启用语义组合。', 503);
+      return result.status;
+    }
     if (method === 'POST' && path === '/timeline') return store.timeline(body, ADMIN);
     if (method === 'POST' && path === '/maintenance') return this.requestMaintenance(true, spaceName);
     if (method === 'POST' && path === '/consolidate') {
@@ -494,6 +650,7 @@ export class TidalRuntime {
   }
   async close() {
     this.disposed = true;
+    await this.embedding.close();
     await Promise.allSettled([...this.jobs]);
     for (const store of this.spaces.values()) store.close();
     this.spaces.clear();

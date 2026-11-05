@@ -15,8 +15,14 @@ for (const scenario of [
   { name: 'explicit runtime suppression', complete: true, suppressed: true, expected: false },
   { name: 'plugin injection disabled', disabled: true, expected: false },
   { name: 'colloquial capture shared with another native session', captured: true, expected: true },
+  { name: 'local semantic cross-session first request', semantic: 'cpu', captured: true, expected: true },
+  { name: 'semantic context honors runtime suppression', semantic: 'cpu', captured: true, suppressed: true, expected: false },
+  { name: 'semantic context honors complete prompt', semantic: 'cpu', captured: true, complete: true, expected: true },
+  { name: 'enhanced semantic first request', semantic: 'enhanced', captured: true, expected: true },
 ]) {
-  test(`real rc5 agent-loop request: ${scenario.name}`, { timeout: 15000 }, async () => {
+  test(`real rc5 agent-loop request: ${scenario.name}`, {
+    timeout: scenario.semantic ? 60000 : 15000, skip: scenario.semantic && !process.env.TIDAL_MODEL_ROOT,
+  }, async () => {
     const [{ Context }, { AgentRegistry }, { SessionStore }, { SessionProjectionRegistry },
       { SystemPrompt }, { ToolRuntime }, { AgentLoop }, { createUserMessage, isAgentLoopRequest }, plugin] = await Promise.all([
       hostModule('@deepseek-ai/cordis'), hostModule('@deepseek-ai/dsh-agent'),
@@ -27,7 +33,8 @@ for (const scenario of [
     const root = mkdtempSync(join(tmpdir(), 'tidal-request-'));
     const cwd = join(root, 'workspace');
     const ctx = new Context(), fibers = [], requests = [];
-    const canary = scenario.captured ? '这个项目用 SQLite 存储。' : 'omega protocol {{must_stay_literal}}';
+    const canary = scenario.semantic ? '这个项目用 SQLite 数据库存储用户信息。' :
+      scenario.captured ? '这个项目用 SQLite 存储。' : 'omega protocol {{must_stay_literal}}';
     try {
       ctx.provide('llm', {
         async prepareCall(config) {
@@ -50,6 +57,9 @@ for (const scenario of [
       fibers.push(await ctx.plugin(plugin, {
         dataRoot: root, bindings: [{ cwd, space: 'shared' }], autoBackup: false,
         injectContext: !scenario.disabled,
+        ...(scenario.semantic ? { embeddingMode: scenario.semantic, minScore: 1, residentBudget: 0,
+          embeddingModelPath: join(process.env.TIDAL_MODEL_ROOT, 'models',
+            scenario.semantic === 'cpu' ? 'bge-small-zh-v1.5' : 'qwen3-embedding-0.6b') } : {}),
       }));
       ctx.systemPrompt.section({ name: 'synthetic-prompt', order: 1, text: 'PROMPT_CANARY', complete: !!scenario.complete });
       if (scenario.suppressed) ctx.systemPrompt.suppressRuntimeContext();
@@ -61,7 +71,8 @@ for (const scenario of [
       for (let turn = 0; turn < 2; turn++) {
         const current = scenario.captured && turn ? await ctx.agentLoop.create('other-session',
           { provider: 'synthetic', model: 'no-network' }, { cwd }) : agent;
-        current.followup(createUserMessage({ content: [{ type: 'text', text: scenario.captured ? (turn ? 'SQLite' : canary) :
+        current.followup(createUserMessage({ content: [{ type: 'text', text: scenario.captured ?
+          (turn ? scenario.semantic ? '用户数据放在哪种数据库里？' : 'SQLite' : canary) :
           scenario.long ? 'omega protocol '.repeat(300) : 'omega protocol' }], source: { kind: 'user' } }));
         await current.whenIdle();
       }

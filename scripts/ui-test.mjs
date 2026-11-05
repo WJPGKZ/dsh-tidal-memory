@@ -41,6 +41,17 @@ try {
   const rejected = await page.request.post(`${preview.url}/tidal-memory/memories`, { data: { text: 'csrf' } });
   assert.equal(rejected.status(), 403);
   await page.getByRole('tab', { name: '设置与迁移' }).click();
+  await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '模型文件与下载', exact: true }).waitFor();
+  assert.equal(await page.getByRole('link', { name: '查看固定版本的模型下载来源' }).count(), 2);
+  await page.getByLabel('本地语义组合', { exact: true }).selectOption('cpu');
+  await page.getByRole('button', { name: '保存语义设置', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
+  await page.getByRole('button', { name: '准备本地语义索引', exact: true }).click();
+  await page.getByRole('alert').filter({ hasText: /本地模型尚未安装/ }).first().waitFor();
+  await page.getByLabel('本地语义组合', { exact: true }).selectOption('off');
+  await page.getByRole('button', { name: '保存语义设置', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
   await page.getByLabel('总预算（UTF-8 字节估算）').fill('48000');
   await page.getByLabel('L3 常驻范围').selectOption('core');
   await page.getByLabel('近期用户消息窗口').fill('4');

@@ -18,6 +18,12 @@ export const Config = z.object({
   residentMode: z.string().default(DEFAULTS.residentMode).volatile().description('L3 常驻：all 全部有效条目 / core 身份偏好约定及固定项 / pinned 仅固定项。'),
   residentBudget: integer(DEFAULTS.residentBudget, 0, MAX_CONTEXT_BUDGET, 'L3 常驻额度（UTF-8 字节），仍受总预算约束。0 关闭常驻输出。'),
   contextMessages: integer(DEFAULTS.contextMessages, 1, 10, '自动召回参考最近多少条用户消息。'),
+  embeddingMode: z.string().default(DEFAULTS.embeddingMode).volatile().description('off 标准 / cpu 本地语义 / enhanced 本地增强；共用同一记忆库，不自动下载模型。'),
+  embeddingModelPath: z.string().default(DEFAULTS.embeddingModelPath).volatile().description('本地模型包绝对目录；留空使用数据根 models 下的组合默认模型。'),
+  embeddingDevice: z.string().default(DEFAULTS.embeddingDevice).volatile().description('auto：增强版使用 Vulkan GPU，语义版使用 CPU；cpu：强制 CPU。'),
+  embeddingTimeoutSeconds: integer(DEFAULTS.embeddingTimeoutSeconds, 5, 3600, '语义准备等待秒数，包含冷启动和增量索引；超时明确降级，不影响记忆保存。'),
+  embeddingMinScore: z.number().min(-1).max(1).default(-1).volatile().description('语义最低相似度；-1 使用模型建议值，或设为 0–1。不是事实可信度。'),
+  embeddingRelativeFloor: z.number().min(-1).max(1).default(-1).volatile().description('语义相对最高分门槛；-1 使用模型建议值，或设为 0–1。'),
   autoConsolidate: z.boolean().default(DEFAULTS.autoConsolidate).volatile().description('空闲时执行轻整理；不调用模型。'),
   autoArchive: z.boolean().default(DEFAULTS.autoArchive).volatile().description('低重要、未强化、未召回 L2 保存满八个半衰期后归档，不删除。'),
   dailyConsolidateAt: z.string().default(DEFAULTS.dailyConsolidateAt).volatile().description('每日深度整理时间（本机时区，HH:mm）；默认 03:00，留空关闭自动深度整理。'),
@@ -66,7 +72,7 @@ export function apply(ctx, rawConfig = {}) {
         mode: { type: 'string', enum: ['current', 'history', 'as-of'], description: '默认 current；history 查询包括旧版本的历史，as-of 按事实有效时间查询。' },
         asOf: { type: 'string', description: 'as-of 模式的 ISO 时间。' } },
       execute: async (args, exec) => {
-        return runtime.recallForAgent(exec.agent, args.query, {
+        return runtime.recallForAgentAsync(exec.agent, args.query, {
           includeArchived: args.includeArchived === true, mode: args.mode ?? 'current', asOf: args.asOf });
       },
     },
@@ -113,6 +119,7 @@ export function apply(ctx, rawConfig = {}) {
           return result;
         },
         recall: query => runtime.recallForAgent(agent, query),
+        recallAsync: (query, options) => runtime.recallForAgentAsync(agent, query, options),
       });
     },
     privateWriter(ownerContext) {

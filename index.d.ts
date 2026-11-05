@@ -29,6 +29,8 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   lastRecalledAt: string | null;
 }
 export interface RecallResult {
+  semanticStatus: { mode: 'off' | 'cpu' | 'enhanced'; state: 'disabled' | 'lexical' | 'ready' | 'partial' | 'degraded';
+    code?: string; message?: string; model?: string; fingerprint?: string; candidates?: number };
   mode: 'current' | 'history' | 'as-of';
   asOf: string | null;
   text: string;
@@ -41,13 +43,19 @@ export interface RecallResult {
   contextQueries: number;
   excluded: Array<{ id: string; reason: string; score?: number }>;
   picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[]; matched: boolean;
-    channel: 'resident' | 'query' | 'association' }>;
+    channel: 'resident' | 'query' | 'association'; semanticScore?: number; fusionScore?: number }>;
+}
+export interface RecallOptions {
+  mode?: 'current' | 'history' | 'as-of';
+  asOf?: string;
+  includeArchived?: boolean;
 }
 export interface TidalMemoryService {
   readonly version: 1;
   forAgent(agent: object): {
     proposeMemory(input: MemoryProposal): MemoryRecord;
     recall(query: string): RecallResult;
+    recallAsync(query: string, options?: RecallOptions): Promise<RecallResult>;
   };
   privateWriter(ownerContext: object): {
     append(space: string, content: string, sourceIds?: string[]): { id: string; saved: true };

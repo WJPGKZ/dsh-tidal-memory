@@ -1,8 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicFile, createLayer, openDatabase, transaction } from './database.js';
+import { SemanticIndex, clearSemanticFiles } from './semantic-index.js';
 import {
   LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MAX_PROVENANCE_ITEMS, MAX_PROVENANCE_BYTES, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
   consolidationConflict, consolidationProfile, consolidationSimilarity, defaultImportance, hash, encodeCandidates, ENCODING_VERSION, memoryContentHash, memorySearchText, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms, timestamp,
@@ -70,6 +71,10 @@ export class MemorySpace {
         CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, author TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, source_ids TEXT NOT NULL);
         PRAGMA user_version=1;
       `);
+      if (existsSync(join(this.directory, 'indexes', 'semantic.sqlite3'))) {
+        try { this.semanticIndex = new SemanticIndex(this); }
+        catch (error) { this.logError('SEMANTIC_INDEX_INVALID', `派生语义索引不可用，原始记忆未改动：${error.code ?? 'INDEX_ERROR'}`); }
+      }
       this.recover();
     } catch (error) {
       this.close();
@@ -178,7 +183,8 @@ export class MemorySpace {
     });
     if (record.layer !== 'L0' && (!before || memoryContentHash(before) !== memoryContentHash(record) ||
       before.status !== record.status || before.validFrom !== record.validFrom || before.validUntil !== record.validUntil)) this.generation++;
-    this.semanticIndex?.invalidate(record);
+    try { this.semanticIndex?.invalidate(record); }
+    catch (error) { this.logError('SEMANTIC_INVALIDATION_FAILED', `正文已保存，派生索引更新失败：${error.code ?? 'INDEX_ERROR'}`); }
   }
   create(input, actor) {
     this.ensureOpen();
@@ -546,7 +552,9 @@ export class MemorySpace {
   }
   applyForget(ids) {
     this.generation++;
-    this.semanticIndex?.forget(ids);
+    this.onForget?.();
+    if (this.semanticIndex) this.semanticIndex.forget(ids);
+    else clearSemanticFiles(this.directory);
     const selected = new Set(ids);
     for (const [layer, db] of this.dbs) {
       transaction(db, () => {
@@ -617,23 +625,31 @@ export class MemorySpace {
       .run(operationId, JSON.stringify({ kind: 'reinforce', record: updated, evidenceId: key }), 'pending', this.now());
     this.completeOperation(operationId);
   }
-  recall(query, actor, { includeArchived = false, budget = this.config.tokenBudget,
-    contextQueries = [], evidenceId, mode = 'current', asOf, semantic = [] } = {}) {
+  recallScope(actor, { mode = 'current', asOf, includeArchived = false } = {}) {
     choice(mode, ['current', 'history', 'as-of'], '时间检索模式');
     const at = timestamp(asOf, '历史有效时间');
     requireValue(mode !== 'as-of' || at, 'INVALID_TIME', '按时点查询需要 asOf。');
+    requireValue(actor?.sessionId || actor?.admin, 'FORBIDDEN', '召回需要明确范围。', 403);
+    const now = mode === 'as-of' ? Date.parse(at) : this.clock();
+    const statuses = mode !== 'current' ? ['active', 'archived', 'superseded', 'completed', 'cancelled'] :
+      includeArchived ? ['active', 'archived'] : ['active'];
+    return { at, now, statuses, accept: record => record.layer !== 'L0' && this.visible(record, actor) &&
+      statuses.includes(record.status) &&
+      (mode === 'history' || ((!record.validFrom || Date.parse(record.validFrom) <= now) &&
+        (!record.validUntil || Date.parse(record.validUntil) > now))) };
+  }
+  recall(query, actor, { includeArchived = false, budget = this.config.tokenBudget,
+    contextQueries = [], evidenceId, mode = 'current', asOf, semantic = [], semanticStatus } = {}) {
+    const { at, now, statuses, accept: isEligible } = this.recallScope(actor, { mode, asOf, includeArchived });
     string(query, '查询', MAX_RECALL_QUERY_LENGTH, true);
     number(budget, 128, MAX_CONTEXT_BUDGET, '预算', true);
     requireValue(actor?.sessionId || actor?.admin, 'FORBIDDEN', '召回需要明确范围。', 403);
     requireValue(Array.isArray(contextQueries) && contextQueries.length <= 10, 'INVALID_INPUT', '情境窗最多 10 条消息。');
     contextQueries.forEach(text => string(text, '情境线索', MAX_RECALL_QUERY_LENGTH, true));
     if (evidenceId !== undefined) string(evidenceId, '召回轮次', 512);
-    const now = mode === 'as-of' ? Date.parse(at) : this.clock();
     const queries = [...new Set([query, ...contextQueries].filter(text => terms(text).length))];
     const queryTerms = [...new Set(queries.flatMap(text => terms(text)))];
-    const searchOptions = { persistentOnly: true, limitPerLayer: 200,
-      statuses: mode !== 'current' ? ['active', 'archived', 'superseded', 'completed', 'cancelled'] :
-        includeArchived ? ['active', 'archived'] : ['active'] };
+    const searchOptions = { persistentOnly: true, limitPerLayer: 200, statuses };
     const indexed = [], phraseIds = new Set();
     for (const text of queries) {
       indexed.push(...this.searchRecords(text, { ...searchOptions, mode: 'all' }));
@@ -659,11 +675,6 @@ export class MemorySpace {
         ORDER BY pinned DESC,json_extract(data,'$.importance') DESC,id LIMIT ?`)
         .all(this.now(), this.now(), Math.max(200, Math.ceil(this.config.residentBudget / 64))).map(parse));
     }
-    const isEligible = record =>
-      record.layer !== 'L0' && this.visible(record, actor) &&
-      searchOptions.statuses.includes(record.status) &&
-      (mode === 'history' || ((!record.validFrom || Date.parse(record.validFrom) <= now) &&
-      (!record.validUntil || Date.parse(record.validUntil) > now)));
     const eligible = [...new Map(indexed.map(record => [record.id, record])).values()].filter(isEligible);
     const statistics = queryTerms.length ? this.recallStatistics(queryTerms, searchOptions.statuses) : { count: 0, frequencies: new Map() };
     const documentFrequency = statistics.frequencies;
@@ -758,6 +769,8 @@ export class MemorySpace {
     }
     for (const item of primary.slice(this.config.maxRecall)) excluded.push({ id: item.record.id, reason: '相关记忆条数上限' });
     const result = { text: picked.length ? text : '', picked, excluded, threshold, bestScore, mode, asOf: at,
+      semanticStatus: semanticStatus ?? { mode: this.config.embeddingMode,
+        state: this.config.embeddingMode === 'off' ? 'disabled' : 'lexical', code: 'SYNC_RECALL' },
       estimatedTokens: picked.length ? estimatedTokens(text) : 0, budget,
       residentBytes, contextQueries: queries.length,
       accounting: 'UTF-8 字节数保守估算，不是模型 tokenizer 的精确计数' };
@@ -1080,6 +1093,7 @@ export class MemorySpace {
       count: this.db(id).prepare('SELECT count(*) AS n FROM memories').get().n,
       pending: this.db(id).prepare("SELECT count(*) AS n FROM memories WHERE status IN ('pending','candidate','review')").get().n,
       directory: join(this.directory, info.directory),
+      file: join(this.directory, info.directory, info.file),
     }));
     return { space: this.name, directory: this.directory, layers, errors: this.errors, searchIndex: this.searchIndexStatus(),
       private: this.privateStatus(), encoding: this.encodingStatus(),
@@ -1113,6 +1127,7 @@ export class MemorySpace {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.semanticIndex?.close();
     for (const db of [...this.dbs.values(), this.privateDb, this.system].filter(Boolean)) db.close();
     if (this.lock) this.lock.close();
   }

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
+import edition from './edition.json' with { type: 'json' };
 
 export const LAYERS = Object.freeze({
   L0: { name: '感知缓冲', directory: 'L0-buffer', file: 'buffer.sqlite3' },
@@ -17,6 +18,9 @@ export const DEFAULTS = Object.freeze({
   halfLifeDays: 30, bufferHours: 72, idleMinutes: 20,
   autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
   injectContext: true, autoBackup: true, backupKeep: 14, privateWriters: [],
+  embeddingMode: edition.embeddingMode, embeddingModelPath: '', embeddingDevice: 'auto',
+  embeddingTimeoutSeconds: 300,
+  embeddingMinScore: -1, embeddingRelativeFloor: -1,
 });
 export const MAX_PROVENANCE_ITEMS = 10000;
 export const MAX_PROVENANCE_BYTES = 16 * 1024 * 1024;
@@ -64,6 +68,15 @@ export function configOf(raw = {}) {
   delete result.maxModelOutputTokens;
   for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant', 'autoConsolidate', 'autoArchive']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
   choice(result.residentMode, ['all', 'core', 'pinned'], 'L3 常驻模式');
+  choice(result.embeddingMode, ['off', 'cpu', 'enhanced'], '本地语义组合');
+  choice(result.embeddingDevice, ['auto', 'cpu'], '本地推理设备');
+  for (const key of ['embeddingMinScore', 'embeddingRelativeFloor']) {
+    number(result[key], -1, 1, key);
+    requireValue(result[key] === -1 || result[key] >= 0, 'INVALID_CONFIG', `${key} 应为 -1（模型默认）或 0–1。`);
+  }
+  requireValue(typeof result.embeddingModelPath === 'string' &&
+    (result.embeddingModelPath === '' || isAbsolute(result.embeddingModelPath)),
+  'INVALID_CONFIG', '模型包目录必须是绝对路径或留空使用组合默认路径。');
   requireValue(typeof result.dailyConsolidateAt === 'string' &&
     (result.dailyConsolidateAt === '' || /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(result.dailyConsolidateAt)),
   'INVALID_CONFIG', '每日深度整理时间必须是 HH:mm 格式或留空关闭。');
@@ -73,6 +86,7 @@ export function configOf(raw = {}) {
     ['residentBudget', 0, MAX_CONTEXT_BUDGET], ['contextMessages', 1, 10], ['halfLifeDays', 1, 3650],
     ['workingHours', 0, 8760],
     ['bufferHours', 1, 720], ['idleMinutes', 1, 1440], ['backupKeep', 1, 90],
+    ['embeddingTimeoutSeconds', 5, 3600],
   ]) number(result[key], min, max, key, true);
   requireValue(typeof result.dataRoot === 'string' && (result.dataRoot === '' || isAbsolute(result.dataRoot)), 'INVALID_CONFIG', '数据根目录必须是绝对路径。');
   requireValue(Array.isArray(result.bindings) && result.bindings.length <= 100, 'INVALID_CONFIG', '工作区绑定无效。');
