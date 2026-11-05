@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { startPreview } from './preview.mjs';
 import { MemorySpace } from '../src/store.js';
 
 const preview = await startPreview();
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const candidates = [
   process.env.TIDAL_BROWSER,
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -23,6 +24,8 @@ try {
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await page.getByRole('button', { name: '潮汐记忆', exact: true }).click();
   await page.getByText('同工作区共享，不按会话分库', { exact: true }).waitFor();
+  await page.waitForFunction(expected =>
+    document.querySelector('.tidal .brand .version')?.textContent === expected, `v${packageVersion}`);
   await page.getByRole('tab', { name: '分层记忆' }).click();
   await page.getByText('测试工作区使用蓝色主题。', { exact: true }).click();
   await page.getByRole('textbox', { name: '记忆正文' }).fill('测试工作区使用绿色主题。');
@@ -109,6 +112,18 @@ try {
   await singleSpacePage.getByText('空间：default', { exact: true }).waitFor();
   assert.equal(await singleSpacePage.getByRole('combobox', { name: '记忆空间' }).inputValue(), 'default');
   await singleSpacePage.close();
+  const unavailablePage = await browser.newPage();
+  unavailablePage.on('pageerror', error => errors.push(error.message));
+  await unavailablePage.route('**/tidal-memory/status?*', route => route.fulfill({
+    status: 503, contentType: 'application/json',
+    body: JSON.stringify({ ok: false, error: { message: 'synthetic status unavailable' } }),
+  }));
+  await unavailablePage.goto(preview.url);
+  await unavailablePage.getByRole('button', { name: '设置', exact: true }).click();
+  await unavailablePage.getByRole('button', { name: '潮汐记忆', exact: true }).click();
+  await unavailablePage.getByRole('alert').filter({ hasText: 'synthetic status unavailable' }).waitFor();
+  assert.equal(await unavailablePage.locator('.tidal .brand .version').innerText(), '版本未知');
+  await unavailablePage.close();
   assert.deepEqual(errors, []);
   console.log('Browser UI checks passed: CRUD, workspace sharing/isolation, settings, privacy, index repair, lock retry, CSRF.');
 } finally {

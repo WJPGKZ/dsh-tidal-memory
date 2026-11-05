@@ -52,6 +52,23 @@ function fixture(t, patch = {}) {
 const message = text => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] });
 const admit = text => async () => ({ kind: 'accept', messages: [message(text)] });
 
+test('mixed semantic, resident and association recall keeps nullable scores lossless', async t => {
+  const { runtime, store, agent } = fixture(t, { residentBudget: 16000 });
+  const memory = store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);
+  const resident = store.create({ layer: 'L3', text: 'stable background' }, ADMIN);
+  const association = store.create({ layer: 'L2', text: 'second evidence', parents: [memory.id] }, ADMIN);
+  const result = await runtime.recallForAgentAsync(agent, '数据保存在哪里？');
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  const picked = new Map(result.picked.map(item => [item.id, item]));
+  assert.equal(picked.size, 3);
+  assert.equal(picked.get(memory.id).semanticScore, 1);
+  assert.ok(picked.get(memory.id).fusionScore > 0);
+  assert.equal(picked.get(resident.id).semanticScore, null);
+  assert.equal(picked.get(resident.id).fusionScore, 0);
+  assert.equal(picked.get(association.id).semanticScore, null);
+  assert.equal(picked.get(association.id).fusionScore, null);
+});
+
 test('semantic recall indexes only ordinary persistent memory and reaches every async surface', async t => {
   const { runtime, store, embedding, agent } = fixture(t);
   const memory = store.create({ layer: 'L2', text: 'SQLite', sessionId: 'session-a' }, ADMIN);

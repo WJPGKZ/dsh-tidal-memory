@@ -760,7 +760,7 @@ export class MemorySpace {
       if (asQuery) queryCount++;
       text += block;
       picked.push({ id: r.id, layer: r.layer, reason: item.reason, score: Number(item.score.toFixed(4)),
-        semanticScore: item.semanticScore, fusionScore: item.fusionScore, matched: hasEvidence(item),
+        semanticScore: item.semanticScore ?? null, fusionScore: item.fusionScore ?? null, matched: hasEvidence(item),
         specificity: Number(item.specificity.toFixed(4)), hits: item.hits,
         channel: asResident ? 'resident' : item.association ? 'association' : 'query' });
       if (mode === 'current' && evidenceId && hasEvidence(item) && r.status === 'active') {

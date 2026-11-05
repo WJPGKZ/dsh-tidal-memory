@@ -43,7 +43,7 @@ export interface RecallResult {
   contextQueries: number;
   excluded: Array<{ id: string; reason: string; score?: number }>;
   picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[]; matched: boolean;
-    channel: 'resident' | 'query' | 'association'; semanticScore?: number; fusionScore?: number }>;
+    channel: 'resident' | 'query' | 'association'; semanticScore: number | null; fusionScore: number | null }>;
 }
 export interface RecallOptions {
   mode?: 'current' | 'history' | 'as-of';

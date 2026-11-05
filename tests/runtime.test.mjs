@@ -27,6 +27,13 @@ function fixture(t, overrides = {}, runtimeOptions = {}) {
   return { runtime, ctx, agent, agents, config, root, cwd, modelCalls: () => modelCalls };
 }
 
+test('status version matches the installed package manifest', async t => {
+  const { runtime } = fixture(t);
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
+  assert.equal(status.version, manifest.version);
+});
+
 test('maintenance uses local rules and never calls the configured model', async t => {
   const { runtime, modelCalls } = fixture(t);
   const store = runtime.space('shared');

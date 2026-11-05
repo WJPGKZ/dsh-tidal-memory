@@ -5,9 +5,65 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hostModule } from '../src/host-deps.js';
 import { configOf } from '../src/model.js';
+import { MemorySpace } from '../src/store.js';
 import { prepareHost } from './host-env.mjs';
 
 prepareHost();
+
+for (const embeddingMode of ['off', 'cpu']) {
+  test(`real rc5 recall output is lossless JSON: ${embeddingMode === 'off' ? 'standard' : 'missing model fallback'}`, async () => {
+    const [plugin, { Context }, { SystemPrompt }, { ToolRuntime }] = await Promise.all([
+      import('../index.js'), hostModule('@deepseek-ai/cordis'),
+      hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-tools'),
+    ]);
+    const root = mkdtempSync(join(tmpdir(), 'tidal-tool-output-'));
+    const cwd = join(root, 'workspace'), ctx = new Context(), fibers = [];
+    const session = { id: 'reader', header: { cwd }, snapshotEvents: () => [] };
+    const agent = { id: session.id, session, status: 'idle' };
+    try {
+      const store = new MemorySpace(root, 'shared');
+      let seed, resident, association;
+      try {
+        seed = store.create({ layer: 'L2', text: 'violet protocol', sessionId: 'writer' }, { admin: true });
+        resident = store.create({ layer: 'L3', text: 'stable background' }, { admin: true });
+        association = store.create({ layer: 'L2', text: 'second evidence', parents: [seed.id] }, { admin: true });
+      } finally { store.close(); }
+      ctx.provide('agents', { get: id => id === agent.id ? agent : undefined, list: () => [agent] });
+      ctx.provide('sessions', {});
+      ctx.provide('webServer', { register: () => () => {} });
+      ctx.provide('connection', { requestRejection: () => undefined });
+      ctx.provide('settings', { describe: () => [] });
+      for (const dependency of [SystemPrompt, ToolRuntime]) fibers.push(await ctx.plugin(dependency, {}));
+      fibers.push(await ctx.plugin(plugin, {
+        dataRoot: root, bindings: [{ cwd, space: 'shared' }], autoBackup: false, embeddingMode,
+      }));
+      assert.ok(fibers.every(fiber => fiber.state === 2));
+      const result = await ctx.tools.execute({
+        callId: 'recall-output', name: 'tidal_recall', arguments: { query: 'violet protocol' },
+        agent, signal: new AbortController().signal,
+      });
+      assert.equal(result.isError, false, JSON.stringify(result));
+      assert.deepEqual(JSON.parse(JSON.stringify(result.value)), result.value);
+      assert.deepEqual(JSON.parse(result.content[0].text), result.value);
+      const picked = new Map(result.value.picked.map(item => [item.id, item]));
+      assert.equal(picked.size, 3);
+      assert.equal(picked.get(seed.id).channel, 'query');
+      assert.equal(picked.get(seed.id).semanticScore, null);
+      assert.ok(picked.get(seed.id).fusionScore > 0);
+      assert.equal(picked.get(resident.id).channel, 'resident');
+      assert.equal(picked.get(resident.id).semanticScore, null);
+      assert.equal(picked.get(resident.id).fusionScore, 0);
+      assert.equal(picked.get(association.id).channel, 'association');
+      assert.equal(picked.get(association.id).semanticScore, null);
+      assert.equal(picked.get(association.id).fusionScore, null);
+      assert.equal(result.value.semanticStatus.state, embeddingMode === 'off' ? 'disabled' : 'degraded');
+      if (embeddingMode !== 'off') assert.equal(result.value.semanticStatus.code, 'MODEL_NOT_INSTALLED');
+    } finally {
+      for (const fiber of fibers.reverse()) await fiber.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test('real rc5 Cordis lifecycle, volatile configuration, tools, context and private author', async () => {
   const plugin = await import('../index.js');

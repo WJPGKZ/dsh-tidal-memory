@@ -1,4 +1,4 @@
-import { readdirSync, existsSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import { bindingFor, classifyRememberDirective, configOf, MAX_RECALL_QUERY_LENGT
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
 const MAX_BODY = 12 * 1024 * 1024;
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 async function waitForLocal(promise, timeout, signal) {
   let timer, onAbort;
   const stopped = new Promise((_, reject) => {
@@ -472,7 +473,7 @@ export class TidalRuntime {
         `'${value.replaceAll("'", "'\\''")}'`;
       const command = `${process.platform === 'win32' ? '& ' : ''}${quote(process.execPath)} ${quote(fileURLToPath(
         new URL('../scripts/setup-model.mjs', import.meta.url)))}`;
-      return { version: '0.4.0', root: this.root, spaces: this.names(), ...details,
+      return { version: PACKAGE_VERSION, root: this.root, spaces: this.names(), ...details,
         paths: { plugin: fileURLToPath(new URL('../', import.meta.url)), models: join(this.root, 'models'),
           semanticIndex: join(this.root, 'spaces', spaceName, 'indexes', 'semantic.sqlite3'),
           backups: join(this.root, 'backups', spaceName) },

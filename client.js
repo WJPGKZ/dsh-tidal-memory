@@ -442,7 +442,7 @@ window.__ModuleLoader__.load({
 
       return h('main', { className: 'tidal', 'data-plugin': 'tidal-memory' },
         h('div', { className: 'hero' }, h('div', null, h('div', { className: 'eyebrow' }, 'TIDAL MEMORY'),
-          h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, `v${status?.version ?? '0.4.0'}`)), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
+          h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, status?.version ? `v${status.version}` : '版本未知')), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
           h('div', { className: 'row' }, h('select', { 'aria-label': '记忆空间', disabled: busy, value: space, onChange: e => setSpace(e.target.value) },
             (status?.spaces || ['default']).map(name => h('option', { key: name, value: name }, name))),
             button('刷新', () => run(() => Promise.resolve())))),

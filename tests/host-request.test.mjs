@@ -89,6 +89,18 @@ for (const scenario of [
         assert.match(JSON.stringify(contexts), scenario.captured ? /user_statement/ : /inference/);
         assert.match(JSON.stringify(contexts), /未人工核实/);
       }
+      const recalled = await ctx.tools.execute({
+        callId: 'recall-after-request', name: 'tidal_recall',
+        arguments: { query: scenario.semantic ? '用户数据放在哪种数据库里？' : scenario.captured ? 'SQLite' : 'omega protocol' },
+        agent, signal: new AbortController().signal,
+      });
+      assert.equal(recalled.isError, false, JSON.stringify(recalled));
+      assert.ok(recalled.value.picked.length > 0);
+      assert.deepEqual(JSON.parse(recalled.content[0].text), recalled.value);
+      if (scenario.semantic) {
+        assert.equal(recalled.value.semanticStatus.state, 'ready');
+        assert.ok(recalled.value.picked.some(item => typeof item.semanticScore === 'number'));
+      }
     } finally {
       for (const fiber of fibers.reverse()) await fiber.dispose();
       rmSync(root, { recursive: true, force: true });
