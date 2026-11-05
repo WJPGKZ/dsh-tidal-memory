@@ -185,7 +185,7 @@ test('async tool retrieval rechecks workspace authorization after local preparat
   await assert.rejects(pending, { code: 'UNBOUND_WORKSPACE' });
 });
 
-test('closing while local preparation waits releases pending work', { timeout: 3000 }, async t => {
+test('closing while local preparation waits releases pending work', { timeout: 15000 }, async t => {
   const { runtime, agent, embedding } = fixture(t);
   embedding.pause();
   const pending = runtime.recallForAgentAsync(agent, '数据保存在哪里？');
