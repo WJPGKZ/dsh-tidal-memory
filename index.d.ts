@@ -6,6 +6,7 @@ export interface MemoryProposal {
   horizon?: 'unspecified' | 'task' | 'event' | 'long_term';
   taskKey?: string;
   tags?: string[];
+  aliases?: string[];
 }
 export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   id: string;
@@ -22,11 +23,14 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   validUntil: string | null;
   expiredAt: string | null;
   source: Record<string, unknown>;
+  claim: { subject: string; predicate: string; value: string; polarity: 'positive' | 'negative'; scope: 'space' } | null;
   sources: Array<Record<string, unknown>>;
   recallCount: number;
   lastRecalledAt: string | null;
 }
 export interface RecallResult {
+  mode: 'current' | 'history' | 'as-of';
+  asOf: string | null;
   text: string;
   estimatedTokens: number;
   budget: number;
@@ -36,7 +40,7 @@ export interface RecallResult {
   residentBytes: number;
   contextQueries: number;
   excluded: Array<{ id: string; reason: string; score?: number }>;
-  picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[];
+  picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[]; matched: boolean;
     channel: 'resident' | 'query' | 'association' }>;
 }
 export interface TidalMemoryService {

@@ -47,7 +47,7 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     assert.equal(configOf(fiber.config).dailyConsolidateAt, '03:00');
     assert.equal(configOf(fiber.config).workingHours, 24);
     assert.equal(routes.size, 1);
-    assert.deepEqual([...tools.keys()].sort(), ['tidal_correct', 'tidal_read_evidence', 'tidal_recall', 'tidal_remember']);
+    assert.deepEqual([...tools.keys()].sort(), ['tidal_correct', 'tidal_read_evidence', 'tidal_recall', 'tidal_remember', 'tidal_timeline']);
     const record = await tools.get('tidal_remember').execute({ text: '候选主题', layer: 'L3' }, { agent });
     assert.equal(record.status, 'active');
     const corrected = await tools.get('tidal_correct').execute({

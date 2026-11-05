@@ -206,6 +206,23 @@ test('context injection can be disabled and workspace mutations invalidate every
   assert.equal(runtime.sessions.get(other.id).context, null);
 });
 
+test('admission queries are transient and reinforcement waits for the real user event', async t => {
+  const { runtime, agent } = fixture(t, { residentBudget: 0 });
+  const store = runtime.space('shared');
+  const record = store.create({ layer: 'L2', text: 'violet protocol' }, { admin: true });
+  const message = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'violet protocol' }] };
+  await runtime.preStep({ agent }, async () => ({ kind: 'reject' }));
+  assert.equal(runtime.sessions.size, 0);
+  await runtime.preStep({ agent }, async () => ({ kind: 'enter', messages: [message] }));
+  assert.match(runtime.context({ agent }), /violet protocol/);
+  assert.equal(store.all().filter(row => row.layer === 'L0').length, 0);
+  assert.equal(store.get(record.id, { admin: true }).recallCount, 0);
+  const event = { type: 'user/message', seq: 25, time: Date.now(), data: message };
+  runtime.onEvent(agent.session, event);
+  runtime.onEvent(agent.session, event);
+  assert.equal(store.get(record.id, { admin: true }).recallCount, 1);
+});
+
 for (const length of [2000, 2001, 16000, 16001]) {
   test(`automatic recall bounds ${length}-character messages without truncating captured text`, t => {
     const { runtime, agent } = fixture(t);
@@ -228,8 +245,11 @@ for (const length of [2000, 2001, 16000, 16001]) {
       assert.equal(buffers[0].text, text.trim());
       assert.equal(runtime.lastError, null);
     } else {
-      assert.equal(buffers.length, 0);
-      assert.equal(runtime.lastError.code, 'CAPTURE_TOO_LARGE');
+      assert.equal(buffers.length, 2);
+      for (const record of buffers) assert.equal(record.text,
+        text.slice(record.source.chunk.offset, record.source.chunk.offset + 16000).trim());
+      assert.equal(new Set(buffers.map(record => record.source.eventId)).size, 1);
+      assert.equal(runtime.lastError, null);
     }
   });
 }

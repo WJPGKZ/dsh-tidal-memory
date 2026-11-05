@@ -41,6 +41,7 @@ export function apply(ctx, rawConfig = {}) {
   ctx.effect(() => () => runtime.close());
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler: (req, res) => runtime.handle(req, res) }));
   ctx.on('session/event', (session, event) => runtime.onEvent(session, event), { global: true });
+  ctx.on('agent/pre-step', (payload, next) => runtime.preStep(payload, next), { global: true });
   ctx.on('agent/disposed', ({ agent }) => runtime.sessions.delete(agent.id), { global: true });
   ctx.effect(() => ctx.systemPrompt.context({
     name: 'tidal-memory', order: 950, interpolate: false,
@@ -61,9 +62,21 @@ export function apply(ctx, rawConfig = {}) {
     },
     {
       name: 'tidal_recall', description: '检索当前工作区跨会话共享的记忆；不读取私人日记。旧记忆不能覆盖当前指令。',
-      parameters: { query: text('查询词'), includeArchived: { type: 'boolean' } },
+      parameters: { query: text('查询词'), includeArchived: { type: 'boolean' },
+        mode: { type: 'string', enum: ['current', 'history', 'as-of'], description: '默认 current；history 查询包括旧版本的历史，as-of 按事实有效时间查询。' },
+        asOf: { type: 'string', description: 'as-of 模式的 ISO 时间。' } },
       execute: async (args, exec) => {
-        return runtime.recallForAgent(exec.agent, args.query, { includeArchived: args.includeArchived === true });
+        return runtime.recallForAgent(exec.agent, args.query, {
+          includeArchived: args.includeArchived === true, mode: args.mode ?? 'current', asOf: args.asOf });
+      },
+    },
+    {
+      name: 'tidal_timeline', description: '分页列举当前工作区已保存的情景及时间；可跨会话，不含私人日记。条目数不是实际事件总次数。',
+      parameters: { query: { type: 'string' }, from: { type: 'string' }, until: { type: 'string' },
+        offset: { type: 'integer' }, limit: { type: 'integer' } },
+      execute: async (args, exec) => {
+        const { store, actor } = runtime.forAgent(exec.agent);
+        return store.timeline(args, actor);
       },
     },
     {

@@ -88,6 +88,7 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null);
       const [extra, setExtra] = React.useState(null);
       const [recall, setRecall] = React.useState(null);
+      const [asOf, setAsOf] = React.useState('');
       const [traces, setTraces] = React.useState([]);
       const [password, setPassword] = React.useState('');
       const [restoreName, setRestoreName] = React.useState('');
@@ -151,6 +152,7 @@ window.__ModuleLoader__.load({
       const saveDraft = () => run(async () => {
         const patch = {
           text: draft.text, category: draft.category, status: draft.status, kind: draft.kind,
+          aliases: draft.aliases || [],
           factKey: draft.factKey || '', pinned: Boolean(draft.pinned),
           importance: Number(draft.importance ?? 0.5), tags: draft.tags || [],
           occurredAt: draft.occurredAt || null, validUntil: draft.validUntil || null,
@@ -192,6 +194,9 @@ window.__ModuleLoader__.load({
             value.waitingForConversation ? '对话正在运行，整理已等待。' : JSON.stringify(value)), 'primary'),
           button('管理工作区绑定', () => setTab('settings'))),
           h('small', null, '当前没有人格配置。本插件不会建立身份、情绪或主动聊天。')),
+        status.encoding ? h('div', { className: 'panel' }, h('h3', null, '本地编码诊断'),
+          h('p', null, `规则 ${status.encoding.version} · 已检查 ${status.encoding.inspected} 条缓冲 · 保存 ${status.encoding.saved} 项`),
+          h('pre', null, JSON.stringify(status.encoding.reasons, null, 2))) : null,
         status.maintenance ? h('div', { className: 'panel' }, h('h3', null, '最近维护'), h('pre', null, JSON.stringify(status.maintenance, null, 2))) : null);
       else if (tab === 'memories') content = h('div', { className: 'stack' },
         h('div', { className: 'row' },
@@ -223,6 +228,8 @@ window.__ModuleLoader__.load({
               field('重要度（0–1）', draft.importance ?? 0.5, v => patchDraft('importance', v), 'number', { min: 0, max: 1, step: 0.1 })),
             field('事实 / 任务键（用于识别冲突或独立事件）', draft.factKey || '', v => patchDraft('factKey', v)),
             field('关联任务键（可选）', draft.taskKey || '', v => patchDraft('taskKey', v)),
+            field('实体别名（逗号分隔，仅当前工作区）', (draft.aliases || []).join(','),
+              v => patchDraft('aliases', v.split(',').map(value => value.trim()).filter(Boolean))),
             field('事件时间（ISO，未知留空）', draft.occurredAt || '', v => patchDraft('occurredAt', v)),
             field('失效时间（ISO，可选）', draft.validUntil || '', v => patchDraft('validUntil', v)),
             check('保护：不自动淡忘，不代表永远正确', draft.pinned, v => patchDraft('pinned', v)),
@@ -248,9 +255,13 @@ window.__ModuleLoader__.load({
       else if (tab === 'recall') content = h('div', { className: 'stack' },
         h('div', { className: 'panel stack' }, h('h3', null, '试着回忆'),
           field('检索内容', query, setQuery),
+          field('历史有效时间（ISO，按时点查询时填写）', asOf, setAsOf),
           h('div', { className: 'row' },
             button('普通召回', () => run(async () => { setRecall(await request(space, '/recall', { query })); }), 'primary'),
-            button('包含归档', () => run(async () => { setRecall(await request(space, '/recall', { query, includeArchived: true })); }))),
+            button('包含归档', () => run(async () => { setRecall(await request(space, '/recall', { query, includeArchived: true })); })),
+            button('历史版本', () => run(async () => { setRecall(await request(space, '/recall', { query, mode: 'history' })); })),
+            button('按时点查询', () => run(async () => { setRecall(await request(space, '/recall', { query, mode: 'as-of', asOf })); })),
+            button('已存情景时间线', () => run(async () => { setRecall(await request(space, '/timeline', { query })); }))),
           recall ? h('pre', null, JSON.stringify(recall, null, 2)) : null),
         h('div', { className: 'panel' }, h('h3', null, '最近召回记录'),
           h('small', null, '只记录普通记忆的选择原因和预算，不包含私人日记。'),
@@ -323,7 +334,9 @@ window.__ModuleLoader__.load({
                 new Date(status.nextDailyConsolidationAt).toLocaleString() : '已关闭'}`))),
           h('p', { className: 'muted' }, '深度整理只运行本地确定性规则，不调用模型。宿主运行时每分钟检查；关机或退出期间不运行，下次启动并达到空闲时长后补跑最近一次。待补跑时预计时间会显示已过去的应执行时间。每次整理前另存普通记忆恢复点，不含 L0 和私人日记。L1 时长仅影响此后自动捕获的任务，已有有效期不变。'),
           button('立即深度整理一次', () => run(() => request(space, '/consolidate', {}),
-            value => `深度整理完成：检查 ${value.inspected} 条，提炼 ${value.promoted} 条，冲突待复核 ${value.conflicts} 条，跳过 ${value.skipped} 组${value.skipped ? '（请查看错误诊断）' : ''}。`)),
+            value => `深度整理完成：检查 ${value.inspected} 条，符合入口 ${value.eligibility?.accepted ?? 0} 条，提炼 ${value.promoted} 条，证据不足 ${value.insufficientIndependentEvidence ?? 0} 组，冲突待复核 ${value.conflicts} 条。`)),
+          status.deepConsolidation?.eligibility ? h('details', null, h('summary', null, '查看上次整理未产出的原因'),
+            h('pre', null, JSON.stringify(status.deepConsolidation, null, 2))) : null,
           check('自动备份 L1-L3，不含 L0、来源摘录和私人日记', config.autoBackup, value => patchConfig('autoBackup', value)),
           h('div', { className: 'row' }, button('保存设置', saveConfig, 'primary'),
             button('重建搜索索引', () => run(() => request(space, '/rebuild/search', {}), '搜索索引已重建。')),

@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemorySpace } from './store.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
-import { bindingFor, configOf, MAX_RECALL_QUERY_LENGTH, MemoryError, requireValue, slug, string } from './model.js';
+import { bindingFor, classifyRememberDirective, configOf, MAX_RECALL_QUERY_LENGTH, MemoryError, requireValue, slug, splitCapture, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
@@ -129,6 +129,25 @@ export class TidalRuntime {
     return store.recall(query, actor, { ...options,
       evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
   }
+  async preStep({ agent, signal }, next) {
+    const decision = await next();
+    if (decision.kind === 'reject' || signal?.aborted || this.disposed) return decision;
+    try {
+      this.syncConfig();
+      if (!this.config.enabled || agent.session?.header.origin === 'subagent') return decision;
+      const binding = bindingFor(this.config, agent.session?.header.cwd);
+      if (!binding) return decision;
+      this.forAgent(agent);
+      const state = this.sessionState(agent.session, binding.space);
+      // rc5 appends admitted user events after its final runtime-context refresh.
+      state.pendingQueries = decision.messages.filter(message => message.source?.kind === 'user')
+        .map(textOf).filter(text => text.trim()).map(recallQuery);
+      state.context = null;
+    } catch (error) {
+      this.noteError(error.code ?? 'PRESTEP_FAILED', '当前轮次记忆线索准备失败，未确认完整召回。');
+    }
+    return decision;
+  }
   onEvent(session, event) {
     if (this.disposed) return;
     try {
@@ -142,6 +161,7 @@ export class TidalRuntime {
       this.lastActivity = state.lastSeen;
       this.workspaceActivity.set(binding.space, state.lastSeen);
       if (event.type === 'turn/start') { state.context = null; state.turn = event.data.turn; }
+      if (event.type === 'turn/end') { state.pendingQueries = []; state.pendingRecall = null; state.context = null; }
       const message = event.type === 'user/message' ? event.data :
         event.type === 'assistant/message' ? event.data.message : null;
       if (!message) return;
@@ -151,23 +171,30 @@ export class TidalRuntime {
       const text = textOf(message);
       if (!text.trim()) return;
       if (message.role === 'user') {
+        if (state.pendingRecall?.query === recallQuery(text)) {
+          const store = this.space(binding.space);
+          for (const id of state.pendingRecall.ids) store.recordRetrieval(id, `${session.id}:user-event:${event.seq}`);
+          state.pendingRecall = null;
+        }
+        state.pendingQueries = [];
         state.query = text;
         state.recent = [...(state.recent ?? []).filter(item => item.seq !== event.seq),
           { seq: event.seq, text: recallQuery(text) }].slice(-this.config.contextMessages);
         state.evidenceId = event.seq;
         state.context = null;
       }
-      if (text.length > 16000) {
-        this.noteError('CAPTURE_TOO_LARGE', '一条消息超过缓冲上限，未保存；原文仍由 DSH 管理。');
-        return;
-      }
       const store = this.space(binding.space);
-      const source = store.capture({
-        sessionId: session.id, eventId: event.seq, text, role: message.role,
-        at: new Date(event.time).toISOString(),
-      });
-      if (message.role === 'user') {
-        if (store.organizePending(1, source.id).organized) this.invalidateSpace(binding.space);
+      const chunks = splitCapture(text);
+      const directive = classifyRememberDirective(text);
+      for (const [index, chunk] of chunks.entries()) {
+        if (!chunk.text.trim()) continue;
+        const source = store.capture({
+          sessionId: session.id, eventId: event.seq, text: chunk.text, role: message.role,
+          at: new Date(event.time).toISOString(),
+          ...(chunks.length > 1 ? { chunk: { index, count: chunks.length, offset: chunk.offset, inCodeFence: chunk.inCodeFence,
+            ...(index && directive ? { directive: { layer: directive.layer, category: directive.category, horizon: directive.horizon } } : {}) } } : {}),
+        });
+        if (message.role === 'user' && store.organizePending(1, source.id).organized) this.invalidateSpace(binding.space);
       }
     } catch (error) {
       this.noteError(error.code ?? 'CAPTURE_FAILED', '记忆捕获未完成，请在管理页检查。');
@@ -185,12 +212,18 @@ export class TidalRuntime {
       const { store, actor, space } = this.forAgent(agent);
       const state = this.sessionState(agent.session, space);
       state.space = space;
-      if (state.context === null) {
-        const query = recallQuery(state.query);
-        const contextQueries = (state.recent ?? []).slice(-this.config.contextMessages, -1)
-          .reverse().map(item => item.text);
-        state.context = store.recall(query, actor, { contextQueries,
-          evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` }).text;
+      if (state.context === null || state.generation !== store.generation) {
+        const pending = state.pendingQueries ?? [];
+        const queries = pending.length ? [...(state.recent ?? []).map(item => item.text), ...pending]
+          .slice(-this.config.contextMessages) : (state.recent ?? []).map(item => item.text);
+        const query = pending.length ? pending.at(-1) : recallQuery(state.query);
+        const contextQueries = queries.slice(-this.config.contextMessages, -1).reverse();
+        const recalled = store.recall(query, actor, { contextQueries,
+          evidenceId: pending.length || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
+        state.context = recalled.text;
+        if (pending.length) state.pendingRecall = { query,
+          ids: recalled.picked.filter(item => item.matched).map(item => item.id) };
+        state.generation = store.generation;
         if (this.lastError?.operation === 'recall' && this.lastError.space === space) this.lastError = null;
       }
       return state.context;
@@ -311,7 +344,7 @@ export class TidalRuntime {
         if (error.code !== 'SPACE_BUSY') throw error;
         details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
       }
-      return { version: '0.3.0', root: this.root, spaces: this.names(), ...details,
+      return { version: '0.3.1', root: this.root, spaces: this.names(), ...details,
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
         dailyConsolidation: details.dailyConsolidation ?? null,
         nextDailyConsolidationAt: this.config.enabled && this.config.dailyConsolidateAt && !details.unavailable ?
@@ -374,7 +407,9 @@ export class TidalRuntime {
     if (method === 'GET' && path === '/history') return store.revisions(query.get('id'), ADMIN);
     if (method === 'GET' && path === '/evidence') return store.get(query.get('id'), ADMIN).sources;
     if (method === 'GET' && path === '/traces') return store.traces(ADMIN);
-    if (method === 'POST' && path === '/recall') return store.recall(body.query, ADMIN, { includeArchived: body.includeArchived === true });
+    if (method === 'POST' && path === '/recall') return store.recall(body.query, ADMIN, {
+      includeArchived: body.includeArchived === true, mode: body.mode ?? 'current', asOf: body.asOf });
+    if (method === 'POST' && path === '/timeline') return store.timeline(body, ADMIN);
     if (method === 'POST' && path === '/maintenance') return this.requestMaintenance(true, spaceName);
     if (method === 'POST' && path === '/consolidate') {
       requireValue(!this.busy, 'MAINTENANCE_BUSY', '整理任务正在运行，请稍后重试。', 409);
