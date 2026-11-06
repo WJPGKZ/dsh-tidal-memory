@@ -19,7 +19,7 @@ function dayBounds(day) {
 }
 
 export function initializePrivateJournal(db) {
-  requireValue(db.prepare('PRAGMA user_version').get().user_version <= 2,
+  requireValue(db.prepare('PRAGMA user_version').get().user_version <= 3,
     'PRIVATE_VERSION_UNSUPPORTED', '私人记录格式较新，请使用对应版本。');
   transaction(db, () => {
     db.exec(`CREATE TABLE IF NOT EXISTS entries (
@@ -36,7 +36,8 @@ export function initializePrivateJournal(db) {
       );
       CREATE TABLE IF NOT EXISTS journal_pending (entry_id TEXT PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE);
       CREATE TABLE IF NOT EXISTS journal_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      PRAGMA user_version=2;`);
+      CREATE TABLE IF NOT EXISTS private_tombstones (id TEXT PRIMARY KEY);
+      PRAGMA user_version=3;`);
     db.exec(`DELETE FROM entry_aliases WHERE entry_id NOT IN (SELECT id FROM entries);
       DELETE FROM journal_pending WHERE entry_id NOT IN (SELECT id FROM entries);
       DELETE FROM entry_state WHERE entry_id NOT IN (SELECT id FROM entries);`);

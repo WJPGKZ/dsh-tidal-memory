@@ -7,6 +7,7 @@ export interface MemoryProposal {
   taskKey?: string;
   tags?: string[];
   aliases?: string[];
+  topics?: string[];
 }
 export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   id: string;
@@ -22,6 +23,8 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   validFrom: string | null;
   validUntil: string | null;
   expiredAt: string | null;
+  archiveReason: 'manual' | 'expired' | 'inactivity' | 'unknown' | null;
+  archivedAt: string | null;
   source: Record<string, unknown>;
   claim: { subject: string; predicate: string; value: string; polarity: 'positive' | 'negative'; scope: 'space' } | null;
   sources: Array<Record<string, unknown>>;
@@ -34,6 +37,10 @@ export interface RecallResult {
     code?: string; message?: string; model?: string; fingerprint?: string; candidates?: number };
   mode: 'current' | 'history' | 'as-of';
   asOf: string | null;
+  includeArchived: boolean;
+  topicCards: Array<{ id: string; kind: 'topic' | 'fact' | 'task' | 'alias' | 'scene';
+    label: string; count: number; evidenceIds: string[] }>;
+  topicStatus: { state: 'ready' | 'unavailable'; code?: string; message?: string };
   text: string;
   estimatedTokens: number;
   budget: number;
@@ -55,12 +62,43 @@ export interface RecallOptions {
   asOf?: string;
   includeArchived?: boolean;
 }
+export interface EvidenceOptions extends RecallOptions {
+  id?: string;
+  topic?: string;
+  cursor?: string;
+  limit?: number;
+}
+export interface EvidenceRecord {
+  id: string;
+  layer: Layer;
+  text: string;
+  status: string;
+  sources: Array<Record<string, unknown>>;
+  sourcesTotal?: number;
+  sourcesComplete?: boolean;
+  occurredAt: string | null;
+  kind: string;
+  horizon: string;
+  taskKey: string;
+  topics: string[];
+  validFrom: string | null;
+  validUntil: string | null;
+}
+export interface EvidencePage {
+  topic: string;
+  mode: 'current' | 'history' | 'as-of';
+  asOf: string | null;
+  total: number;
+  items: EvidenceRecord[];
+  nextCursor: string | null;
+}
 export interface TidalMemoryService {
   readonly version: 1;
   forAgent(agent: object): {
     proposeMemory(input: MemoryProposal): MemoryRecord;
     recall(query: string): RecallResult;
     recallAsync(query: string, options?: RecallOptions): Promise<RecallResult>;
+    readEvidence(options: EvidenceOptions): EvidenceRecord | EvidencePage;
   };
   privateWriter(ownerContext: object): {
     append(space: string, content: string, sourceIds?: string[]): { id: string; saved: true; day: string; revision: number };

@@ -17,7 +17,7 @@ export const DEFAULTS = Object.freeze({
   dailyConsolidateAt: '03:00', workingHours: 24,
   halfLifeDays: 30, bufferHours: 72, idleMinutes: 20,
   autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
-  injectContext: true, autoBackup: true, backupKeep: 14, privateWriters: [],
+  injectContext: true, autoBackup: true, autoBackupMode: 'plain', backupKeep: 14, privateWriters: [],
   deepOrganizationMode: 'local', privateOrganizationMode: 'local',
   embeddingMode: edition.embeddingMode, embeddingModelPath: '', embeddingDevice: 'auto',
   embeddingTimeoutSeconds: 300,
@@ -76,6 +76,7 @@ export function configOf(raw = {}) {
   choice(result.embeddingDevice, ['auto', 'cpu'], '本地推理设备');
   choice(result.deepOrganizationMode, ['local', 'selected'], '普通深度整理方式');
   choice(result.privateOrganizationMode, ['local', 'author'], '私人日记整理方式');
+  choice(result.autoBackupMode, ['plain', 'encrypted', 'encrypted-private'], '自动备份方式');
   for (const key of ['embeddingMinScore', 'embeddingRelativeFloor']) {
     number(result[key], -1, 1, key);
     requireValue(result[key] === -1 || result[key] >= 0, 'INVALID_CONFIG', `${key} 应为 -1（模型默认）或 0–1。`);
@@ -156,7 +157,14 @@ export function normalizeRecord(input, now, existing) {
   const validFrom = timestamp(field('validFrom'), '生效时间');
   const validUntil = timestamp(field('validUntil'), '失效时间');
   const expiredAt = timestamp(Object.hasOwn(input, 'expiredAt') ? input.expiredAt :
-    Object.hasOwn(input, 'status') ? null : existing?.expiredAt, '自动到期归档时间');
+    Object.hasOwn(input, 'status') && input.status !== existing?.status ? null : existing?.expiredAt, '自动到期归档时间');
+  requireValue(status === 'archived' || input.archiveReason === undefined || input.archiveReason === null,
+    'INVALID_INPUT', '归档原因仅适用于归档记录。');
+  const archiveReason = status === 'archived' ? choice(input.archiveReason ??
+    (existing?.status === 'archived' ? existing.archiveReason ?? (expiredAt ? 'expired' : 'unknown') :
+      expiredAt ? 'expired' : 'manual'), ['manual', 'expired', 'inactivity', 'unknown'], '归档原因') : null;
+  const archivedAt = status === 'archived' ? timestamp(input.archivedAt ??
+    (existing?.status === 'archived' ? existing.archivedAt ?? existing.expiredAt : now), '归档时间') : null;
   requireValue(!validFrom || !validUntil || Date.parse(validFrom) <= Date.parse(validUntil), 'INVALID_TIME', '失效时间不能早于生效时间。');
   const tags = input.tags ?? existing?.tags ?? [];
   requireValue(Array.isArray(tags) && tags.length <= 20 && tags.every(t => typeof t === 'string' && t.length <= 60), 'INVALID_TAGS', '标签最多 20 个，每个不超过 60 字符。');
@@ -164,6 +172,11 @@ export function normalizeRecord(input, now, existing) {
   requireValue(Array.isArray(aliases) && aliases.length <= 40 &&
     aliases.every(t => typeof t === 'string' && t.length > 0 && t.length <= 120),
   'INVALID_ALIASES', '实体别名最多 40 个，每个 1–120 字符。');
+  const topics = input.topics ?? existing?.topics ?? [];
+  requireValue(Array.isArray(topics) && topics.length <= 20 &&
+    topics.every(value => typeof value === 'string' && value.toWellFormed().normalize('NFKC').trim().length > 0 &&
+      value.toWellFormed().normalize('NFKC').trim().length <= 60),
+  'INVALID_TOPICS', '主题最多 20 个，每个 1–60 字符。');
   const claim = Object.hasOwn(input, 'claim') ? input.claim :
     input.text !== undefined && input.text !== existing?.text ? null : existing?.claim ?? null;
   if (claim !== null) {
@@ -188,10 +201,11 @@ export function normalizeRecord(input, now, existing) {
   const eventKey = layer === 'L0' ? JSON.stringify(source) : layer === 'L2' ? (occurredAt?.slice(0, 10) ?? 'unknown') : '';
   return {
     id: existing?.id ?? randomUUID(), layer, text, category, kind, status, scope, sessionId,
-    source, sources, tags: [...new Set(tags)], aliases: [...new Set(aliases)], claim,
+    source, sources, tags: [...new Set(tags)], aliases: [...new Set(aliases)],
+    topics: [...new Set(topics.map(value => value.toWellFormed().normalize('NFKC').trim().toLowerCase()))], claim,
     parents: [...new Set(parents)],
     factKey, horizon, taskKey, occurredAt,
-    validFrom, validUntil, expiredAt,
+    validFrom, validUntil, expiredAt, archiveReason, archivedAt,
     importance: number(input.importance ?? existing?.importance ?? defaultImportance(category), 0, 1, '重要度'),
     pinned: input.pinned ?? existing?.pinned ?? false,
     createdAt: existing?.createdAt ?? now, updatedAt: now,
@@ -347,7 +361,8 @@ export function splitCapture(text, limit = 16000) {
   }
   return chunks;
 }
-export const memorySearchText = record => `${record.text} ${(record.tags ?? []).join(' ')} ${(record.aliases ?? []).join(' ')}`;
+export const memorySearchText = record => `${record.text} ${(record.tags ?? []).join(' ')} ${(record.aliases ?? []).join(' ')}` +
+  ((record.topics ?? []).length ? ` ${record.topics.join(' ')}` : '');
 export const memoryContentHash = record => hash(memorySearchText(record));
 
 export const SEARCH_VERSION = 'intl-zh-v3';
@@ -395,6 +410,26 @@ export function consolidationConflict(left, right) {
 export function estimatedTokens(text) {
   return Buffer.byteLength(text, 'utf8');
 }
+export function memoryActivation(memory, now, halfLifeDays) {
+  const anchor = memory.lastRecalledAt ?? memory.reinforcedAt ?? memory.occurredAt ?? memory.createdAt;
+  const anchorKind = memory.lastRecalledAt ? 'recall' : memory.reinforcedAt ? 'confirmation' :
+    memory.occurredAt ? 'event' : 'creation';
+  const ageDays = Math.max(0, now - Date.parse(anchor)) / 86400000;
+  const effectiveHalfLifeDays = halfLifeDays * memory.stability;
+  const freshness = memory.pinned || memory.layer === 'L3' ? 1 : 2 ** (-ageDays / effectiveHalfLifeDays);
+  return { anchor, anchorKind, ageDays, effectiveHalfLifeDays, freshness };
+}
+const STABLE_CATEGORIES = new Set(['preference', 'agreement', 'knowledge', 'identity', 'self']);
+export function consolidationEligibility(record, now, { includeReview = false } = {}) {
+  if (record.layer !== 'L2') return 'otherLayer';
+  if (record.status !== 'active' && !(includeReview && record.status === 'review')) return 'inactive';
+  if (record.kind !== 'user_statement') return 'historicalOrInferred';
+  if (!STABLE_CATEGORIES.has(record.category)) return 'episodicCategory';
+  if (!['unspecified', 'long_term'].includes(record.horizon)) return 'horizon';
+  if ((record.validFrom && Date.parse(record.validFrom) > now) ||
+      (record.validUntil && Date.parse(record.validUntil) <= now)) return 'validity';
+  return 'accepted';
+}
 const EVIDENCE_STOP = new Set(['到', '在', '有', '对', '把', '从', '以', '和', '与', '还', '吗', '呢', '吧', '啊',
   '请', '可以', '一下', 'can', 'you', 'please', 'to', 'for', 'with']);
 export function rankMemory(memory, queryTerms, now, halfLifeDays, idf = new Map(), idfCeiling = 0) {
@@ -407,8 +442,7 @@ export function rankMemory(memory, queryTerms, now, halfLifeDays, idf = new Map(
   const coverage = hitWeight / Math.max(Number.EPSILON, totalWeight);
   const evidence = 1 - Math.exp(-hitWeight / Math.max(1, idfCeiling));
   const direct = 0.55 * coverage + 0.45 * evidence;
-  const age = Math.max(0, now - Date.parse(memory.lastRecalledAt ?? memory.reinforcedAt ?? memory.occurredAt ?? memory.createdAt)) / 86400000;
-  const freshness = memory.pinned || memory.layer === 'L3' ? 1 : 2 ** (-age / (halfLifeDays * memory.stability));
+  const { freshness } = memoryActivation(memory, now, halfLifeDays);
   const specificity = idfCeiling > 0 ? Math.min(1, Math.max(0, ...hits.map(weight)) / idfCeiling) : 1;
   // A complete multi-term match remains useful when IDF has little separation in a small corpus.
   const scoreSpecificity = hits.length >= 2 && hits.length === queryTerms.length ? Math.max(specificity, 0.5) : specificity;

@@ -39,7 +39,8 @@ export const Config = z.object({
   idleMinutes: integer(DEFAULTS.idleMinutes, 1, 1440, '后台整理要求的空闲分钟数。'),
   injectContext: z.boolean().default(DEFAULTS.injectContext).volatile()
     .description('自动附加普通记忆到当前聊天请求；关闭不禁止模型主动调用记忆工具。'),
-  autoBackup: z.boolean().default(true).volatile().description('自动备份 L1-L3，不含 L0、来源摘录和私人日记；旧备份不会自动清理。'),
+  autoBackup: z.boolean().default(true).volatile().description('空闲维护自动创建恢复点；深度整理前仍会创建恢复点。'),
+  autoBackupMode: z.string().default(DEFAULTS.autoBackupMode).volatile().description('plain 普通明文 / encrypted 普通加密 / encrypted-private 加密并包含私人日记；加密需要先设置 Windows 账户保护的口令。'),
   backupKeep: integer(DEFAULTS.backupKeep, 1, 90, '每空间保留的自动恢复点数量。'),
   privateWriters: z.array(z.string()).default([]).volatile().description('允许写私人记录的插件名称。第一版不自动生成私人日记。'),
 });
@@ -60,10 +61,12 @@ export function apply(ctx, rawConfig = {}) {
   const definitions = [
     {
       name: 'tidal_remember', description: '自动保存当前工作区共享的记忆并供后续召回，工具写入标为未核实推断。只记录有用信息，不记录凭据或私人日记；会话只作为来源。',
-      parameters: { text: text('要记住的内容'), layer: { type: 'string', enum: ['L1', 'L2', 'L3'], required: true } },
+      parameters: { text: text('要记住的内容'), layer: { type: 'string', enum: ['L1', 'L2', 'L3'], required: true },
+        topics: { type: 'array', items: { type: 'string' }, description: '可选的工作区主题名称，不代表事实合并。' } },
       execute: async (args, exec) => {
         const { store, actor, space } = runtime.forAgent(exec.agent);
-        const result = store.create({ text: args.text, layer: args.layer, category: args.layer === 'L1' ? 'task' : 'event' }, actor);
+        const result = store.create({ text: args.text, layer: args.layer, topics: args.topics,
+          category: args.layer === 'L1' ? 'task' : 'event' }, actor);
         runtime.invalidateSpace(space);
         return result;
       },
@@ -88,13 +91,15 @@ export function apply(ctx, rawConfig = {}) {
       },
     },
     {
-      name: 'tidal_read_evidence', description: '读取当前可见记忆的出处，不读取任意本地路径或私人记录。',
-      parameters: { id: text('记忆 ID') },
+      name: 'tidal_read_evidence', description: '按记忆 ID 或召回返回的主题入口分页读取当前工作区的正文及出处；主题页超大出处会注明仅显示数量，可按 ID 读取完整出处。默认仅限当前有效记录，不读取私人日记。',
+      parameters: { id: { type: 'string', description: '记忆 ID；与主题入口至少提供一个。' },
+        topic: { type: 'string', description: 'tidal_recall 返回的主题入口 ID。' },
+        cursor: { type: 'string', description: '上一页返回的 nextCursor。' }, limit: { type: 'integer' },
+        includeArchived: { type: 'boolean' }, mode: { type: 'string', enum: ['current', 'history', 'as-of'] },
+        asOf: { type: 'string', description: 'as-of 模式的 ISO 时间。' } },
       execute: async (args, exec) => {
         const { store, actor } = runtime.forAgent(exec.agent);
-        const record = store.get(args.id, actor);
-        return { id: record.id, sources: record.sources, occurredAt: record.occurredAt,
-          kind: record.kind, horizon: record.horizon, taskKey: record.taskKey };
+        return store.readEvidence(args, actor);
       },
     },
     {
@@ -122,6 +127,10 @@ export function apply(ctx, rawConfig = {}) {
         },
         recall: query => runtime.recallForAgent(agent, query),
         recallAsync: (query, options) => runtime.recallForAgentAsync(agent, query, options),
+        readEvidence: options => {
+          const { store, actor } = access();
+          return store.readEvidence(options, actor);
+        },
       });
     },
     privateWriter(ownerContext) {

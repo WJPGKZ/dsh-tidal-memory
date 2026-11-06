@@ -7,7 +7,7 @@ import { Readable } from 'node:stream';
 import { TidalRuntime, recallQuery } from '../src/runtime.js';
 import { MAX_RECALL_QUERY_LENGTH, MemoryError } from '../src/model.js';
 import { MemorySpace } from '../src/store.js';
-import { automaticBackup, unpackBackup } from '../src/transfer.js';
+import { automaticBackup, packBackup, restoreBackup, unpackBackup } from '../src/transfer.js';
 
 function fixture(t, overrides = {}, runtimeOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tidal-runtime-'));
@@ -143,6 +143,42 @@ test('daily scheduling uses local dates, waits for idle, and persists completion
     assert.equal((await restarted.checkDailyConsolidation()).results[0].alreadyRun, true);
     now = new Date(2026, 2, 5, 3, 0);
     assert.equal((await restarted.checkDailyConsolidation()).results[0].day, '2026-03-05');
+  } finally { await restarted.close(); }
+  assert.equal(modelCalls(), 0);
+});
+
+test('scheduled sleep creates bounded review candidates and resumes without duplicates after restart', async t => {
+  let now = new Date(2026, 2, 4, 4, 0);
+  const { runtime, ctx, config, root, modelCalls } = fixture(t, { privateWriters: ['test-author'] }, { clock: () => now });
+  runtime.lastActivity -= 21 * 60000;
+  const store = runtime.space('shared');
+  const questionAt = new Date(now.getTime() - 15 * 60000);
+  const answerAt = new Date(now.getTime() - 14 * 60000);
+  const question = store.capture({ sessionId: 's', eventId: 'q', text: '这个项目的包管理器是什么？',
+    at: questionAt.toISOString() });
+  const answer = store.capture({ sessionId: 's', eventId: 'a', text: 'pnpm', at: answerAt.toISOString() });
+  const journal = store.appendPrivate('test-author', 'PRIVATE_SLEEP_FIRST\r\nSECOND');
+  const first = await runtime.checkDailyConsolidation();
+  assert.equal(first.results[0].reencoding.candidates, 1);
+  const candidate = store.all().find(record => record.source.kind === 'local-context');
+  assert.equal(candidate.status, 'candidate');
+  assert.equal(candidate.kind, 'inference');
+  assert.deepEqual(candidate.parents, [answer.id, question.id]);
+  assert.equal(store.recall('pnpm', { sessionId: 'another' }).picked.length, 0);
+  assert.equal(store.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(journal.id).content,
+    'PRIVATE_SLEEP_FIRST\nSECOND');
+  assert.equal(store.privateStatus().count, 1);
+  assert.equal(store.status().encoding.sleep.candidates, 1);
+  await runtime.close();
+  const restarted = new TidalRuntime(ctx, config, root, { clock: () => now });
+  try {
+    restarted.lastActivity -= 21 * 60000;
+    assert.equal((await restarted.checkDailyConsolidation()).results[0].alreadyRun, true);
+    now = new Date(2026, 2, 5, 4, 0);
+    const next = await restarted.checkDailyConsolidation();
+    assert.equal(next.results[0].reencoding.candidates, 0);
+    assert.equal(restarted.space('shared').all().filter(record => record.source.kind === 'local-context').length, 1);
+    assert.equal(restarted.space('shared').privateStatus().count, 1);
   } finally { await restarted.close(); }
   assert.equal(modelCalls(), 0);
 });
@@ -308,6 +344,36 @@ test('context injection can be disabled and workspace mutations invalidate every
   runtime.invalidateSpace('shared');
   assert.equal(runtime.sessions.get(agent.id).context, null);
   assert.equal(runtime.sessions.get(other.id).context, null);
+});
+
+test('cached context is not returned when a same-lineage forget arrives during the read', t => {
+  const { runtime, agent, root } = fixture(t);
+  const store = runtime.space('shared');
+  const record = store.create({ layer: 'L3', text: 'cached context forget canary' }, { admin: true });
+  restoreBackup(root, 'context-copy', packBackup(store), '', store.config);
+  const copy = new MemorySpace(root, 'context-copy', { config: store.config });
+  try {
+    assert.match(runtime.context({ agent }), /cached context forget canary/);
+    const version = store.forgetVersion.bind(store);
+    let reads = 0, injected = false;
+    store.forgetVersion = () => {
+      if (++reads === 3) { injected = true; copy.forget(record.id, { admin: true }); }
+      return version();
+    };
+    assert.equal(runtime.context({ agent }).includes(record.text), false);
+    assert.equal(injected, true);
+    assert.equal(store.raw(record.id), undefined);
+  } finally { copy.close(); }
+});
+
+test('cached context is reevaluated when the local clock moves backwards', t => {
+  let now = Date.parse('2026-03-12T00:00:00Z');
+  const { runtime, agent } = fixture(t, {}, { clock: () => new Date(now) });
+  const store = runtime.space('shared');
+  store.create({ layer: 'L3', text: 'future context canary', validFrom: '2026-03-11T00:00:00Z' }, { admin: true });
+  assert.match(runtime.context({ agent }), /future context canary/);
+  now = Date.parse('2026-03-10T00:00:00Z');
+  assert.equal(runtime.context({ agent }).includes('future context canary'), false);
 });
 
 test('admission queries are transient and reinforcement waits for the real user event', async t => {

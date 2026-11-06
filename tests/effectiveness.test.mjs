@@ -414,6 +414,10 @@ test('derived expiry and forgotten provenance are respected by deep consolidatio
   assert.equal(space.all().filter(item => item.layer === 'L3').length, 0);
   restoreBackup(root, 'copy', before, '', space.config);
   const copy = new MemorySpace(root, 'copy');
-  try { assert.equal(copy.consolidate(200, { deep: true }).promoted, 1); }
+  try {
+    const result = copy.consolidate(200, { deep: true });
+    assert.equal(result.promoted, 0);
+    assert.equal(result.skipped, 1);
+  }
   finally { copy.close(); }
 });

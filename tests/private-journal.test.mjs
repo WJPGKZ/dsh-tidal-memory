@@ -39,12 +39,11 @@ test('one authoritative entry per author and local day preserves append order an
   assert.throws(() => space.appendPrivate('author-a', ' '.repeat(50000) + 'x'), { code: 'INVALID_INPUT' });
 });
 
-test('the legacy five-column journal writer can append after rollback and new code merges that fragment', t => {
+test('a legacy five-column insert remains readable without implying full package rollback support', t => {
   const f = fixture(t), space = f.open();
   const entry = space.appendPrivate('author-a', 'NEW_WRITER_FIRST');
   space.privateDb.prepare('INSERT INTO entries VALUES(?,?,?,?,?)')
     .run('rollback-fragment', 'author-a', 'OLD_WRITER_FRAGMENT', new Date(f.now).toISOString(), '[]');
-  space.privateDb.exec('PRAGMA user_version=1');
   space.close();
   const reopened = f.open();
   assert.equal(reopened.appendPrivate('author-a', 'NEW_WRITER_LAST').id, entry.id);
@@ -215,6 +214,8 @@ test('private deletion removes aliases and pending state without touching old ba
   assert.equal(space.privateStatus().count, 0);
   assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM entry_aliases').get().n, 0);
   assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 0);
-  restoreBackup(f.root, 'backup-still-exists', backup, 'synthetic-password-123', {});
+  const restored = restoreBackup(f.root, 'backup-still-exists', backup, 'synthetic-password-123', {});
+  assert.equal(restored.privateCount, 0);
+  assert.equal(restored.skippedPrivate, 1);
   assert.ok(existsSync(join(f.root, 'spaces', 'backup-still-exists')));
 });

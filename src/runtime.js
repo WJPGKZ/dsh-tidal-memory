@@ -6,15 +6,17 @@ import { DatabaseSync } from 'node:sqlite';
 import { MemorySpace } from './store.js';
 import { LocalEmbedding, modelInventory } from './embedding.js';
 import { SemanticIndex, semanticChunks, clearSemanticFiles } from './semantic-index.js';
+import { clearTopicFiles } from './topic-index.js';
 import { privateJournalStatus } from './private-journal.js';
-import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
+import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup, MAX_RESTORE_BODY_BYTES } from './transfer.js';
+import { automaticKeyStatus, readAutomaticKey, saveAutomaticKey } from './backup-key.js';
 import { bindingFor, classifyRememberDirective, configOf, ENCODING_VERSION, LAYERS, MAX_RECALL_QUERY_LENGTH,
   localDateKey, MemoryError, requireValue, SEARCH_VERSION, slug, splitCapture, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
 const MAX_BODY = 12 * 1024 * 1024;
-const MAX_RESTORE_BODY = 128 * 1024 * 1024;
+const MAX_RESTORE_BODY = MAX_RESTORE_BODY_BYTES;
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 async function waitForLocal(promise, timeout, signal) {
   let timer, onAbort;
@@ -107,7 +109,8 @@ export class TidalRuntime {
         this.spaces.get(name).onForget = () => {
           this.semanticQueries.clear();
           this.semanticResults.clear();
-          this.invalidateSpace(name);
+          const lineage = this.spaces.get(name)?.lineageId;
+          for (const [otherName, store] of this.spaces) if (store.lineageId === lineage) this.invalidateSpace(otherName);
         };
         this.spaceErrors.delete(name);
       } catch (error) {
@@ -122,7 +125,8 @@ export class TidalRuntime {
   names() {
     const path = join(this.root, 'spaces');
     const stored = existsSync(path) ? readdirSync(path, { withFileTypes: true })
-      .filter(item => item.isDirectory() && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(item.name) && !item.name.startsWith('restore-'))
+      .filter(item => item.isDirectory() && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(item.name) &&
+        !/^restore-[a-f0-9-]{36}$/.test(item.name))
       .map(item => item.name) : [];
     return [...new Set([...stored, ...this.config.bindings.map(b => b.space)])].sort();
   }
@@ -133,7 +137,9 @@ export class TidalRuntime {
     requireValue(agent.session.header.origin !== 'subagent', 'SUBAGENT_SCOPE', '第一版不向子代理开放跨会话记忆。', 403);
     const binding = bindingFor(this.config, agent.session.header.cwd);
     requireValue(binding, 'UNBOUND_WORKSPACE', '当前工作区未绑定记忆空间，请在设置中绑定。', 403);
-    return { store: this.space(binding.space), actor: { sessionId: agent.id }, space: binding.space };
+    const store = this.space(binding.space);
+    store.reconcileForgetLedger();
+    return { store, actor: { sessionId: agent.id }, space: binding.space };
   }
   invalidateSpace(name) {
     for (const state of this.sessions.values()) {
@@ -180,7 +186,7 @@ export class TidalRuntime {
   }
   semanticResultKey(store, actor, query, contextQueries, options = {}) {
     const scope = store.recallScope(actor, options);
-    return JSON.stringify([this.semanticKey(store, query, contextQueries), store.generation,
+    return JSON.stringify([this.semanticKey(store, query, contextQueries), store.generation, store.forgetVersion(),
       actor?.admin === true, actor?.sessionId ?? null, options.mode ?? 'current', scope.at,
       options.includeArchived === true, this.config.embeddingMinScore, this.config.embeddingRelativeFloor, this.config.maxRecall]);
   }
@@ -440,23 +446,32 @@ export class TidalRuntime {
       const { store, actor, space } = this.forAgent(agent);
       const state = this.sessionState(agent.session, space);
       state.space = space;
-      if (state.context === null || state.generation !== store.generation ||
-          (state.contextExpiresAt !== null && state.contextExpiresAt !== undefined &&
-            this.clock().getTime() >= state.contextExpiresAt)) {
-        const { query, contextQueries, pending } = this.queryWindow(state);
-        const recalled = store.recall(query, actor, { contextQueries,
-          ...this.cachedSemantic(store, actor, query, contextQueries, state),
-          evidenceId: pending || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
-        const incomplete = this.config.embeddingMode !== 'off' && recalled.semanticStatus?.state !== 'ready';
-        state.context = recalled.text + (incomplete ? '\n[本地语义联想尚未完整就绪，召回可能遗漏；不要据此断言不存在相关历史。]' : '');
-        if (pending) state.pendingRecall = { query,
-          ids: recalled.picked.filter(item => item.matched).map(item => item.id) };
-        state.generation = store.generation;
-        const scope = store.recallScope(actor);
-        state.contextExpiresAt = store.nextEligibilityChange(scope.statuses, scope.now);
-        if (this.lastError?.operation === 'recall' && this.lastError.space === space) this.lastError = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        store.reconcileForgetLedger();
+        const version = store.reconciledForgetVersion, observedAt = this.clock().getTime();
+        if (state.context === null || state.generation !== store.generation ||
+            (state.contextAt !== undefined && observedAt < state.contextAt) ||
+            (state.contextExpiresAt !== null && state.contextExpiresAt !== undefined && observedAt >= state.contextExpiresAt)) {
+          const { query, contextQueries, pending } = this.queryWindow(state);
+          const recalled = store.recall(query, actor, { contextQueries,
+            ...this.cachedSemantic(store, actor, query, contextQueries, state),
+            evidenceId: pending || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
+          const incomplete = this.config.embeddingMode !== 'off' && recalled.semanticStatus?.state !== 'ready';
+          state.context = recalled.text + (incomplete ? '\n[本地语义联想尚未完整就绪，召回可能遗漏；不要据此断言不存在相关历史。]' : '');
+          if (pending) state.pendingRecall = { query,
+            ids: recalled.picked.filter(item => item.matched).map(item => item.id) };
+          state.generation = store.generation;
+          const scope = store.recallScope(actor);
+          state.contextAt = Math.max(observedAt, scope.now);
+          state.contextExpiresAt = store.nextEligibilityChange(scope.statuses, scope.now);
+          if (this.lastError?.operation === 'recall' && this.lastError.space === space) this.lastError = null;
+        }
+        if (version === store.forgetVersion()) return state.context;
+        state.context = null;
+        state.semantic = null;
+        state.pendingRecall = null;
       }
-      return state.context;
+      throw new MemoryError('FORGET_CONFLICT', '生成上下文期间遗忘标记持续变化，请稍后重试。', 409);
     } catch (error) {
       this.noteError(error.code ?? 'RECALL_FAILED',
         error instanceof MemoryError ? `记忆召回不可用：${error.message}` : '记忆召回不可用，不应声称已经读取历史。',
@@ -624,8 +639,8 @@ export class TidalRuntime {
           continue;
         }
         try {
-          const privateOrganization = this.runPrivateOrganization(store, now, due);
           const backup = automaticBackup(store, this.root, { force: true });
+          const privateOrganization = this.runPrivateOrganization(store, now, due);
           const previousDue = new Date(due);
           previousDue.setDate(previousDue.getDate() - 1);
           const from = store.system.prepare("SELECT value FROM metadata WHERE key='sleep-reencoding-until'").get()?.value ??
@@ -700,7 +715,11 @@ export class TidalRuntime {
       return { version: PACKAGE_VERSION, root: this.root, spaces: this.names(), ...details,
         paths: { plugin: fileURLToPath(new URL('../', import.meta.url)), models: join(this.root, 'models'),
           semanticIndex: join(this.root, 'spaces', spaceName, 'indexes', 'semantic.sqlite3'),
-          backups: join(this.root, 'backups', spaceName) },
+          topicIndex: join(this.root, 'spaces', spaceName, 'indexes', 'topics.sqlite3'),
+          backups: join(this.root, 'backups', spaceName),
+          backupKey: automaticKeyStatus(this.root).path,
+          forgetLedger: join(this.root, 'system', 'forget-ledger.sqlite3') },
+        backupProtection: { mode: this.config.autoBackupMode, ...automaticKeyStatus(this.root) },
         modelPacks: modelInventory(this.root).map(item => ({ ...item,
           installCommand: `${command} --edition ${item.edition} --root ${quote(this.root)}` })),
         semantic: { ...this.embedding.state, index: this.spaces.get(spaceName)?.semanticIndex?.status() ?? null,
@@ -729,6 +748,8 @@ export class TidalRuntime {
       const validated = configOf({ ...this.config, ...body.patch });
       requireValue(validated.dataRoot === this.config.dataRoot, 'ROOT_RESTART_REQUIRED', '修改数据根目录需要停止插件并使用备份迁移。');
       requireValue(body.revision === descriptor.revision, 'REVISION_CONFLICT', '设置已变化，请刷新后重试。', 409);
+      if (validated.autoBackupMode !== 'plain' && validated.autoBackupMode !== this.config.autoBackupMode)
+        readAutomaticKey(this.root);
       const patch = Object.fromEntries(Object.entries(body.patch).filter(([key, value]) =>
         key !== 'dataRoot' && JSON.stringify(value) !== JSON.stringify(this.config[key])));
       if (Object.keys(patch).length) await this.ctx.settings.update(descriptor.ns, patch, body.revision);
@@ -739,7 +760,9 @@ export class TidalRuntime {
       const result = restoreBackup(this.root, slug(body.name), body.text, body.password ?? '', this.config);
       return result;
     }
+    if (method === 'POST' && path === '/backup/key') return saveAutomaticKey(this.root, body.password);
     const store = this.space(spaceName);
+    store.reconcileForgetLedger();
     if (method === 'GET' && path === '/memories') return store.list({
       layer: query.get('layer') || undefined, status: query.get('status') || undefined,
       query: query.get('q') ?? '', offset: Number(query.get('offset') ?? 0), limit: 50,
@@ -773,9 +796,11 @@ export class TidalRuntime {
     }
     if (method === 'GET' && path === '/history') return store.revisions(query.get('id'), ADMIN);
     if (method === 'GET' && path === '/evidence') return store.get(query.get('id'), ADMIN).sources;
+    if (method === 'GET' && path === '/lifecycle') return store.lifecycle(query.get('id'), ADMIN);
     if (method === 'GET' && path === '/traces') return store.traces(ADMIN);
     if (method === 'POST' && path === '/recall') return this.recallAsync(store, ADMIN, body.query, {
       includeArchived: body.includeArchived === true, mode: body.mode ?? 'current', asOf: body.asOf });
+    if (method === 'POST' && path === '/topics/read') return store.readEvidence(body, ADMIN);
     if (method === 'POST' && path === '/semantic/prepare') {
       requireValue(this.config.embeddingMode !== 'off', 'SEMANTIC_DISABLED', '请先选择并保存本地语义组合。');
       const result = await this.prepareSemantic(store, ADMIN, '');
@@ -813,8 +838,8 @@ export class TidalRuntime {
       try {
         const now = this.clock();
         const due = this.config.dailyConsolidateAt ? latestScheduledAt(now, this.config.dailyConsolidateAt) : now;
-        const privateOrganization = this.runPrivateOrganization(store, now, due);
         const backup = automaticBackup(store, this.root, { force: true });
+        const privateOrganization = this.runPrivateOrganization(store, now, due);
         const previousDue = new Date(due);
         previousDue.setDate(previousDue.getDate() - 1);
         const from = store.system.prepare("SELECT value FROM metadata WHERE key='sleep-reencoding-until'").get()?.value ??
@@ -833,6 +858,14 @@ export class TidalRuntime {
       return result;
     }
     if (method === 'POST' && path === '/rebuild/views') { store.rebuildViews(); return { rebuilt: true }; }
+    if (method === 'POST' && path === '/rebuild/topics') {
+      store.topicIndex?.close();
+      store.topicIndex = null;
+      store.topicCardCache.clear();
+      clearTopicFiles(store.directory);
+      store.topics();
+      return { rebuilt: true };
+    }
     if (method === 'GET' && path === '/private') return store.privateStatus();
     if (method === 'POST' && path === '/private/organize') {
       requireValue(!this.busy, 'MAINTENANCE_BUSY', '整理任务正在运行，请稍后重试。', 409);
@@ -892,7 +925,7 @@ export class TidalRuntime {
         for await (const chunk of req) {
           size += chunk.length;
           requireValue(size <= limit, 'BODY_TOO_LARGE',
-            limit === MAX_BODY ? '请求超过 12 MiB。' : '恢复请求超过 128 MiB。', 413);
+            limit === MAX_BODY ? '请求超过 12 MiB。' : '恢复请求超过 256 MiB 加少量封装开销。', 413);
           chunks.push(chunk);
         }
         body = JSON.parse(Buffer.concat(chunks).toString('utf8'));

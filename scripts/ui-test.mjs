@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { startPreview } from './preview.mjs';
 import { MemorySpace } from '../src/store.js';
+import { unpackBackup } from '../src/transfer.js';
 
 const preview = await startPreview();
 const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -31,8 +32,19 @@ try {
   await page.getByRole('textbox', { name: '记忆正文' }).fill('测试工作区使用绿色主题。');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '已保存' }).waitFor();
+  await page.getByRole('button', { name: '激活与生命周期', exact: true }).click();
+  await page.getByText('激活是排序线索，不是事实可信度。', { exact: true }).waitFor();
+  await page.getByLabel('状态', { exact: true }).selectOption('archived');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await page.getByRole('button', { name: '激活与生命周期', exact: true }).click();
+  await page.getByText(/归档原因：人工归档/).waitFor();
+  await page.getByRole('button', { name: '撤销归档', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '已撤销归档' }).waitFor();
+  assert.equal(await page.getByLabel('状态', { exact: true }).inputValue(), 'active');
   await page.getByRole('button', { name: '新建', exact: true }).click();
   await page.getByRole('textbox', { name: '记忆正文' }).fill('UI 创建的跨会话共享记录');
+  await page.getByLabel('主题（逗号分隔，用于关联和检索，不改变层级）').fill('人工体验,项目导航');
+  await page.getByLabel('实体别名（逗号分隔，仅当前工作区）').fill('别名一,别名二');
   await page.getByLabel('状态', { exact: true }).selectOption('active');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await page.getByText('UI 创建的跨会话共享记录', { exact: true }).waitFor();
@@ -42,6 +54,13 @@ try {
   assert.equal(await page.getByRole('option', { name: /调用作者自己的模型/ }).evaluate(option => option.disabled), true);
   await page.getByRole('button', { name: '重试私人轻整理', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '私人轻整理完成' }).waitFor();
+  const writers = page.getByLabel('允许的作者插件名称（逗号分隔）');
+  await writers.fill('');
+  await writers.pressSequentially('demo-author,second-author');
+  assert.equal(await writers.inputValue(), 'demo-author,second-author');
+  await page.getByRole('button', { name: '保存作者权限', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
+  assert.deepEqual(preview.runtime.config.privateWriters, ['demo-author', 'second-author']);
   assert.equal((await page.locator('body').innerText()).includes('PRIVATE_CANARY_SYNTHETIC_9038'), false);
   const privateResponse = await page.request.get(`${preview.url}/tidal-memory/private?space=default`);
   assert.equal((await privateResponse.text()).includes('PRIVATE_CANARY'), false);
@@ -52,7 +71,28 @@ try {
   assert.equal(await page.getByLabel('普通深度整理方式').inputValue(), 'local');
   assert.equal(await page.getByRole('option', { name: /宿主自选模型/ }).evaluate(option => option.disabled), true);
   await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
+  await page.getByText('当前空间的派生主题索引', { exact: true }).waitFor();
+  await page.getByText('自动备份受保护口令', { exact: true }).waitFor();
+  await page.getByText('同谱系恢复的遗忘标记（无正文）', { exact: true }).waitFor();
   await page.getByRole('heading', { name: '模型文件与下载', exact: true }).waitFor();
+  const backupMode = page.getByLabel('自动恢复点方式');
+  assert.equal(await backupMode.inputValue(), 'plain');
+  const password = 'synthetic-ui-offline-password-123';
+  if (process.platform === 'win32') {
+    await backupMode.selectOption('encrypted-private');
+    await page.getByRole('button', { name: '保存自动备份方式', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: '未设置自动加密口令' }).waitFor();
+    await page.getByLabel('设置自动备份口令（至少 12 字符）').fill(password);
+    await page.getByRole('button', { name: '保存受保护的自动备份口令', exact: true }).click();
+    await page.getByRole('status').filter({ hasText: '请离线保存原口令' }).waitFor();
+    assert.equal(await page.getByLabel('设置自动备份口令（至少 12 字符）').inputValue(), '');
+    await backupMode.selectOption('encrypted-private');
+    await page.getByRole('button', { name: '保存自动备份方式', exact: true }).click();
+    await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
+    assert.equal(preview.runtime.config.autoBackupMode, 'encrypted-private');
+  } else {
+    assert.equal(await page.getByRole('option', { name: '加密普通记忆和私人日记' }).isDisabled(), true);
+  }
   await page.getByText(/空间空闲时只为已启用的本地语义组合准备普通索引/).waitFor();
   assert.equal(await page.getByRole('link', { name: '查看固定版本的模型下载来源' }).count(), 2);
   await page.getByLabel('本地语义组合', { exact: true }).selectOption('cpu');
@@ -83,9 +123,49 @@ try {
   await page.getByRole('button', { name: '立即深度整理一次' }).click();
   await page.getByRole('status').filter({ hasText: '深度整理完成' }).waitFor();
   await page.getByText(/上次深度整理：.*手动.*提炼/).waitFor();
+  if (process.platform === 'win32') {
+    const directory = join(preview.runtime.root, 'backups', 'default');
+    const encrypted = readdirSync(directory).find(name => name.endsWith('.encrypted.json'));
+    assert.ok(encrypted);
+    const backup = readFileSync(join(directory, encrypted));
+    assert.equal(backup.includes(Buffer.from('PRIVATE_CANARY_SYNTHETIC_9038')), false);
+    assert.equal(unpackBackup(backup.toString('utf8'), password).privateEntries.length, 1);
+    await page.getByLabel('恢复到新空间（不得与现有空间重名）').fill('ui-recovered');
+    await page.getByLabel('选择备份文件').setInputFiles({
+      name: 'synthetic.encrypted', mimeType: 'application/octet-stream', buffer: backup,
+    });
+    await page.getByLabel('手动备份 / 恢复口令（至少 12 字符；手动加密备份包含私人记录）').fill('incorrect-synthetic-password');
+    await page.getByRole('button', { name: '恢复到新空间', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: '备份口令错误或加密文件已损坏' }).waitFor();
+    await page.getByLabel('手动备份 / 恢复口令（至少 12 字符；手动加密备份包含私人记录）').fill(password);
+    await page.getByRole('button', { name: '恢复到新空间', exact: true }).click();
+    await page.getByRole('status').filter({ hasText: '已恢复到 ui-recovered' }).waitFor();
+    await page.getByText(/已应用本机同谱系遗忘标记/).waitFor();
+    assert.equal(preview.runtime.space('ui-recovered').privateStatus().count, 1);
+  }
   await page.getByRole('button', { name: '重建搜索索引', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '搜索索引已重建' }).waitFor();
   await page.getByRole('tab', { name: '回忆与整理' }).click();
+  await page.getByRole('textbox', { name: '检索内容' }).fill('UI 创建的跨会话共享记录');
+  await page.getByRole('button', { name: '普通召回' }).click();
+  await page.getByText('按需查看关联主题', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '人工体验 · 1 条', exact: true }).click();
+  await page.getByText(/ID .* · 1 个出处/).waitFor();
+  await page.getByText('查看出处', { exact: true }).click();
+  await page.getByText(/"kind": "manual"/).waitFor();
+  const store = preview.runtime.space('default');
+  const large = store.create({ layer: 'L2', text: 'UI 验证大来源展示', status: 'active', topics: ['多出处'] },
+    { admin: true });
+  const sources = Array.from({ length: 1100 }, (_, index) =>
+    ({ kind: 'manual', id: `evidence-${index}`, excerpt: 'x'.repeat(1000) }));
+  store.persist({ ...large, sources, revision: large.revision + 1 });
+  await page.getByRole('textbox', { name: '检索内容' }).fill('UI 验证大来源展示');
+  await page.getByRole('button', { name: '普通召回' }).click();
+  await page.getByRole('button', { name: '多出处 · 1 条', exact: true }).click();
+  await page.getByText(/1100 个出处（本页仅显示数量）/).waitFor();
+  await page.getByRole('button', { name: '读取完整出处', exact: true }).click();
+  await page.getByText('查看出处', { exact: true }).click();
+  await page.getByText(/"id": "evidence-1099"/).waitFor();
   await page.getByRole('textbox', { name: '检索内容' }).fill('unique query with no saved match');
   await page.getByRole('button', { name: '普通召回' }).click();
   await page.waitForFunction(() => {
@@ -98,6 +178,8 @@ try {
   await page.getByText(/没有查询匹配；仍附带/).waitFor();
   const shared = preview.runtime.space('default').all().find(r => r.text === 'UI 创建的跨会话共享记录');
   assert.equal(shared.status, 'active');
+  assert.deepEqual(shared.topics, ['人工体验', '项目导航']);
+  assert.deepEqual(shared.aliases, ['别名一', '别名二']);
   assert.equal(preview.runtime.space('default').get(shared.id, { sessionId: 'another-session' }).text, shared.text);
   await page.getByRole('tab', { name: '总览' }).click();
   await page.evaluate(() => document.documentElement.style.setProperty('--dsw-alias-label-primary', 'rgb(42, 53, 64)'));

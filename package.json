@@ -1,6 +1,6 @@
 {
   "name": "dsh-tidal-memory",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "四层独立存储、证据召回与受限私人记录的 DeepSeek Harness 记忆插件。",
   "type": "module",
   "packageManager": "pnpm@11.28.5",
@@ -12,11 +12,12 @@
     "./core": "./src/store.js",
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "index.d.ts", "client.js", "src", "scripts/setup-model.mjs", "cordis.patch.yml", "README.md", "CONTRIBUTING.md", "LICENSE"],
+  "files": ["index.js", "index.d.ts", "client.js", "src", "scripts/setup-model.mjs", "scripts/bench-topics.mjs",
+    "scripts/bench-backup.mjs", "cordis.patch.yml", "README.md", "CONTRIBUTING.md", "LICENSE"],
   "engines": {"node": ">=24.0.0", "dsh": "0.2.1-rc.5"},
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:unit": "node --test tests/memory.test.mjs tests/runtime.test.mjs tests/review.test.mjs tests/effectiveness.test.mjs tests/encoding.test.mjs tests/sleep-context.test.mjs tests/private-journal.test.mjs tests/semantic.test.mjs tests/process-lock.test.mjs",
+    "test:unit": "node --test tests/memory.test.mjs tests/runtime.test.mjs tests/review.test.mjs tests/effectiveness.test.mjs tests/encoding.test.mjs tests/sleep-context.test.mjs tests/private-journal.test.mjs tests/semantic.test.mjs tests/process-lock.test.mjs tests/topics.test.mjs tests/backup-encryption.test.mjs tests/backup-boundary.test.mjs tests/restore-forget.test.mjs tests/lifecycle.test.mjs",
     "test:models": "node --test tests/local-model.test.mjs",
     "pack:editions": "node scripts/pack-editions.mjs",
     "test:host": "node --test tests/host*.test.mjs",
@@ -25,6 +26,8 @@
     "test:ui": "node scripts/ui-test.mjs",
     "bench": "node scripts/bench.mjs",
     "bench:index": "node scripts/bench-index.mjs",
+    "bench:topics": "node scripts/bench-topics.mjs",
+    "bench:backup": "node scripts/bench-backup.mjs",
     "probe:editor": "node scripts/probe-editor-alias.mjs",
     "preview": "node scripts/preview.mjs"
   },

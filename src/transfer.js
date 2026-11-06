@@ -1,30 +1,42 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync, timingSafeEqual, randomUUID } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, randomBytes, scryptSync, timingSafeEqual, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { atomicFile } from './database.js';
-import { MemorySpace } from './store.js';
+import { MemorySpace, openSpaceFor } from './store.js';
+import { expandForgotten, ForgetLedger } from './forget-ledger.js';
 import { MAX_PRIVATE_CONTENT_LENGTH } from './private-journal.js';
-import { hash, MemoryError, normalizeRecord, requireValue, slug, string, timestamp } from './model.js';
+import { readAutomaticKey } from './backup-key.js';
+import { hash, localDateKey, MemoryError, normalizeRecord, requireValue, slug, string, timestamp } from './model.js';
 
-export function packBackup(space, password = '') {
-  return packSnapshot(space.snapshot({ includePrivate: Boolean(password) }), password);
+export const MAX_BACKUP_FILE_BYTES = 128 * 1024 * 1024;
+export const MAX_RESTORE_BODY_BYTES = MAX_BACKUP_FILE_BYTES * 2 + 8192;
+function checkBackupSize(text) {
+  requireValue(typeof text === 'string' && text.length > 0, 'INVALID_BACKUP', '备份文件必须是非空文本。');
+  requireValue(Buffer.byteLength(text, 'utf8') <= MAX_BACKUP_FILE_BYTES,
+    'BACKUP_TOO_LARGE', '备份文件超过 128 MiB（UTF-8 字节）；未生成或恢复。', 413);
+  return text;
+}
+export function packBackup(space, password = '', { includePrivate = Boolean(password) } = {}) {
+  requireValue(!includePrivate || Boolean(password), 'PRIVATE_PLAINTEXT', '私人记录只能放入加密备份。');
+  return packSnapshot(space.snapshot({ includePrivate }), password);
 }
 function packSnapshot(snapshot, password = '') {
   if (password) string(password, '备份口令', 256);
-  requireValue(!password || password.length >= 12, 'WEAK_PASSWORD', '包含私人记录的备份口令至少 12 个字符。');
+  requireValue(!password || password.length >= 12, 'WEAK_PASSWORD', '加密备份口令至少 12 个字符。');
   const payload = JSON.stringify(snapshot);
-  if (!password) return JSON.stringify({ format: 'tidal-backup', version: 1, sha256: hash(payload), payload });
+  if (!password) return checkBackupSize(JSON.stringify({ format: 'tidal-backup', version: 1, sha256: hash(payload), payload }));
   const salt = randomBytes(16), iv = randomBytes(12);
   const key = scryptSync(password, salt, 32);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(Buffer.from('tidal-backup-v1'));
-  const data = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()]);
-  key.fill(0);
-  return JSON.stringify({ format: 'tidal-encrypted-backup', version: 1, salt: salt.toString('base64'),
-    iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: data.toString('base64') });
+  try {
+    const cipher = createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(Buffer.from('tidal-backup-v1'));
+    const data = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()]);
+    return checkBackupSize(JSON.stringify({ format: 'tidal-encrypted-backup', version: 1, salt: salt.toString('base64'),
+      iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: data.toString('base64') }));
+  } finally { key.fill(0); }
 }
 export function unpackBackup(text, password = '') {
-  string(text, '备份文件', 50 * 1024 * 1024);
+  checkBackupSize(text);
   const envelope = JSON.parse(text);
   requireValue(envelope.version === 1, 'BACKUP_VERSION', '不支持此备份版本。');
   let payload;
@@ -40,6 +52,8 @@ export function unpackBackup(text, password = '') {
       cipher.setAAD(Buffer.from('tidal-backup-v1'));
       cipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
       payload = Buffer.concat([cipher.update(Buffer.from(envelope.data, 'base64')), cipher.final()]).toString('utf8');
+    } catch {
+      throw new MemoryError('BACKUP_AUTH_FAILED', '备份口令错误或加密文件已损坏，未恢复数据。');
     } finally { key.fill(0); }
   } else {
     requireValue(envelope.format === 'tidal-backup' && typeof envelope.payload === 'string' &&
@@ -50,19 +64,68 @@ export function unpackBackup(text, password = '') {
   const document = JSON.parse(payload);
   requireValue(document.schema === 'tidal-memory' && document.version === 1 &&
     Array.isArray(document.records) && Array.isArray(document.revisions) && Array.isArray(document.tombstones) &&
+    (document.forgottenKeys === undefined || Array.isArray(document.forgottenKeys)) &&
     (document.reinforcements === undefined || Array.isArray(document.reinforcements)) &&
     (document.retrievalEvents === undefined || Array.isArray(document.retrievalEvents)),
   'INVALID_BACKUP', '记忆快照结构无效。');
   requireValue(envelope.format === 'tidal-encrypted-backup' ||
-    (!document.privateEntries && !document.privateAliases && !document.privatePending),
+    (!document.privateEntries && !document.privateAliases && !document.privatePending && !document.privateForgottenIds),
   'PRIVATE_PLAINTEXT', '拒绝包含私人日记的明文备份。');
   return document;
 }
 export function restoreBackup(root, name, text, password, config) {
   slug(name);
+  requireValue(!/^restore-[a-f0-9-]{36}$/.test(name), 'INVALID_SPACE', '该名称保留给临时恢复空间，请使用其他名称。');
   const target = join(root, 'spaces', name);
   requireValue(!existsSync(target), 'SPACE_EXISTS', '恢复必须使用一个尚不存在的新空间。', 409);
   const document = unpackBackup(text, password);
+  requireValue(document.lineageId === undefined || typeof document.lineageId === 'string' &&
+    /^[a-f0-9-]{36}$/.test(document.lineageId), 'INVALID_BACKUP', '恢复谱系无效。');
+  if (document.space !== undefined) slug(document.space);
+  const ledger = new ForgetLedger(root);
+  let lineageId = document.lineageId ?? (document.space ? ledger.lineageFor(document.space) : null);
+  let coverage = lineageId && ledger.hasLineage(lineageId) ?
+    (document.lineageId ? 'local-ledger' : 'legacy-name-match') : 'backup-only';
+  try {
+    const sourceFile = document.space && join(root, 'spaces', document.space, 'system', 'operations.sqlite3');
+    if ((!lineageId || coverage === 'backup-only') && sourceFile && existsSync(sourceFile)) {
+      const current = openSpaceFor(root, document.space);
+      const source = current ?? new MemorySpace(root, document.space, { config });
+      try {
+        source.recover();
+        if (!lineageId || source.lineageId === lineageId) {
+          lineageId = source.lineageId;
+          coverage = document.lineageId ? 'local-ledger' : 'legacy-name-match';
+        }
+      } finally { if (!current) source.close(); }
+    }
+    lineageId ??= randomUUID();
+    const state = ledger.state(lineageId);
+    const blockedIds = new Set(state.tombstones.map(row => row.id));
+    const blockedKeys = new Set([...state.tombstones.map(row => row.dedupe_key), ...state.forgottenKeys]);
+    requireValue(document.privateForgottenIds === undefined || Array.isArray(document.privateForgottenIds),
+      'INVALID_BACKUP', '私人遗忘标记无效。');
+    const blockedPrivateIds = new Set(state.privateIds);
+    for (const id of document.privateForgottenIds ?? []) {
+      string(id, '私人遗忘标记 ID', 64);
+      blockedPrivateIds.add(id);
+    }
+    for (const row of document.tombstones) {
+      requireValue(row && typeof row.id === 'string' && /^[a-f0-9-]{36}$/.test(row.id) &&
+        typeof row.dedupe_key === 'string' && /^[a-f0-9]{64}$/.test(row.dedupe_key),
+      'INVALID_BACKUP', '遗忘标记无效。');
+      blockedIds.add(row.id);
+      blockedKeys.add(row.dedupe_key);
+    }
+    for (const key of document.forgottenKeys ?? []) {
+      requireValue(typeof key === 'string' && /^[a-f0-9]{64}$/.test(key), 'INVALID_BACKUP', '遗忘标记无效。');
+      blockedKeys.add(key);
+    }
+    return restoreDocument(root, name, document, config, { lineageId, coverage, blockedIds, blockedKeys, blockedPrivateIds, ledger });
+  } finally { ledger.close(); }
+}
+function restoreDocument(root, name, document, config, { lineageId, coverage, blockedIds, blockedKeys, blockedPrivateIds, ledger }) {
+  const target = join(root, 'spaces', name);
   const validate = record => {
     requireValue(typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id), 'INVALID_BACKUP', '记忆 ID 无效。');
     requireValue(timestamp(record.createdAt, '创建时间') && timestamp(record.updatedAt, '更新时间'),
@@ -77,45 +140,62 @@ export function restoreBackup(root, name, text, password, config) {
   const normalized = document.records.map(validate);
   const records = new Map(normalized.map(record => [record.id, record]));
   requireValue(records.size === normalized.length, 'INVALID_BACKUP', '备份包含重复 ID。');
+  const revisions = document.revisions.map(revision => {
+    requireValue(revision && revision.record && records.has(revision.record.id) &&
+      revision.layer === revision.record.layer, 'INVALID_BACKUP', '版本历史引用无效。');
+    const record = validate(revision.record);
+    const current = records.get(record.id);
+    requireValue(current.layer === revision.layer && record.revision <= current.revision,
+      'INVALID_BACKUP', '版本历史层级或编号无效。');
+    return { layer: revision.layer, record };
+  });
+  const seeds = [...blockedIds,
+    ...normalized.filter(record => blockedKeys.has(record.dedupeKey)).map(record => record.id),
+    ...revisions.filter(({ record }) => blockedKeys.has(record.dedupeKey)).map(({ record }) => record.id)];
+  const blocked = expandForgotten([...normalized, ...revisions.map(item => item.record)], seeds);
+  const skipped = new Set(normalized.filter(record => blocked.has(record.id)).map(record => record.id));
   const staging = `restore-${randomUUID()}`;
   let store;
-  let completed = false;
+  let completed = false, published = false;
   try {
-    store = new MemorySpace(root, staging, { config });
-    for (const record of normalized) store.persist(record);
-    for (const revision of document.revisions) {
-      requireValue(records.has(revision.record.id) && revision.layer === revision.record.layer, 'INVALID_BACKUP', '版本历史引用无效。');
-      const validated = validate(revision.record);
-      const current = records.get(validated.id);
-      requireValue(current.layer === revision.layer && validated.revision <= current.revision,
-        'INVALID_BACKUP', '版本历史层级或编号无效。');
-      store.db(revision.layer).prepare('INSERT OR REPLACE INTO revisions VALUES(?,?,?)')
+    store = new MemorySpace(root, staging, { config, lineageId, registerName: false, deferLedgerWrites: true });
+    for (const record of normalized) if (!skipped.has(record.id)) store.persist(record);
+    for (const revision of revisions) {
+      const validated = revision.record;
+      if (!skipped.has(validated.id)) store.db(revision.layer).prepare('INSERT OR REPLACE INTO revisions VALUES(?,?,?)')
         .run(validated.id, validated.revision, JSON.stringify(validated));
+      else store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(validated.dedupeKey);
     }
     for (const row of document.tombstones) {
-      string(row.id, '删除 ID', 64);
-      string(row.dedupe_key, '删除摘要', 64);
-      store.system.prepare('INSERT INTO tombstones VALUES(?,?)').run(row.id, row.dedupe_key);
+      store.system.prepare('INSERT OR IGNORE INTO tombstones VALUES(?,?)').run(row.id, row.dedupe_key);
+      store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(row.dedupe_key);
     }
     for (const key of document.forgottenKeys ?? []) {
-      requireValue(typeof key === 'string' && /^[a-f0-9]{64}$/.test(key), 'INVALID_BACKUP', '遗忘标记无效。');
       store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(key);
+    }
+    for (const id of skipped) {
+      const record = records.get(id);
+      store.system.prepare('INSERT OR IGNORE INTO tombstones VALUES(?,?)').run(record.id, record.dedupeKey);
+      store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(record.dedupeKey);
     }
     for (const row of document.reinforcements ?? []) {
       requireValue(row && typeof row === 'object' && records.has(row.id), 'INVALID_BACKUP', '强化依据引用无效。');
       string(row.evidence, '强化依据', 256);
-      store.system.prepare('INSERT INTO reinforcements VALUES(?,?)').run(row.id, row.evidence);
+      if (!skipped.has(row.id)) store.system.prepare('INSERT INTO reinforcements VALUES(?,?)').run(row.id, row.evidence);
     }
     for (const row of document.retrievalEvents ?? []) {
       requireValue(row && typeof row === 'object' && records.get(row.id)?.layer === row.layer &&
         row.layer !== 'L0' && typeof row.evidence === 'string' && /^recall:[a-f0-9]{64}$/.test(row.evidence),
       'INVALID_BACKUP', '召回依据引用无效。');
-      store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
+      if (!skipped.has(row.id)) store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
     }
     requireValue((document.privateEntries === undefined || Array.isArray(document.privateEntries)) &&
       (document.privateAliases === undefined || Array.isArray(document.privateAliases)) &&
       (document.privatePending === undefined || Array.isArray(document.privatePending)),
     'INVALID_BACKUP', '私人记录备份结构无效。');
+    const skippedPrivate = new Set((document.privateEntries ?? []).filter(entry => blockedPrivateIds.has(entry.id)).map(entry => entry.id));
+    for (const alias of document.privateAliases ?? []) if (blockedPrivateIds.has(alias?.alias_id) || blockedPrivateIds.has(alias?.entry_id))
+      skippedPrivate.add(alias.entry_id);
     const privateIds = new Set();
     for (const entry of document.privateEntries ?? []) {
       string(entry.id, '私人记录 ID', 64);
@@ -137,48 +217,82 @@ export function restoreBackup(root, name, text, password, config) {
         (day === null || (updated && contentHash)), 'INVALID_BACKUP', '私人记录元数据无效。');
       requireValue(!privateIds.has(entry.id), 'INVALID_BACKUP', '私人记录 ID 重复。');
       privateIds.add(entry.id);
-      store.privateDb.prepare('INSERT INTO entries(id,author,content,created_at,source_ids) VALUES(?,?,?,?,?)')
-        .run(entry.id, entry.author, entry.content, created, JSON.stringify(sources));
-      if (day !== null) store.privateDb.prepare('INSERT INTO entry_state VALUES(?,?,?,?,?,?)')
-        .run(entry.id, entry.author, day, revision, updated, contentHash);
+      if (!skippedPrivate.has(entry.id)) {
+        store.privateDb.prepare('INSERT INTO entries(id,author,content,created_at,source_ids) VALUES(?,?,?,?,?)')
+          .run(entry.id, entry.author, entry.content, created, JSON.stringify(sources));
+        if (day !== null) store.privateDb.prepare('INSERT INTO entry_state VALUES(?,?,?,?,?,?)')
+          .run(entry.id, entry.author, day, revision, updated, contentHash);
+      }
     }
     for (const alias of document.privateAliases ?? []) {
       requireValue(alias && typeof alias === 'object' && typeof alias.alias_id === 'string' &&
         alias.alias_id.length > 0 && alias.alias_id.length <= 64 && !privateIds.has(alias.alias_id) &&
         privateIds.has(alias.entry_id), 'INVALID_BACKUP', '私人记录别名无效。');
-      store.privateDb.prepare('INSERT INTO entry_aliases VALUES(?,?)').run(alias.alias_id, alias.entry_id);
+      if (!skippedPrivate.has(alias.entry_id))
+        store.privateDb.prepare('INSERT INTO entry_aliases VALUES(?,?)').run(alias.alias_id, alias.entry_id);
     }
     for (const pending of document.privatePending ?? []) {
       requireValue(pending && privateIds.has(pending.entry_id), 'INVALID_BACKUP', '私人整理待处理项无效。');
-      store.privateDb.prepare('INSERT INTO journal_pending VALUES(?)').run(pending.entry_id);
+      if (!skippedPrivate.has(pending.entry_id))
+        store.privateDb.prepare('INSERT INTO journal_pending VALUES(?)').run(pending.entry_id);
     }
+    for (const id of document.privateForgottenIds ?? [])
+      store.privateDb.prepare('INSERT OR IGNORE INTO private_tombstones VALUES(?)').run(id);
+    store.reconciledForgetVersion = null;
+    store.recover();
+    const restoredCount = store.all().filter(record => record.layer !== 'L0').length;
+    const restoredPrivateCount = store.privateDb.prepare('SELECT count(*) AS n FROM entries').get().n;
     store.rebuildViews();
+    const expectedVersion = store.reconciledForgetVersion;
+    const markers = store.system.prepare('SELECT * FROM tombstones').all();
+    const keys = store.system.prepare('SELECT dedupe_key FROM forgotten_keys').all().map(row => row.dedupe_key);
+    const privateMarkers = store.privateDb.prepare('SELECT id FROM private_tombstones').all().map(row => row.id);
     store.close();
     store = undefined;
     requireValue(!existsSync(target), 'SPACE_EXISTS', '恢复目标已被创建，请使用其他名称。', 409);
-    renameSync(join(root, 'spaces', staging), target);
+    ledger.publishRestore(name, lineageId, expectedVersion, markers, keys, privateMarkers, () => {
+      renameSync(join(root, 'spaces', staging), target);
+      published = true;
+    });
     completed = true;
-    return { space: name, records: normalized.length, privateCount: document.privateEntries?.length ?? 0 };
+    return { space: name, records: restoredCount, skippedForgotten: normalized.length - restoredCount,
+      forgetCoverage: coverage, privateCount: restoredPrivateCount,
+      skippedPrivate: (document.privateEntries?.length ?? 0) - restoredPrivateCount };
+  } catch (error) {
+    if (published && !completed) {
+      try { renameSync(target, join(root, 'spaces', staging)); }
+      catch {
+        throw new MemoryError('RESTORE_PUBLICATION_FAILED', `恢复未确认完成，目标目录可能存在，请检查：${target}`, 500);
+      }
+    }
+    throw error;
   } finally {
     store?.close();
     if (!completed) rmSync(join(root, 'spaces', staging), { recursive: true, force: true });
   }
 }
 export function automaticBackup(space, root, { force = false } = {}) {
-  const day = space.now().slice(0, 10);
-  const last = space.system.prepare("SELECT value FROM metadata WHERE key='backup'").get();
-  if (!force && last && JSON.parse(last.value).day === day) return;
+  const day = localDateKey(new Date(space.clock()));
+  const mode = space.config.autoBackupMode;
+  const key = mode === 'plain' ? null : readAutomaticKey(root);
+  const lastRow = space.system.prepare("SELECT value FROM metadata WHERE key='backup'").get();
+  const last = lastRow ? JSON.parse(lastRow.value) : null;
+  const samePolicy = (last?.mode ?? 'plain') === mode && (last?.keyId ?? null) === (key?.id ?? null);
+  if (!force && samePolicy && last?.day === day) return;
   const directory = join(root, 'backups', space.name);
-  const snapshot = space.snapshot();
+  const snapshot = space.snapshot({ includePrivate: mode === 'encrypted-private' });
   const { createdAt, ...content } = snapshot;
-  const snapshotHash = hash(JSON.stringify(content));
-  if (!force && last && JSON.parse(last.value).hash === snapshotHash) return;
+  const serialized = JSON.stringify(content);
+  const snapshotHash = key ? createHmac('sha256', key.password).update(serialized).digest('hex') : hash(serialized);
+  if (!force && samePolicy && last?.hash === snapshotHash) return;
   mkdirSync(directory, { recursive: true });
-  const filename = `backup-${day}-${randomUUID()}.json`;
-  atomicFile(join(directory, filename), packSnapshot(snapshot));
+  const filename = `backup-${day}-${randomUUID()}${key ? '.encrypted' : ''}.json`;
+  atomicFile(join(directory, filename), packSnapshot(snapshot, key?.password ?? ''));
   space.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
-    .run('backup', JSON.stringify({ day, hash: snapshotHash, filename }));
-  const files = readdirSync(directory).filter(name => /^backup-\d{4}-\d{2}-\d{2}-[a-f0-9-]{36}\.json$/.test(name))
+    .run('backup', JSON.stringify({ day, hash: snapshotHash, filename, mode, keyId: key?.id ?? null }));
+  const pattern = key ? /^backup-\d{4}-\d{2}-\d{2}-[a-f0-9-]{36}\.encrypted\.json$/ :
+    /^backup-\d{4}-\d{2}-\d{2}-[a-f0-9-]{36}\.json$/;
+  const files = readdirSync(directory).filter(name => pattern.test(name))
     .map(name => ({ name, time: statSync(join(directory, name)).mtimeMs }))
     .sort((a, b) => Number(b.name === filename) - Number(a.name === filename) || b.time - a.time)
     .map(file => file.name);

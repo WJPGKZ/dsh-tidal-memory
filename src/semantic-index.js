@@ -87,6 +87,7 @@ export class SemanticIndex {
       const check = () => {
         requireValue(!signal?.aborted, 'SEMANTIC_CANCELLED', '本地语义准备已取消。', 409);
         requireValue(!this.closed && embedder.key === modelKey, 'MODEL_CHANGED', '索引已关闭或模型已切换。', 409);
+        this.store.reconcileForgetLedger();
       };
       check();
       this.state = 'indexing';

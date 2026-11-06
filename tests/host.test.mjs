@@ -24,9 +24,9 @@ for (const embeddingMode of ['off', 'cpu']) {
       const store = new MemorySpace(root, 'shared');
       let seed, resident, association;
       try {
-        seed = store.create({ layer: 'L2', text: 'violet protocol', sessionId: 'writer' }, { admin: true });
+        seed = store.create({ layer: 'L2', text: 'violet protocol', sessionId: 'writer', topics: ['orchid'] }, { admin: true });
         resident = store.create({ layer: 'L3', text: 'stable background' }, { admin: true });
-        association = store.create({ layer: 'L2', text: 'second evidence', parents: [seed.id] }, { admin: true });
+        association = store.create({ layer: 'L2', text: 'second evidence', parents: [seed.id], topics: ['orchid'] }, { admin: true });
       } finally { store.close(); }
       ctx.provide('agents', { get: id => id === agent.id ? agent : undefined, list: () => [agent] });
       ctx.provide('sessions', {});
@@ -58,6 +58,16 @@ for (const embeddingMode of ['off', 'cpu']) {
       assert.equal(picked.get(association.id).fusionScore, null);
       assert.equal(result.value.semanticStatus.state, embeddingMode === 'off' ? 'disabled' : 'degraded');
       if (embeddingMode !== 'off') assert.equal(result.value.semanticStatus.code, 'MODEL_NOT_INSTALLED');
+      const card = result.value.topicCards.find(item => item.label === 'orchid');
+      assert.equal(card.count, 2);
+      const detail = await ctx.tools.execute({
+        callId: 'topic-output', name: 'tidal_read_evidence', arguments: { topic: card.id, limit: 1 },
+        agent, signal: new AbortController().signal,
+      });
+      assert.equal(detail.isError, false, JSON.stringify(detail));
+      assert.deepEqual(JSON.parse(detail.content[0].text), detail.value);
+      assert.equal(detail.value.total, 2);
+      assert.ok(detail.value.nextCursor);
     } finally {
       for (const fiber of fibers.reverse()) await fiber.dispose();
       rmSync(root, { recursive: true, force: true });

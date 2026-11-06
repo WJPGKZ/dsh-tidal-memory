@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { TidalRuntime, ADMIN } from '../src/runtime.js';
 import { MemorySpace } from '../src/store.js';
 import { semanticChunks } from '../src/semantic-index.js';
 import { MemoryError, hash } from '../src/model.js';
 import { readModelPack, normalizedVector, packFile } from '../src/embedding.js';
+import { packBackup, restoreBackup } from '../src/transfer.js';
 
 class TestEmbedding {
   constructor() {
@@ -226,6 +228,35 @@ test('a late embedding cannot replace a record changed or forgotten while it was
   assert.ok(current.picked.some(item => item.id === memory.id));
   store.forget(memory.id, ADMIN);
   assert.equal((await runtime.recallForAgentAsync(agent, '水上运动')).picked.length, 0);
+});
+
+test('a late embedding cannot recreate vectors forgotten by another process in the same lineage', async t => {
+  const { root, runtime, store, embedding, agent } = fixture(t);
+  const memory = store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);
+  restoreBackup(root, 'other-process-copy', packBackup(store), '', store.config);
+  const embed = embedding.embed.bind(embedding);
+  let started, release;
+  const startedDocument = new Promise(resolve => { started = resolve; });
+  const pausedDocument = new Promise(resolve => { release = resolve; });
+  embedding.embed = async (texts, kind) => {
+    if (kind === 'document') { started(); await pausedDocument; }
+    return embed(texts, kind);
+  };
+  const pending = runtime.recallForAgentAsync(agent, '数据保存在哪里？');
+  await startedDocument;
+  const script = `
+    import { MemorySpace } from ${JSON.stringify(new URL('../src/store.js', import.meta.url).href)};
+    const space = new MemorySpace(process.argv[1], 'other-process-copy');
+    try { space.forget(process.argv[2], { admin: true }); } finally { space.close(); }
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, root, memory.id],
+    { encoding: 'utf8', timeout: 15000 });
+  release();
+  assert.equal(child.status, 0, child.stderr || child.error?.message);
+  const result = await pending;
+  assert.equal(result.picked.some(item => item.id === memory.id), false);
+  assert.equal(store.semanticIndex.db.prepare('SELECT count(*) AS n FROM vectors').get().n, 0);
+  assert.equal(store.raw(memory.id), undefined);
 });
 
 test('semantic rebuild does not reject unrelated ordinary jobs', async t => {
