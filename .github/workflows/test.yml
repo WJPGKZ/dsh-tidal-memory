@@ -16,6 +16,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm install:host
       - run: pnpm check
-      - run: pnpm test:unit
+      - name: Unit tests with bounded Windows concurrency
+        run: pnpm test:unit
       - name: Required real rc5 host contract and request tests
         run: pnpm test:host

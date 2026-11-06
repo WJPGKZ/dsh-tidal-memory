@@ -26,11 +26,15 @@ try {
   if ($result) { [Array]::Clear($result,0,$result.Length) }
 }`;
   const result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    input: bytes.toString('base64'), encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 16384,
+    input: bytes.toString('base64'), encoding: 'utf8', windowsHide: true, timeout: 30000, maxBuffer: 16384,
   });
-  if (result.error || result.status !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(result.stdout.trim()))
-    throw new MemoryError('BACKUP_KEY_UNAVAILABLE', 'Windows 账户无法保护或读取自动备份口令；未写入明文备份。', 503);
-  return Buffer.from(result.stdout.trim(), 'base64');
+  const output = typeof result.stdout === 'string' ? result.stdout.trim() : '';
+  const failure = result.error?.code === 'ETIMEDOUT' ? '响应超时' :
+    result.error ? '程序无法启动' : result.status !== 0 ? '程序执行失败' :
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(output) ? '程序返回无效格式' : null;
+  if (failure) throw new MemoryError('BACKUP_KEY_UNAVAILABLE',
+    `Windows 账户口令保护${failure}；未写入明文备份。`, 503);
+  return Buffer.from(output, 'base64');
 }
 function validPassword(password) {
   string(password, '自动备份口令', 256);
