@@ -63,7 +63,7 @@ export interface TidalMemoryService {
     recallAsync(query: string, options?: RecallOptions): Promise<RecallResult>;
   };
   privateWriter(ownerContext: object): {
-    append(space: string, content: string, sourceIds?: string[]): { id: string; saved: true };
+    append(space: string, content: string, sourceIds?: string[]): { id: string; saved: true; day: string; revision: number };
   };
 }
 export const name: string;

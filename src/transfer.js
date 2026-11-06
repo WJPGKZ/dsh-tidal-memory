@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { join, basename } from 'node:path';
 import { atomicFile } from './database.js';
 import { MemorySpace } from './store.js';
+import { MAX_PRIVATE_CONTENT_LENGTH } from './private-journal.js';
 import { hash, MemoryError, normalizeRecord, requireValue, slug, string, timestamp } from './model.js';
 
 export function packBackup(space, password = '') {
@@ -52,7 +53,9 @@ export function unpackBackup(text, password = '') {
     (document.reinforcements === undefined || Array.isArray(document.reinforcements)) &&
     (document.retrievalEvents === undefined || Array.isArray(document.retrievalEvents)),
   'INVALID_BACKUP', '记忆快照结构无效。');
-  requireValue(envelope.format === 'tidal-encrypted-backup' || !document.privateEntries, 'PRIVATE_PLAINTEXT', '拒绝包含私人日记的明文备份。');
+  requireValue(envelope.format === 'tidal-encrypted-backup' ||
+    (!document.privateEntries && !document.privateAliases && !document.privatePending),
+  'PRIVATE_PLAINTEXT', '拒绝包含私人日记的明文备份。');
   return document;
 }
 export function restoreBackup(root, name, text, password, config) {
@@ -109,14 +112,45 @@ export function restoreBackup(root, name, text, password, config) {
       'INVALID_BACKUP', '召回依据引用无效。');
       store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
     }
+    requireValue((document.privateEntries === undefined || Array.isArray(document.privateEntries)) &&
+      (document.privateAliases === undefined || Array.isArray(document.privateAliases)) &&
+      (document.privatePending === undefined || Array.isArray(document.privatePending)),
+    'INVALID_BACKUP', '私人记录备份结构无效。');
+    const privateIds = new Set();
     for (const entry of document.privateEntries ?? []) {
       string(entry.id, '私人记录 ID', 64);
       slug(entry.author);
-      string(entry.content, '私人正文', 2 * 1024 * 1024);
-      string(entry.created_at, '私人记录时间', 100);
-      requireValue(Number.isFinite(Date.parse(entry.created_at)) && Array.isArray(JSON.parse(entry.source_ids)), 'INVALID_BACKUP', '私人记录元数据无效。');
-      store.privateDb.prepare('INSERT INTO entries VALUES(?,?,?,?,?)')
-        .run(entry.id, entry.author, entry.content, entry.created_at, entry.source_ids);
+      string(entry.content, '私人正文', MAX_PRIVATE_CONTENT_LENGTH);
+      requireValue(entry.content.length <= MAX_PRIVATE_CONTENT_LENGTH, 'INVALID_BACKUP', '私人正文过长。');
+      const created = timestamp(entry.created_at, '私人记录时间');
+      const updated = timestamp(entry.updated_at, '私人记录更新时间');
+      const day = entry.day_key ?? null, revision = entry.revision ?? 1, contentHash = entry.content_hash ?? null;
+      let sources;
+      try { sources = JSON.parse(entry.source_ids); }
+      catch { throw new MemoryError('INVALID_BACKUP', '私人记录来源元数据无效。'); }
+      requireValue(created && Array.isArray(sources) && sources.length <= 10000 &&
+        sources.every(id => typeof id === 'string') && Number.isSafeInteger(revision) && revision > 0 &&
+        (day === null || (typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) &&
+          Number.isFinite(Date.parse(`${day}T00:00:00Z`)) &&
+          new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day)) &&
+        (contentHash === null || contentHash === hash(entry.content)) &&
+        (day === null || (updated && contentHash)), 'INVALID_BACKUP', '私人记录元数据无效。');
+      requireValue(!privateIds.has(entry.id), 'INVALID_BACKUP', '私人记录 ID 重复。');
+      privateIds.add(entry.id);
+      store.privateDb.prepare('INSERT INTO entries(id,author,content,created_at,source_ids) VALUES(?,?,?,?,?)')
+        .run(entry.id, entry.author, entry.content, created, JSON.stringify(sources));
+      if (day !== null) store.privateDb.prepare('INSERT INTO entry_state VALUES(?,?,?,?,?,?)')
+        .run(entry.id, entry.author, day, revision, updated, contentHash);
+    }
+    for (const alias of document.privateAliases ?? []) {
+      requireValue(alias && typeof alias === 'object' && typeof alias.alias_id === 'string' &&
+        alias.alias_id.length > 0 && alias.alias_id.length <= 64 && !privateIds.has(alias.alias_id) &&
+        privateIds.has(alias.entry_id), 'INVALID_BACKUP', '私人记录别名无效。');
+      store.privateDb.prepare('INSERT INTO entry_aliases VALUES(?,?)').run(alias.alias_id, alias.entry_id);
+    }
+    for (const pending of document.privatePending ?? []) {
+      requireValue(pending && privateIds.has(pending.entry_id), 'INVALID_BACKUP', '私人整理待处理项无效。');
+      store.privateDb.prepare('INSERT INTO journal_pending VALUES(?)').run(pending.entry_id);
     }
     store.rebuildViews();
     store.close();
@@ -256,7 +290,7 @@ export function applyImport(space, plan, selected) {
     for (const file of plan.privateFiles) {
       const h = file.fingerprint;
       const id = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
-      space.privateDb.prepare('INSERT OR IGNORE INTO entries VALUES(?,?,?,?,?)')
+      space.privateDb.prepare('INSERT OR IGNORE INTO entries(id,author,content,created_at,source_ids) VALUES(?,?,?,?,?)')
         .run(id, 'legacy-import', file.content, space.now(), '[]');
       privateCount++;
     }

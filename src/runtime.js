@@ -6,9 +6,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { MemorySpace } from './store.js';
 import { LocalEmbedding, modelInventory } from './embedding.js';
 import { SemanticIndex, semanticChunks, clearSemanticFiles } from './semantic-index.js';
+import { privateJournalStatus } from './private-journal.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
 import { bindingFor, classifyRememberDirective, configOf, ENCODING_VERSION, LAYERS, MAX_RECALL_QUERY_LENGTH,
-  MemoryError, requireValue, SEARCH_VERSION, slug, splitCapture, string } from './model.js';
+  localDateKey, MemoryError, requireValue, SEARCH_VERSION, slug, splitCapture, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
@@ -33,7 +34,7 @@ export function recallQuery(text) {
   const half = Math.floor((MAX_RECALL_QUERY_LENGTH - 1) / 2);
   return `${text.slice(0, half)}\n${text.slice(-(MAX_RECALL_QUERY_LENGTH - half - 1))}`.toWellFormed();
 }
-const dateKey = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+const dateKey = localDateKey;
 function scheduledAt(date, time) {
   const [hours, minutes] = time.split(':').map(Number);
   return new Date(date.getFullYear(), date.getMonth(), date.getDate(), hours, minutes, 0, 0);
@@ -560,8 +561,8 @@ export class TidalRuntime {
       for (const row of encoded) reasons[row.reason] = (reasons[row.reason] ?? 0) + 1;
       const privateFile = join(directory, 'private', 'journal.sqlite3');
       const privateDb = open(privateFile);
-      const count = privateDb?.prepare('SELECT count(*) AS count,max(created_at) AS lastWritten FROM entries').get() ??
-        { count: 0, lastWritten: null };
+      const count = privateDb ? privateJournalStatus(privateDb) :
+        { count: 0, lastWritten: null, dailyCount: 0, legacyCount: 0, firstDay: null, lastDay: null, organization: null, failure: null };
       let bytes = 0;
       for (const file of [privateFile, `${privateFile}-wal`]) {
         try { bytes += statSync(file).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -571,7 +572,9 @@ export class TidalRuntime {
         private: { ...count, bytes, directory: join(directory, 'private'), authors: this.config.privateWriters,
           contentVisible: false, generation: '由获准的外部作者插件提供，本插件不生成拟人人格日记。' },
         encoding: { version: ENCODING_VERSION, inspected: encoded.length,
-          saved: encoded.reduce((total, row) => total + row.saved, 0), reasons },
+          saved: encoded.reduce((total, row) => total + row.saved, 0), reasons,
+          sleep: JSON.parse(metadata.get('sleep-reencoding') ?? 'null'),
+          expiredBeforeSleep: Number(metadata.get('expired-unencoded') ?? 0) },
         maintenance: JSON.parse(metadata.get('maintenance') ?? 'null'),
         dailyConsolidation: JSON.parse(metadata.get('daily-consolidation') ?? 'null'),
         deepConsolidation: JSON.parse(metadata.get('deep-consolidation') ?? 'null'),
@@ -621,12 +624,18 @@ export class TidalRuntime {
           continue;
         }
         try {
+          const privateOrganization = this.runPrivateOrganization(store, now, due);
           const backup = automaticBackup(store, this.root, { force: true });
+          const previousDue = new Date(due);
+          previousDue.setDate(previousDue.getDate() - 1);
+          const from = store.system.prepare("SELECT value FROM metadata WHERE key='sleep-reencoding-until'").get()?.value ??
+            previousDue.toISOString();
           const result = store.dailyConsolidation(day, {
-            missed: now.getTime() - due.getTime() > 60000, backup,
+            missed: now.getTime() - due.getTime() > 60000, backup, from, until: now.toISOString(),
           });
           if (this.lastError?.operation === 'consolidation' && this.lastError.space === name) this.lastError = null;
-          results.push({ space: name, ...result });
+          results.push({ space: name, ...result, privateOrganization,
+            modelExtraction: this.modelOrganizationStatus() });
         } catch (error) {
           this.noteError(error.code ?? 'CONSOLIDATION_FAILED', `空间 ${name} 深度整理失败；未记录当日完成，下次检查重试。`,
             { operation: 'consolidation', space: name });
@@ -638,6 +647,42 @@ export class TidalRuntime {
   }
   descriptor() {
     return this.ctx.settings.describe({ redactSecrets: true }).find(row => row.ns === 'tidal-memory');
+  }
+  modelOrganizationStatus() {
+    return this.config.deepOrganizationMode === 'selected'
+      ? { mode: 'selected', state: 'unavailable', code: 'HOST_AUDIT_REQUIRED',
+        message: '宿主自选模型整理尚未满足可回放审计要求，未发送数据；本地规则仍可独立运行。' }
+      : { mode: 'local', state: 'rules-only', code: 'LOCAL_GENERATOR_NOT_CONFIGURED',
+        message: '本地生成模型未配置；仅运行本地规则和已启用的语义索引。' };
+  }
+  runPrivateOrganization(store, now, due = now) {
+    if (this.config.privateOrganizationMode === 'author') return {
+      state: 'unavailable', code: 'PRIVATE_MODEL_ROUTE_UNVERIFIED',
+      message: '作者模型映射及私人调用审计尚未验证，未发送或修改私人内容。',
+    };
+    try {
+      const previous = store.privateStatus().organization?.until;
+      const first = new Date(due);
+      first.setDate(first.getDate() - 1);
+      const from = previous ?? first.toISOString(), until = now.toISOString();
+      const result = store.organizePrivateWindow({ from, until });
+      store.privateDb.prepare("DELETE FROM journal_metadata WHERE key='last-failure'").run();
+      if (result.state === 'completed' && this.lastError?.operation === 'private' && this.lastError.space === store.name)
+        this.lastError = null;
+      return result;
+    } catch (error) {
+      let recorded = true;
+      try {
+        store.privateDb.prepare("INSERT OR REPLACE INTO journal_metadata VALUES('last-failure',?)").run(now.toISOString());
+      } catch {
+        recorded = false;
+      }
+      const code = recorded ? 'PRIVATE_ORGANIZATION_FAILED' : 'PRIVATE_STATUS_WRITE_FAILED';
+      this.noteError(code, recorded ? '私人整理未全部完成；已完成条目保留，失败条目需要重试。普通整理可继续。' :
+        '私人整理和失败状态写入均未完成，请检查私人库后重试；普通整理可继续。',
+      { operation: 'private', space: store.name });
+      return { state: 'failed', code };
+    }
   }
   async api(method, path, query, body) {
     this.syncConfig();
@@ -663,6 +708,10 @@ export class TidalRuntime {
             .map(task => ({ kind: task.kind, state: task.state })),
           lastTask: this.lastSemanticTask.get(spaceName) ?? null },
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
+        organizationModels: { ordinary: this.modelOrganizationStatus(),
+          private: { mode: this.config.privateOrganizationMode, authorAvailable: false,
+            code: 'PRIVATE_MODEL_ROUTE_UNVERIFIED',
+            message: '作者模型映射及私人调用审计尚未验证，作者模型选项暂不可用。' } },
         dailyConsolidation: details.dailyConsolidation ?? null,
         nextDailyConsolidationAt: this.config.enabled && this.config.dailyConsolidateAt && !details.unavailable ?
           nextScheduledAt(this.clock(), this.config.dailyConsolidateAt, details.dailyConsolidation?.day) : null,
@@ -762,8 +811,16 @@ export class TidalRuntime {
       'CONVERSATION_BUSY', '当前空间正在生成回复，请等会话空闲后再整理。', 409);
       this.busy = true;
       try {
+        const now = this.clock();
+        const due = this.config.dailyConsolidateAt ? latestScheduledAt(now, this.config.dailyConsolidateAt) : now;
+        const privateOrganization = this.runPrivateOrganization(store, now, due);
         const backup = automaticBackup(store, this.root, { force: true });
-        return store.manualDeepConsolidation(dateKey(this.clock()), { backup });
+        const previousDue = new Date(due);
+        previousDue.setDate(previousDue.getDate() - 1);
+        const from = store.system.prepare("SELECT value FROM metadata WHERE key='sleep-reencoding-until'").get()?.value ??
+          previousDue.toISOString();
+        return { ...store.manualDeepConsolidation(dateKey(now), { backup, from, until: now.toISOString() }), privateOrganization,
+          modelExtraction: this.modelOrganizationStatus() };
       } finally {
         this.busy = false;
         this.invalidateSpace(spaceName);
@@ -777,6 +834,18 @@ export class TidalRuntime {
     }
     if (method === 'POST' && path === '/rebuild/views') { store.rebuildViews(); return { rebuilt: true }; }
     if (method === 'GET' && path === '/private') return store.privateStatus();
+    if (method === 'POST' && path === '/private/organize') {
+      requireValue(!this.busy, 'MAINTENANCE_BUSY', '整理任务正在运行，请稍后重试。', 409);
+      requireValue(![...this.ctx.agents.list()].some(agent => agent.status === 'running' &&
+        bindingFor(this.config, agent.session.header.cwd)?.space === spaceName),
+      'CONVERSATION_BUSY', '当前空间正在生成回复，请等会话空闲后再整理。', 409);
+      const now = this.clock();
+      const due = this.config.dailyConsolidateAt ? latestScheduledAt(now, this.config.dailyConsolidateAt) : now;
+      const result = this.runPrivateOrganization(store, now, due);
+      requireValue(!['failed', 'unavailable'].includes(result.state), result.code,
+        result.message ?? '私人整理未完成，请检查状态后重试。', 409);
+      return result;
+    }
     if (method === 'POST' && path === '/private/clear') return store.clearPrivate(ADMIN, body.confirmation);
     if (method === 'POST' && path === '/backup') return { filename: `tidal-${spaceName}-${Date.now()}.${body.password ? 'encrypted' : 'json'}`,
       text: packBackup(store, body.password ?? '') };

@@ -129,7 +129,11 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
       name: 'fixture-author', inject: ['tidalMemory'],
       apply(owner) { writer = owner.tidalMemory.privateWriter(owner); },
     });
-    assert.equal(writer.append('shared', 'PRIVATE_HOST_CANARY').saved, true);
+    const firstPrivate = writer.append('shared', 'PRIVATE_HOST_CANARY');
+    const secondPrivate = writer.append('shared', 'PRIVATE_HOST_SECOND_CANARY');
+    assert.equal(firstPrivate.saved, true);
+    assert.equal(secondPrivate.id, firstPrivate.id);
+    assert.ok(secondPrivate.revision > firstPrivate.revision);
     assert.throws(() => ctx.tidalMemory.privateWriter({}), /真实 Context/);
     assert.equal(ctx.tidalMemory.forAgent(agent).recall('PRIVATE_HOST_CANARY').text.includes('PRIVATE_HOST_CANARY'), false);
     await writerFiber.dispose();

@@ -4,9 +4,11 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicFile, createLayer, openDatabase, transaction } from './database.js';
 import { SemanticIndex, clearSemanticFiles } from './semantic-index.js';
+import { appendPrivateEntry, initializePrivateJournal, organizePrivateWindow, privateJournalStatus } from './private-journal.js';
+import { contextualSleepCandidate, SLEEP_CONTEXT_VERSION } from './sleep-context.js';
 import {
   LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MAX_PROVENANCE_ITEMS, MAX_PROVENANCE_BYTES, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
-  consolidationConflict, consolidationProfile, consolidationSimilarity, defaultImportance, hash, encodeCandidates, ENCODING_VERSION, memoryContentHash, memorySearchText, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms, timestamp,
+  consolidationConflict, consolidationProfile, consolidationSimilarity, defaultImportance, hash, encodeCandidates, ENCODING_VERSION, localDateKey, memoryContentHash, memorySearchText, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms, timestamp,
 } from './model.js';
 
 const parse = row => {
@@ -66,13 +68,13 @@ export class MemorySpace {
         CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS encodings (source_id TEXT PRIMARY KEY, version TEXT NOT NULL, result TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sleep_encodings (source_id TEXT PRIMARY KEY, source_revision INTEGER NOT NULL,
+          version TEXT NOT NULL, context_hash TEXT NOT NULL, result TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sleep_expirations (source_id TEXT PRIMARY KEY);
         PRAGMA user_version=1;
       `);
       this.privateDb = openDatabase(join(this.directory, 'private', 'journal.sqlite3'));
-      this.privateDb.exec(`
-        CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, author TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, source_ids TEXT NOT NULL);
-        PRAGMA user_version=1;
-      `);
+      initializePrivateJournal(this.privateDb);
       if (existsSync(join(this.directory, 'indexes', 'semantic.sqlite3'))) {
         try { this.semanticIndex = new SemanticIndex(this); }
         catch (error) { this.logError('SEMANTIC_INDEX_INVALID', `派生语义索引不可用，原始记忆未改动：${error.code ?? 'INDEX_ERROR'}`); }
@@ -374,7 +376,75 @@ export class MemorySpace {
     const rows = this.system.prepare('SELECT result FROM encodings').all().map(row => JSON.parse(row.result));
     const reasons = {};
     for (const row of rows) reasons[row.reason] = (reasons[row.reason] ?? 0) + 1;
-    return { version: ENCODING_VERSION, inspected: rows.length, saved: rows.reduce((n, row) => n + row.saved, 0), reasons };
+    const sleep = this.system.prepare("SELECT value FROM metadata WHERE key='sleep-reencoding'").get()?.value;
+    const expired = this.system.prepare("SELECT value FROM metadata WHERE key='expired-unencoded'").get()?.value;
+    return { version: ENCODING_VERSION, inspected: rows.length, saved: rows.reduce((n, row) => n + row.saved, 0),
+      reasons, sleep: sleep ? JSON.parse(sleep) : null, expiredBeforeSleep: Number(expired ?? 0) };
+  }
+  reencodeRecent({ from, until }) {
+    const start = timestamp(from, '二次编码起点'), end = timestamp(until, '二次编码截止点');
+    requireValue(start && end && start <= end, 'INVALID_TIME', '二次编码时间范围无效。');
+    const result = { version: SLEEP_CONTEXT_VERSION, from: start, until: end,
+      inspected: 0, candidates: 0, skipped: 0, state: this.config.autoCandidates ? 'completed' : 'disabled' };
+    if (!this.config.autoCandidates) return result;
+    const db = this.db('L0');
+    const retentionStart = new Date(this.clock() - this.config.bufferHours * 3600000).toISOString();
+    const records = db.prepare(`SELECT data FROM memories WHERE status='processed' AND created_at>=? AND created_at<=?
+      AND updated_at>=?
+      AND json_extract(data,'$.source.kind')='session' AND json_extract(data,'$.source.role')='user'
+      ORDER BY created_at,rowid`).all(start, end, retentionStart).map(parse);
+    for (const source of records) {
+      const initial = this.system.prepare('SELECT result FROM encodings WHERE source_id=?').get(source.id);
+      if (!initial || JSON.parse(initial.result).reason !== 'no-explicit-rule' || source.source.chunk?.inCodeFence) continue;
+      const context = db.prepare(`SELECT data FROM memories WHERE session_id=? AND rowid<(SELECT rowid FROM memories WHERE id=?)
+        AND json_extract(data,'$.source.kind')='session' AND json_extract(data,'$.source.role')='user'
+        AND json_extract(data,'$.source.eventId')<>? ORDER BY rowid DESC LIMIT 1`)
+        .get(source.sessionId, source.id, source.source.eventId);
+      const previous = parse(context);
+      const sourceTime = Date.parse(source.occurredAt ?? source.createdAt);
+      const previousTime = previous && Date.parse(previous.occurredAt ?? previous.createdAt);
+      const usableContext = previous && previous.updatedAt >= retentionStart &&
+        !previous.source.chunk?.inCodeFence && previousTime <= sourceTime &&
+        sourceTime - previousTime <= 30 * 60000 ? previous : null;
+      const contextHash = hash(JSON.stringify([source.id, source.revision,
+        usableContext?.id ?? null, usableContext?.revision ?? null]));
+      const existing = this.system.prepare('SELECT source_revision,version,context_hash FROM sleep_encodings WHERE source_id=?')
+        .get(source.id);
+      if (existing?.source_revision === source.revision && existing.version === SLEEP_CONTEXT_VERSION &&
+          existing.context_hash === contextHash) { result.skipped++; continue; }
+      result.inspected++;
+      const candidate = contextualSleepCandidate(source.text, usableContext);
+      let outcome = 'no-safe-context';
+      if (candidate) {
+        requireValue(source.text.includes(candidate.text) && usableContext.text.length <= 1000,
+          'INVALID_EVIDENCE', '二次编码的来源片段无效。');
+        const input = {
+          ...candidate, sessionId: source.sessionId, occurredAt: source.occurredAt,
+          parents: [source.id, usableContext.id],
+          source: { kind: 'local-context', rule: candidate.rule, encodingVersion: SLEEP_CONTEXT_VERSION,
+            sceneId: JSON.stringify([source.sessionId, source.source.eventId]), parentId: source.id,
+            contextSourceId: usableContext.id, original: source.source, excerpt: candidate.text,
+            context: { sourceId: usableContext.id, excerpt: usableContext.text } },
+        };
+        const proposed = normalizeRecord(input, this.now());
+        const duplicate = this.db(proposed.layer).prepare('SELECT id FROM memories WHERE dedupe_key=?').get(proposed.dedupeKey);
+        try {
+          if (!duplicate) {
+            this.create(input, { admin: true });
+            this.failpoint('after-sleep-encoding-save');
+            result.candidates++;
+            outcome = 'candidate';
+          } else outcome = 'duplicate';
+        } catch (error) {
+          if (error.code !== 'FORGOTTEN') throw error;
+          outcome = 'forgotten';
+        }
+      }
+      this.system.prepare('INSERT OR REPLACE INTO sleep_encodings VALUES(?,?,?,?,?)')
+        .run(source.id, source.revision, SLEEP_CONTEXT_VERSION, contextHash, outcome);
+    }
+    this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)').run('sleep-reencoding', JSON.stringify(result));
+    return result;
   }
   timeline({ query = '', from, until, offset = 0, limit = 100 } = {}, actor) {
     requireValue(actor?.admin || actor?.sessionId, 'FORBIDDEN', '时间线需要明确范围。', 403);
@@ -432,7 +502,7 @@ export class MemorySpace {
       const duplicate = this.db(record.layer).prepare('SELECT id FROM memories WHERE dedupe_key=?').get(record.dedupeKey);
       requireValue(!duplicate || duplicate.id === id, 'DUPLICATE_MEMORY', '相同内容已存在，请编辑现有记忆。', 409);
     }
-    for (const parent of record.parents) this.get(parent, actor);
+    for (const parent of record.parents) if (!previous.parents.includes(parent)) this.get(parent, actor);
     if (record.factKey && record.status === 'active') {
       requireValue(!this.all().some(other => other.id !== id && other.status === 'active' &&
         other.factKey === record.factKey && other.text !== record.text), 'FACT_CONFLICT',
@@ -620,6 +690,8 @@ export class MemorySpace {
       }
       for (const id of ids) this.system.prepare('DELETE FROM reinforcements WHERE id=?').run(id);
       for (const id of ids) this.system.prepare('DELETE FROM encodings WHERE source_id=?').run(id);
+      for (const id of ids) this.system.prepare('DELETE FROM sleep_encodings WHERE source_id=?').run(id);
+      for (const id of ids) this.system.prepare('DELETE FROM sleep_expirations WHERE source_id=?').run(id);
       this.system.exec('DELETE FROM traces');
     });
   }
@@ -1018,7 +1090,7 @@ export class MemorySpace {
             const occurred = origin.at ?? item.occurredAt;
             if (!evidence.has(evidenceId) && occurred) {
               evidence.set(evidenceId, item);
-              days.add(new Date(occurred).toISOString().slice(0, 10));
+              days.add(localDateKey(new Date(occurred)));
             }
           }
         }
@@ -1071,7 +1143,7 @@ export class MemorySpace {
       .run('consolidation', JSON.stringify({ at: this.now(), ...result }));
     return result;
   }
-  deepConsolidation(day, { missed = false, manual = false, backup } = {}) {
+  deepConsolidation(day, { missed = false, manual = false, backup, from, until } = {}) {
     requireValue(/^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(`${day}T00:00:00Z`)) &&
       new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day,
       'INVALID_DATE', '每日整理日期无效。');
@@ -1085,8 +1157,12 @@ export class MemorySpace {
       localOrganization.inspected += batch.inspected;
       localOrganization.organized += batch.organized;
     } while (batch.inspected === 1000);
+    const end = timestamp(until ?? this.now(), '二次编码截止点');
+    const last = this.system.prepare("SELECT value FROM metadata WHERE key='sleep-reencoding-until'").get()?.value;
+    const start = timestamp(from ?? last ?? new Date(Date.parse(end) - 24 * 3600000).toISOString(), '二次编码起点');
+    const reencoding = this.reencodeRecent({ from: start, until: end });
     const result = this.consolidate(200, { deep: true });
-    const entry = { day, at: this.now(), missed, manual, backup, localOrganization, ...result };
+    const entry = { day, at: this.now(), missed, manual, backup, localOrganization, reencoding, ...result };
     transaction(this.system, () => {
       const save = this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)');
       if (!manual) {
@@ -1094,6 +1170,7 @@ export class MemorySpace {
         save.run('daily-consolidation', JSON.stringify(entry));
       }
       save.run('deep-consolidation', JSON.stringify(entry));
+      if (reencoding.state === 'completed') save.run('sleep-reencoding-until', end);
     });
     return entry;
   }
@@ -1113,6 +1190,18 @@ export class MemorySpace {
     const cutoff = new Date(this.clock() - this.config.bufferHours * 3600000).toISOString();
     const db = this.db('L0');
     const expiredIds = db.prepare("SELECT id FROM memories WHERE status='processed' AND updated_at<? ORDER BY updated_at LIMIT 500").all(cutoff);
+    let expiredUnencoded = 0;
+    transaction(this.system, () => {
+      for (const { id } of expiredIds) {
+        const initial = this.system.prepare('SELECT result FROM encodings WHERE source_id=?').get(id);
+        if (initial && JSON.parse(initial.result).reason === 'no-explicit-rule' &&
+            !this.system.prepare('SELECT 1 FROM sleep_encodings WHERE source_id=?').get(id)) {
+          expiredUnencoded += this.system.prepare('INSERT OR IGNORE INTO sleep_expirations VALUES(?)').run(id).changes;
+        }
+      }
+      const previous = Number(this.system.prepare("SELECT value FROM metadata WHERE key='expired-unencoded'").get()?.value ?? 0);
+      this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)').run('expired-unencoded', String(previous + expiredUnencoded));
+    });
     transaction(db, () => {
       for (const { id } of expiredIds) {
         db.prepare('DELETE FROM memories WHERE id=?').run(id);
@@ -1122,6 +1211,7 @@ export class MemorySpace {
     });
     for (const { id } of expiredIds) {
       rmSync(join(this.directory, LAYERS.L0.directory, 'views', `${id}.md`), { force: true });
+      this.system.prepare('DELETE FROM sleep_encodings WHERE source_id=?').run(id);
       expired++;
     }
     for (const db of this.dbs.values()) {
@@ -1141,23 +1231,22 @@ export class MemorySpace {
         forgottenEpisodes++;
       }
     }
-    const result = { at: this.now(), expiredBuffers: expired, forgottenEpisodes };
+    const result = { at: this.now(), expiredBuffers: expired, expiredUnencoded, forgottenEpisodes };
     this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)').run('maintenance', JSON.stringify(result));
     return result;
   }
   appendPrivate(author, content, sourceIds = []) {
     slug(author);
     requireValue(this.config.privateWriters.includes(author), 'PRIVATE_WRITER_DISABLED', '此私人作者未被用户启用。', 403);
-    string(content, '私人正文', 50000);
     requireValue(Array.isArray(sourceIds) && sourceIds.length <= 40, 'INVALID_SOURCE', '私人记录来源无效。');
     for (const id of sourceIds) this.get(id, { admin: true });
-    const id = randomUUID();
-    this.privateDb.prepare('INSERT INTO entries VALUES(?,?,?,?,?)')
-      .run(id, author, content.toWellFormed(), this.now(), JSON.stringify(sourceIds));
-    return { id, saved: true };
+    return appendPrivateEntry(this.privateDb, author, content, sourceIds, new Date(this.clock()));
+  }
+  organizePrivateWindow(options) {
+    return organizePrivateWindow(this.privateDb, { ...options, now: new Date(this.clock()) });
   }
   privateStatus() {
-    const count = this.privateDb.prepare('SELECT count(*) AS count,max(created_at) AS lastWritten FROM entries').get();
+    const count = privateJournalStatus(this.privateDb);
     const file = join(this.directory, 'private', 'journal.sqlite3');
     let bytes = 0;
     for (const path of [file, `${file}-wal`]) {
@@ -1169,7 +1258,11 @@ export class MemorySpace {
   clearPrivate(actor, confirmation) {
     adminOnly(actor);
     requireValue(confirmation === 'DELETE PRIVATE JOURNAL', 'CONFIRMATION_REQUIRED', '请输入 DELETE PRIVATE JOURNAL 确认。');
-    this.privateDb.exec('PRAGMA secure_delete=ON; DELETE FROM entries; PRAGMA wal_checkpoint(TRUNCATE); VACUUM;');
+    this.privateDb.exec('PRAGMA secure_delete=ON;');
+    transaction(this.privateDb, () => {
+      this.privateDb.exec('DELETE FROM entry_aliases; DELETE FROM journal_pending; DELETE FROM journal_metadata; DELETE FROM entries;');
+    });
+    this.privateDb.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;');
     return this.privateStatus();
   }
   status() {
@@ -1214,7 +1307,13 @@ export class MemorySpace {
       retrievalEvents: [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([layer, db]) =>
         db.prepare('SELECT id,evidence FROM retrieval_events ORDER BY id,evidence').all()
           .filter(row => included.has(row.id)).map(row => ({ layer, id: row.id, evidence: row.evidence }))),
-      ...(includePrivate ? { privateEntries: this.privateDb.prepare('SELECT * FROM entries').all() } : {}),
+      ...(includePrivate ? {
+        privateEntries: this.privateDb.prepare(`SELECT e.*,s.day_key,COALESCE(s.revision,1) AS revision,
+          s.updated_at,s.content_hash FROM entries e LEFT JOIN entry_state s ON s.entry_id=e.id
+          ORDER BY e.created_at,e.id`).all(),
+        privateAliases: this.privateDb.prepare('SELECT * FROM entry_aliases ORDER BY alias_id').all(),
+        privatePending: this.privateDb.prepare('SELECT * FROM journal_pending ORDER BY entry_id').all(),
+      } : {}),
     };
   }
   close() {

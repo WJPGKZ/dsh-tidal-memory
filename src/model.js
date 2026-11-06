@@ -18,6 +18,7 @@ export const DEFAULTS = Object.freeze({
   halfLifeDays: 30, bufferHours: 72, idleMinutes: 20,
   autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
   injectContext: true, autoBackup: true, backupKeep: 14, privateWriters: [],
+  deepOrganizationMode: 'local', privateOrganizationMode: 'local',
   embeddingMode: edition.embeddingMode, embeddingModelPath: '', embeddingDevice: 'auto',
   embeddingTimeoutSeconds: 300,
   embeddingMinScore: -1, embeddingRelativeFloor: -1,
@@ -36,6 +37,9 @@ export function requireValue(condition, code, message, status = 400) {
   if (!condition) throw new MemoryError(code, message, status);
 }
 export const hash = value => createHash('sha256').update(value).digest('hex');
+export function localDateKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
 export function slug(value) {
   requireValue(typeof value === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value), 'INVALID_SPACE', '空间名仅允许小写字母、数字、短横线和下划线，最多 64 字符。');
   return value;
@@ -70,6 +74,8 @@ export function configOf(raw = {}) {
   choice(result.residentMode, ['all', 'core', 'pinned'], 'L3 常驻模式');
   choice(result.embeddingMode, ['off', 'cpu', 'enhanced'], '本地语义组合');
   choice(result.embeddingDevice, ['auto', 'cpu'], '本地推理设备');
+  choice(result.deepOrganizationMode, ['local', 'selected'], '普通深度整理方式');
+  choice(result.privateOrganizationMode, ['local', 'author'], '私人日记整理方式');
   for (const key of ['embeddingMinScore', 'embeddingRelativeFloor']) {
     number(result[key], -1, 1, key);
     requireValue(result[key] === -1 || result[key] >= 0, 'INVALID_CONFIG', `${key} 应为 -1（模型默认）或 0–1。`);

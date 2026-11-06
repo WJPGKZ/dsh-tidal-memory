@@ -222,6 +222,51 @@ test('a failed recovery point prevents organizing pending records or marking a d
   assert.equal(runtime.busy, false);
 });
 
+test('ordinary and private model routes remain independent and unavailable routes never send content', async t => {
+  const now = new Date(2026, 2, 4, 4, 0);
+  const { runtime, modelCalls } = fixture(t, { deepOrganizationMode: 'selected',
+    privateOrganizationMode: 'author', privateWriters: ['test-author'] }, { clock: () => now });
+  runtime.lastActivity -= 21 * 60000;
+  const store = runtime.space('shared');
+  store.appendPrivate('test-author', 'PRIVATE_MODEL_ROUTE_CANARY');
+  store.capture({ sessionId: 's', eventId: '1', text: '我喜欢简短回答。' });
+  const result = (await runtime.checkDailyConsolidation()).results[0];
+  assert.equal(result.privateOrganization.code, 'PRIVATE_MODEL_ROUTE_UNVERIFIED');
+  assert.equal(result.modelExtraction.code, 'HOST_AUDIT_REQUIRED');
+  assert.equal(result.localOrganization.organized, 1);
+  assert.equal(modelCalls(), 0);
+  const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
+  assert.equal(status.organizationModels.private.authorAvailable, false);
+  assert.equal(status.organizationModels.ordinary.state, 'unavailable');
+  assert.equal(JSON.stringify(status).includes('PRIVATE_MODEL_ROUTE_CANARY'), false);
+  await assert.rejects(runtime.api('POST', '/private/organize', new URLSearchParams({ space: 'shared' }), {}),
+    { code: 'PRIVATE_MODEL_ROUTE_UNVERIFIED' });
+});
+
+test('private organization failure does not block ordinary consolidation and retry clears the error', async t => {
+  const now = new Date(2026, 2, 4, 4, 0);
+  const { runtime, modelCalls } = fixture(t, { privateWriters: ['test-author'] }, { clock: () => now });
+  runtime.lastActivity -= 21 * 60000;
+  const store = runtime.space('shared');
+  store.appendPrivate('test-author', 'PRIVATE_FAILURE_CANARY');
+  store.capture({ sessionId: 's', eventId: '1', text: '我喜欢简短回答。' });
+  store.organizePrivateWindow = () => { throw new Error('PRIVATE_FAILURE_CANARY must not enter logs'); };
+  const first = (await runtime.checkDailyConsolidation()).results[0];
+  assert.equal(first.privateOrganization.state, 'failed');
+  assert.equal(first.localOrganization.organized, 1);
+  assert.equal(JSON.stringify(runtime.lastError).includes('PRIVATE_FAILURE_CANARY'), false);
+  assert.equal(store.privateStatus().failure.code, 'PRIVATE_ORGANIZATION_FAILED');
+  store.close();
+  runtime.spaces.delete('shared');
+  const persisted = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
+  assert.equal(persisted.private.failure.code, 'PRIVATE_ORGANIZATION_FAILED');
+  const retry = await runtime.api('POST', '/private/organize', new URLSearchParams({ space: 'shared' }), {});
+  assert.equal(retry.state, 'completed');
+  assert.equal(runtime.space('shared').privateStatus().failure, null);
+  assert.equal(runtime.lastError, null);
+  assert.equal(modelCalls(), 0);
+});
+
 test('status avoids reading WAL while another writer is active', async t => {
   const { runtime, root } = fixture(t);
   const owner = new MemorySpace(root, 'shared');

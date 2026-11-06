@@ -27,6 +27,8 @@ export const Config = z.object({
   autoConsolidate: z.boolean().default(DEFAULTS.autoConsolidate).volatile().description('空闲时执行本地规则轻整理，不调用生成模型；已启用的本地语义组合可独立预热索引。'),
   autoArchive: z.boolean().default(DEFAULTS.autoArchive).volatile().description('低重要、未强化、未召回 L2 保存满八个半衰期后归档，不删除。'),
   dailyConsolidateAt: z.string().default(DEFAULTS.dailyConsolidateAt).volatile().description('每日深度整理时间（本机时区，HH:mm）；默认 03:00，留空关闭自动深度整理。'),
+  deepOrganizationMode: z.string().default(DEFAULTS.deepOrganizationMode).volatile().description('普通整理：local 本地规则与已启用的语义索引；selected 宿主自选模型尚未满足审计要求，暂不可用。'),
+  privateOrganizationMode: z.string().default(DEFAULTS.privateOrganizationMode).volatile().description('私人整理：local 本地轻整理；author 作者模型映射及私有审计尚未验证，暂不可用。'),
   workingHours: integer(DEFAULTS.workingHours, 0, 8760, '会话自动捕获的 L1 有效时长（小时）；0 不自动到期。已保存的有效期不随设置改写。'),
   minScore: z.number().min(0).max(1).default(DEFAULTS.minScore).volatile().description('最低相关性分数；不是事实可信度。'),
   relativeFloor: z.number().min(0).max(1).default(DEFAULTS.relativeFloor).volatile().description('相对最高相关性分数的最低比例。'),

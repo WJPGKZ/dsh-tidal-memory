@@ -197,6 +197,9 @@ window.__ModuleLoader__.load({
           h('small', null, '当前没有人格配置。本插件不会建立身份、情绪或主动聊天。')),
         status.encoding ? h('div', { className: 'panel' }, h('h3', null, '本地编码诊断'),
           h('p', null, `规则 ${status.encoding.version} · 已检查 ${status.encoding.inspected} 条缓冲 · 保存 ${status.encoding.saved} 项`),
+          h('p', { className: 'muted' }, status.encoding.sleep ?
+            `二次编码 ${status.encoding.sleep.from} 至 ${status.encoding.sleep.until} · 检查 ${status.encoding.sleep.inspected} 条 · 新增 ${status.encoding.sleep.candidates} 条待确认候选 · 到期前未二次检查 ${status.encoding.expiredBeforeSleep ?? 0} 条` :
+            `尚未进行二次编码 · 到期前未二次检查 ${status.encoding.expiredBeforeSleep ?? 0} 条`),
           h('pre', null, JSON.stringify(status.encoding.reasons, null, 2))) : null,
         h('div', { className: 'panel' }, h('h3', null, '本地语义联想'),
           h('p', null, status.semantic?.mode === 'off' ? '标准组合：词面、别名、时间及来源关系检索，不加载 embedding。' :
@@ -295,11 +298,26 @@ window.__ModuleLoader__.load({
         h('div', { className: 'private-card stack' }, h('div', { className: 'eyebrow' }, 'PRIVATE JOURNAL'),
           h('h2', null, '私人记录，不展示正文'),
           h('p', null, `${status.private.count} 篇 · ${(status.private.bytes / 1024).toFixed(1)} KiB`),
+          h('p', { className: 'muted' }, `按日管理 ${status.private.dailyCount ?? 0} 篇 · 旧记录 ${status.private.legacyCount ?? 0} 篇 · 日期范围 ${status.private.firstDay || '暂无'} 至 ${status.private.lastDay || '暂无'}`),
           h('p', { className: 'muted' }, `最近写入：${status.private.lastWritten || '尚无记录'}`),
           h('p', null, status.private.generation),
           h('p', { className: 'path' }, status.private.directory),
           h('small', null, '不出现在普通搜索、模型召回和明文备份中。此隔离不是对本机管理员或其他任意文件工具的绝对保密。')),
         h('div', { className: 'panel stack' },
+          h('label', null, h('span', null, '私人日记整理方式'),
+            h('select', { 'aria-label': '私人日记整理方式', value: config.privateOrganizationMode,
+              onChange: event => patchConfig('privateOrganizationMode', event.target.value) },
+            h('option', { value: 'local' }, '本地轻整理（默认）'),
+            h('option', { value: 'author', disabled: true }, '调用作者自己的模型（暂不可用）'))),
+          h('small', null, status.organizationModels?.private?.message),
+          status.private.failure ? h('p', { className: 'message error' },
+            `私人轻整理在 ${status.private.failure.at} 未完成，已完成条目保留；可单独重试。`) : null,
+          h('small', null, status.private.organization ?
+            `上次覆盖 ${status.private.organization.from} 至 ${status.private.organization.until} · ${status.private.organization.state === 'completed' ? '已完成' : '部分完成，可重试'} · 检查 ${status.private.organization.inspected} 篇` :
+            '尚未整理；首次仅处理最近睡眠窗口内可确认日期的记录，不批量改写历史导入。'),
+          button('保存私人整理设置', saveConfig, 'primary'),
+          button('重试私人轻整理', () => run(() => request(space, '/private/organize', {}),
+            value => value.state === 'completed' ? '私人轻整理完成，未展示正文。' : '私人轻整理部分完成，请稍后重试。')),
           field('允许的作者插件名称（逗号分隔）', config.privateWriters.join(','),
             value => patchConfig('privateWriters', value.split(',').map(x => x.trim()).filter(Boolean))),
           button('保存作者权限', saveConfig, 'primary'),
@@ -406,6 +424,12 @@ window.__ModuleLoader__.load({
           h('p', { className: 'muted' }, '常驻不等于已核实；过期、待审核和已被替代的条目不注入。常驻先使用独立额度，但总预算仍是硬上限。近期消息逐条匹配，不用无关内容凑数。'),
           check('空闲时执行小整理（纯本地规则）', config.autoConsolidate, value => patchConfig('autoConsolidate', value)),
           check('低重要且未使用的旧 L2 自动归档（保存满八个半衰期，不删除）', config.autoArchive, value => patchConfig('autoArchive', value)),
+          h('label', null, h('span', null, '普通深度整理方式'),
+            h('select', { 'aria-label': '普通深度整理方式', value: config.deepOrganizationMode,
+              onChange: event => patchConfig('deepOrganizationMode', event.target.value) },
+            h('option', { value: 'local' }, '本地规则 / 语义索引（默认）'),
+            h('option', { value: 'selected', disabled: true }, '宿主自选模型（暂不可用）'))),
+          h('small', null, status.organizationModels?.ordinary?.message),
           h('div', { className: 'fields' },
             field('每日深度整理时间（本机时间，留空关闭）', config.dailyConsolidateAt,
               value => patchConfig('dailyConsolidateAt', value), 'time'),
@@ -414,9 +438,11 @@ window.__ModuleLoader__.load({
                 `${new Date(status.deepConsolidation.at).toLocaleString()} · ${status.deepConsolidation.manual ? '手动' : '定时'} · 提炼 ${status.deepConsolidation.promoted} 条` : '尚未运行'}`),
               h('small', null, `下次预计：${status.nextDailyConsolidationAt ?
                 new Date(status.nextDailyConsolidationAt).toLocaleString() : '已关闭'}`))),
-          h('p', { className: 'muted' }, '深度整理只运行本地确定性规则，不调用模型。宿主运行时每分钟检查；关机或退出期间不运行，下次启动并达到空闲时长后补跑最近一次。待补跑时预计时间会显示已过去的应执行时间。每次整理前另存普通记忆恢复点，不含 L0 和私人日记。L1 时长仅影响此后自动捕获的任务，已有有效期不变。'),
+          h('p', { className: 'muted' }, '本地深度整理不调用生成模型。私人轻整理与普通整理分开；普通整理前另存恢复点，不含 L0 和私人日记。宿主每分钟检查，停机后空闲时补跑最近一次。L1 时长仅影响此后自动捕获的任务。'),
           button('立即深度整理一次', () => run(() => request(space, '/consolidate', {}),
-            value => `深度整理完成：检查 ${value.inspected} 条，符合入口 ${value.eligibility?.accepted ?? 0} 条，提炼 ${value.promoted} 条，证据不足 ${value.insufficientIndependentEvidence ?? 0} 组，冲突待复核 ${value.conflicts} 条。`)),
+            value => `本地深度整理完成：检查 ${value.inspected} 条，提炼 ${value.promoted} 条，二次编码新增 ${value.reencoding?.candidates ?? 0} 条待确认候选，冲突待复核 ${value.conflicts} 条。${
+              value.privateOrganization?.state === 'completed' ? '' : '私人整理未全部完成，请查看私人日记状态。'}${
+              value.modelExtraction?.state === 'unavailable' ? '自选模型未运行。' : ''}`)),
           status.deepConsolidation?.eligibility ? h('details', null, h('summary', null, '查看上次整理未产出的原因'),
             h('pre', null, JSON.stringify(status.deepConsolidation, null, 2))) : null,
           check('自动备份 L1-L3，不含 L0、来源摘录和私人日记', config.autoBackup, value => patchConfig('autoBackup', value)),

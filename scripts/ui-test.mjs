@@ -38,6 +38,10 @@ try {
   await page.getByText('UI 创建的跨会话共享记录', { exact: true }).waitFor();
   await page.getByRole('tab', { name: '私人日记' }).click();
   await page.getByText('私人记录，不展示正文', { exact: true }).waitFor();
+  assert.equal(await page.getByLabel('私人日记整理方式').inputValue(), 'local');
+  assert.equal(await page.getByRole('option', { name: /调用作者自己的模型/ }).evaluate(option => option.disabled), true);
+  await page.getByRole('button', { name: '重试私人轻整理', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '私人轻整理完成' }).waitFor();
   assert.equal((await page.locator('body').innerText()).includes('PRIVATE_CANARY_SYNTHETIC_9038'), false);
   const privateResponse = await page.request.get(`${preview.url}/tidal-memory/private?space=default`);
   assert.equal((await privateResponse.text()).includes('PRIVATE_CANARY'), false);
@@ -45,6 +49,8 @@ try {
   assert.equal(rejected.status(), 403);
   await page.getByRole('tab', { name: '设置与迁移' }).click();
   await page.getByText(/工作区名称尽量使用英文/).waitFor();
+  assert.equal(await page.getByLabel('普通深度整理方式').inputValue(), 'local');
+  assert.equal(await page.getByRole('option', { name: /宿主自选模型/ }).evaluate(option => option.disabled), true);
   await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
   await page.getByRole('heading', { name: '模型文件与下载', exact: true }).waitFor();
   await page.getByText(/空间空闲时只为已启用的本地语义组合准备普通索引/).waitFor();
