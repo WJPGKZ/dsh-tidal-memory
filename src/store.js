@@ -34,6 +34,7 @@ export class MemorySpace {
     this.errors = [];
     this.closed = false;
     this.generation = 0;
+    this.statisticsCache = new Map();
     mkdirSync(join(this.directory, 'system'), { recursive: true });
     try {
       this.lock = new DatabaseSync(join(this.directory, 'system', 'owner.sqlite3'));
@@ -57,6 +58,7 @@ export class MemorySpace {
       this.system = openDatabase(join(this.directory, 'system', 'operations.sqlite3'));
       this.system.exec(`
         CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS operations_pending ON operations(created_at,id) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS tombstones (id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS forgotten_keys (dedupe_key TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS reinforcements (id TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(id,evidence));
@@ -136,6 +138,9 @@ export class MemorySpace {
     });
   }
   recallStatistics(queryTerms, statuses) {
+    const key = JSON.stringify([statuses, queryTerms]);
+    const cached = this.statisticsCache.get(key);
+    if (cached) return cached;
     let count = 0;
     const frequencies = new Map(queryTerms.map(term => [term, 0]));
     const placeholders = statuses.map(() => '?').join(',');
@@ -149,7 +154,10 @@ export class MemorySpace {
         frequencies.set(term, frequencies.get(term) + n);
       }
     }
-    return { count, frequencies };
+    const result = { count, frequencies };
+    if (this.statisticsCache.size >= 128) this.statisticsCache.delete(this.statisticsCache.keys().next().value);
+    this.statisticsCache.set(key, result);
+    return result;
   }
   list({ layer, status, query = '', offset = 0, limit = 50 } = {}, actor) {
     if (layer) this.db(layer);
@@ -168,6 +176,7 @@ export class MemorySpace {
   persist(record) {
     const db = this.db(record.layer);
     const before = parse(db.prepare('SELECT data FROM memories WHERE id=?').get(record.id));
+    const searchChanged = !before || memoryContentHash(before) !== memoryContentHash(record);
     transaction(db, () => {
       const json = JSON.stringify(record);
       db.prepare(`INSERT INTO memories(id,data,dedupe_key,status,scope,session_id,created_at,updated_at,fact_key,pinned,valid_until)
@@ -178,11 +187,16 @@ export class MemorySpace {
         .run(record.id, json, record.dedupeKey, record.status, record.scope, record.sessionId,
           record.createdAt, record.updatedAt, record.factKey, record.pinned ? 1 : 0, record.validUntil);
       if (record.layer !== 'L0') db.prepare('INSERT OR REPLACE INTO revisions VALUES(?,?,?)').run(record.id, record.revision, json);
-      db.prepare('DELETE FROM search WHERE id=?').run(record.id);
-      db.prepare('INSERT INTO search(id,words) VALUES(?,?)').run(record.id, terms(memorySearchText(record), Infinity).join(' '));
+      if (searchChanged) {
+        db.prepare('DELETE FROM search WHERE id=?').run(record.id);
+        db.prepare('INSERT INTO search(id,words) VALUES(?,?)').run(record.id, terms(memorySearchText(record), Infinity).join(' '));
+      }
     });
-    if (record.layer !== 'L0' && (!before || memoryContentHash(before) !== memoryContentHash(record) ||
-      before.status !== record.status || before.validFrom !== record.validFrom || before.validUntil !== record.validUntil)) this.generation++;
+    if (record.layer !== 'L0') {
+      if (searchChanged || before.status !== record.status) this.statisticsCache.clear();
+      if (searchChanged || before.status !== record.status || before.scope !== record.scope ||
+          before.validFrom !== record.validFrom || before.validUntil !== record.validUntil) this.generation++;
+    }
     try { this.semanticIndex?.invalidate(record); }
     catch (error) { this.logError('SEMANTIC_INVALIDATION_FAILED', `正文已保存，派生索引更新失败：${error.code ?? 'INDEX_ERROR'}`); }
   }
@@ -431,7 +445,8 @@ export class MemorySpace {
   revisions(id, actor) {
     const memory = this.get(id, actor);
     if (memory.layer === 'L0') return [memory];
-    return this.db(memory.layer).prepare('SELECT data FROM revisions WHERE id=? ORDER BY revision DESC').all(id).map(parse);
+    const history = this.db(memory.layer).prepare('SELECT data FROM revisions WHERE id=? ORDER BY revision DESC').all(id).map(parse);
+    return history[0]?.revision === memory.revision ? history : [memory, ...history];
   }
   mergeSources(existing, incoming) {
     const sources = [...(existing.sources ?? [existing.source])];
@@ -485,6 +500,25 @@ export class MemorySpace {
     const operation = JSON.parse(row.payload);
     if (operation.kind === 'forget') {
       this.applyForget(operation.ids);
+    } else if (operation.kind === 'usage') {
+      const { memoryId, evidenceId, at } = operation;
+      const current = this.raw(memoryId);
+      if (current && !this.system.prepare('SELECT 1 FROM tombstones WHERE id=?').get(memoryId)) {
+        const db = this.db(current.layer);
+        transaction(db, () => {
+          const inserted = db.prepare('INSERT OR IGNORE INTO retrieval_events VALUES(?,?)').run(memoryId, evidenceId).changes;
+          if (!inserted) return;
+          const latest = parse(db.prepare('SELECT data FROM memories WHERE id=?').get(memoryId));
+          const updated = normalizeRecord({}, latest.updatedAt > at ? latest.updatedAt : at, latest);
+          updated.stability = Math.min(8, latest.stability + 0.1);
+          updated.recallCount = (latest.recallCount ?? 0) + 1;
+          updated.lastRecalledAt = latest.lastRecalledAt && latest.lastRecalledAt > at ? latest.lastRecalledAt : at;
+          db.prepare('UPDATE memories SET data=?,updated_at=? WHERE id=?')
+            .run(JSON.stringify(updated), updated.updatedAt, memoryId);
+        });
+        this.failpoint('after-reinforcement-write');
+        this.system.prepare('INSERT OR IGNORE INTO reinforcements VALUES(?,?)').run(memoryId, evidenceId);
+      }
     } else if (operation.kind === 'reinforce') {
       const { record, evidenceId } = operation;
       if (!this.system.prepare('SELECT 1 FROM tombstones WHERE id=?').get(record.id) && this.raw(record.id)) {
@@ -559,6 +593,7 @@ export class MemorySpace {
   }
   applyForget(ids) {
     this.generation++;
+    this.statisticsCache.clear();
     this.onForget?.();
     if (this.semanticIndex) this.semanticIndex.forget(ids);
     else clearSemanticFiles(this.directory);
@@ -568,6 +603,7 @@ export class MemorySpace {
         for (const id of ids) {
           db.prepare('DELETE FROM memories WHERE id=?').run(id);
           db.prepare('DELETE FROM revisions WHERE id=?').run(id);
+          db.prepare('DELETE FROM retrieval_events WHERE id=?').run(id);
           db.prepare('DELETE FROM search WHERE id=?').run(id);
         }
       });
@@ -577,7 +613,8 @@ export class MemorySpace {
       for (const row of this.system.prepare("SELECT id,payload FROM operations WHERE state='pending'").all()) {
         const op = JSON.parse(row.payload);
         if ((op.kind === 'promote' && (selected.has(op.sourceId) || op.target.parents.some(p => selected.has(p)))) ||
-          (op.kind === 'reinforce' && selected.has(op.record.id))) {
+          (op.kind === 'reinforce' && selected.has(op.record.id)) ||
+          (op.kind === 'usage' && selected.has(op.memoryId))) {
           this.system.prepare("UPDATE operations SET state='cancelled',payload='{}' WHERE id=?").run(row.id);
         }
       }
@@ -620,16 +657,14 @@ export class MemorySpace {
     if (!record || record.status !== 'active') return;
     const key = `recall:${hash(evidenceId)}`;
     if (this.system.prepare('SELECT 1 FROM reinforcements WHERE id=? AND evidence=?').get(id, key)) return;
-    this.recover();
+    if (this.system.prepare("SELECT 1 FROM operations WHERE state='pending' LIMIT 1").get()) this.recover();
     if (this.system.prepare('SELECT 1 FROM reinforcements WHERE id=? AND evidence=?').get(id, key)) return;
     const current = this.raw(id);
-    const updated = normalizeRecord({}, this.now(), current);
-    updated.stability = Math.min(8, current.stability + 0.1);
-    updated.recallCount = (current.recallCount ?? 0) + 1;
-    updated.lastRecalledAt = this.now();
+    if (!current || current.status !== 'active') return;
     const operationId = randomUUID();
     this.system.prepare('INSERT INTO operations VALUES(?,?,?,?)')
-      .run(operationId, JSON.stringify({ kind: 'reinforce', record: updated, evidenceId: key }), 'pending', this.now());
+      .run(operationId, JSON.stringify({ kind: 'usage', memoryId: id, evidenceId: key, at: this.now() }), 'pending', this.now());
+    this.failpoint('after-reinforcement-prepare');
     this.completeOperation(operationId);
   }
   recallScope(actor, { mode = 'current', asOf, includeArchived = false } = {}) {
@@ -645,6 +680,23 @@ export class MemorySpace {
       (mode === 'history' || ((!record.validFrom || Date.parse(record.validFrom) <= now) &&
         (!record.validUntil || Date.parse(record.validUntil) > now))) };
   }
+  nextEligibilityChange(statuses, now) {
+    const after = new Date(now).toISOString();
+    const placeholders = statuses.map(() => '?').join(',');
+    let next = null;
+    for (const [layer, db] of this.dbs) {
+      if (layer === 'L0') continue;
+      for (const column of ['valid_until', "json_extract(data,'$.validFrom')"]) {
+        const value = db.prepare(`SELECT min(${column}) AS value FROM memories
+          WHERE status IN (${placeholders}) AND ${column}>?`).get(...statuses, after).value;
+        if (value) {
+          const time = Date.parse(value);
+          if (next === null || time < next) next = time;
+        }
+      }
+    }
+    return next;
+  }
   recall(query, actor, { includeArchived = false, budget = this.config.tokenBudget,
     contextQueries = [], evidenceId, mode = 'current', asOf, semantic = [], semanticStatus } = {}) {
     const { at, now, statuses, accept: isEligible } = this.recallScope(actor, { mode, asOf, includeArchived });
@@ -657,19 +709,21 @@ export class MemorySpace {
     const queries = [...new Set([query, ...contextQueries].filter(text => terms(text).length))];
     const queryTerms = [...new Set(queries.flatMap(text => terms(text)))];
     const searchOptions = { persistentOnly: true, limitPerLayer: 200, statuses };
-    const indexed = [], phraseIds = new Set();
+    const indexed = [], phraseIds = new Set(), lexicalByQuery = [];
     for (const text of queries) {
-      indexed.push(...this.searchRecords(text, { ...searchOptions, mode: 'all' }));
+      const local = this.searchRecords(text, { ...searchOptions, mode: 'all' });
       if (terms(text).length > 1) {
         const phrase = this.searchRecords(text, { ...searchOptions, mode: 'phrase' });
-        indexed.push(...phrase);
+        local.push(...phrase);
         phrase.forEach(record => phraseIds.add(record.id));
       }
-      indexed.push(...this.searchRecords(text, searchOptions));
+      local.push(...this.searchRecords(text, searchOptions));
+      indexed.push(...local);
+      lexicalByQuery.push(new Set(local.map(record => record.id)));
     }
     const semanticById = new Map(semantic.filter(item => {
       const record = this.raw(item.id);
-      return record && item.contentHash === memoryContentHash(record) && item.revision === record.revision &&
+      return record && item.contentHash === memoryContentHash(record) &&
         Number.isFinite(item.score) && item.score >= 0 && item.score <= 1;
     }).map(item => [item.id, item]));
     indexed.push(...[...semanticById.keys()].map(id => this.raw(id)));
@@ -682,23 +736,35 @@ export class MemorySpace {
         ORDER BY pinned DESC,json_extract(data,'$.importance') DESC,id LIMIT ?`)
         .all(this.now(), this.now(), Math.max(200, Math.ceil(this.config.residentBudget / 64))).map(parse));
     }
-    const eligible = [...new Map(indexed.map(record => [record.id, record])).values()].filter(isEligible);
+    const uniqueCandidates = [...new Map(indexed.map(record => [record.id, record])).values()];
+    const eligible = uniqueCandidates.filter(isEligible);
     const statistics = queryTerms.length ? this.recallStatistics(queryTerms, searchOptions.statuses) : { count: 0, frequencies: new Map() };
     const documentFrequency = statistics.frequencies;
     const idf = new Map(queryTerms.map(word => [word,
       Math.log(1 + (statistics.count - (documentFrequency.get(word) ?? 0) + 0.5) /
         ((documentFrequency.get(word) ?? 0) + 0.5))]));
     const idfCeiling = statistics.count ? Math.log(1 + (statistics.count - 0.5) / 1.5) : 0;
+    const queryDetails = queries.map(text => ({ text: text.normalize('NFKC').toLowerCase(), words: terms(text),
+      contextIndex: text === query ? 0 : contextQueries.indexOf(text) + 1 }));
     const scored = eligible.map(record => {
-      const ranked = queries.map((text, index) => {
-        const result = rankMemory(record, terms(text), now, this.config.halfLifeDays, idf, idfCeiling);
-        return { ...result, score: result.score * Math.max(0.65, 1 - index * 0.06), contextIndex: index };
+      const ranked = queryDetails.map(detail => {
+        let result = rankMemory(record, detail.words, now, this.config.halfLifeDays, idf, idfCeiling);
+        for (const alias of record.aliases ?? []) {
+          const words = terms(alias, Infinity);
+          if (!words.length || !detail.text.includes(alias.normalize('NFKC').toLowerCase()) ||
+              !words.every(word => detail.words.includes(word))) continue;
+          const exact = rankMemory(record, words, now, this.config.halfLifeDays, idf, idfCeiling);
+          if (exact.score > result.score) result = { ...exact, aliasMatch: true };
+        }
+        return { ...result, score: result.score * Math.max(0.65, 1 - detail.contextIndex * 0.06),
+          contextIndex: detail.contextIndex };
       }).sort((a, b) => b.score - a.score)[0] ??
         { score: 0, hits: [], specificity: 0, freshness: 1, contextIndex: 0 };
       const resident = mode === 'current' && this.config.residentBudget > 0 && record.status === 'active' && residentMemory(record, this.config.residentMode);
       const semanticScore = semanticById.get(record.id)?.score;
       return { ...ranked, score: Math.min(1, ranked.score + (phraseIds.has(record.id) ? 0.05 : 0)),
         record, resident, semanticScore, reason: resident ? 'L3 常驻背景（不等于已核实）' :
+          ranked.aliasMatch ? '工作区别名精确匹配' :
           semanticScore !== undefined ? '本地语义联想（不等于事实验证）' :
           ranked.contextIndex ? '近期用户情境匹配' : phraseIds.has(record.id) ? '连续分词匹配' : '关键词匹配' };
     });
@@ -775,11 +841,23 @@ export class MemorySpace {
       }
     }
     for (const item of primary.slice(this.config.maxRecall)) excluded.push({ id: item.record.id, reason: '相关记忆条数上限' });
-    const result = { text: picked.length ? text : '', picked, excluded, threshold, bestScore, mode, asOf: at,
+    const queryIndex = queries.indexOf(query);
+    const contextIds = new Set(lexicalByQuery.flatMap((ids, index) => index === queryIndex ? [] : [...ids]));
+    const result = { requestId: randomUUID(), text: picked.length ? text : '', picked, excluded, threshold, bestScore, mode, asOf: at,
       semanticStatus: semanticStatus ?? { mode: this.config.embeddingMode,
         state: this.config.embeddingMode === 'off' ? 'disabled' : 'lexical', code: 'SYNC_RECALL' },
       estimatedTokens: picked.length ? estimatedTokens(text) : 0, budget,
       residentBytes, contextQueries: queries.length,
+      diagnostics: { lexicalQueryCandidates: queryIndex < 0 ? 0 : lexicalByQuery[queryIndex].size,
+        lexicalContextCandidates: contextIds.size, semanticCandidates: semantic.length,
+        semanticValidated: semanticById.size, uniqueCandidates: uniqueCandidates.length,
+        scopeOrTimeFiltered: uniqueCandidates.length - eligible.length,
+        belowThreshold: scored.length - accepted.length,
+        budgetOrLimitExcluded: excluded.filter(item =>
+          item.reason === '预算或条数上限' || item.reason === '相关记忆条数上限').length,
+        returnedQuery: picked.filter(item => item.channel === 'query').length,
+        returnedResident: picked.filter(item => item.channel === 'resident').length,
+        returnedAssociation: picked.filter(item => item.channel === 'association').length },
       accounting: 'UTF-8 字节数保守估算，不是模型 tokenizer 的精确计数' };
     this.system.prepare('INSERT INTO traces(data) VALUES(?)')
       .run(JSON.stringify({ at: this.now(), sessionId: actor.sessionId ?? null, ...result, text: undefined }));
@@ -800,7 +878,7 @@ export class MemorySpace {
     try {
       atomicFile(path, `<!-- Generated read-only view. Edit through Tidal Memory UI. -->\n# ${record.layer} · ${record.id}\n\n` +
         `- Status: ${record.status}\n- Kind: ${record.kind}\n- Occurred: ${record.occurredAt ?? 'unknown'}\n` +
-        `- Scope: ${record.scope}\n- Revision: ${record.revision}\n\n${record.text}\n`);
+        `- Scope: ${record.scope}\n- Revision at last content update: ${record.revision}\n\n${record.text}\n`);
     } catch (error) {
       this.logError('VIEW_WRITE_FAILED', `可读视图更新失败，数据库中的记忆已保存：${error.code ?? 'IO_ERROR'}`);
     }
@@ -825,6 +903,7 @@ export class MemorySpace {
       expectedVersion: SEARCH_VERSION }));
   }
   rebuildSearch() {
+    this.statisticsCache.clear();
     const layers = [];
     for (const [layer, db] of this.dbs) {
       let count = 0;
@@ -1119,15 +1198,22 @@ export class MemorySpace {
         .map(([key, value]) => [key, provenance(value)]));
     };
     const retained = record => ({ ...record, source: provenance(record.source), sources: provenance(record.sources) });
+    const records = [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([, db]) =>
+      db.prepare('SELECT data FROM memories ORDER BY created_at,id').all().map(row => retained(parse(row))));
+    const included = new Set(records.map(record => record.id));
     return {
       schema: 'tidal-memory', version: 1, space: this.name, createdAt: this.now(),
       excluded: ['L0', 'source-excerpts'],
-      records: [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([, db]) =>
-        db.prepare('SELECT data FROM memories ORDER BY created_at,id').all().map(row => retained(parse(row)))),
+      records,
       revisions: [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([layer, db]) =>
         db.prepare('SELECT data FROM revisions ORDER BY id,revision').all().map(row => ({ layer, record: retained(parse(row)) }))),
       tombstones: this.system.prepare('SELECT * FROM tombstones').all(),
       forgottenKeys: this.system.prepare('SELECT dedupe_key FROM forgotten_keys').all().map(row => row.dedupe_key),
+      reinforcements: this.system.prepare('SELECT id,evidence FROM reinforcements ORDER BY id,evidence')
+        .all().filter(row => included.has(row.id)),
+      retrievalEvents: [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([layer, db]) =>
+        db.prepare('SELECT id,evidence FROM retrieval_events ORDER BY id,evidence').all()
+          .filter(row => included.has(row.id)).map(row => ({ layer, id: row.id, evidence: row.evidence }))),
       ...(includePrivate ? { privateEntries: this.privateDb.prepare('SELECT * FROM entries').all() } : {}),
     };
   }

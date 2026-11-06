@@ -29,6 +29,7 @@ export interface MemoryRecord extends Omit<MemoryProposal, 'layer'> {
   lastRecalledAt: string | null;
 }
 export interface RecallResult {
+  requestId: string;
   semanticStatus: { mode: 'off' | 'cpu' | 'enhanced'; state: 'disabled' | 'lexical' | 'ready' | 'partial' | 'degraded';
     code?: string; message?: string; model?: string; fingerprint?: string; candidates?: number };
   mode: 'current' | 'history' | 'as-of';
@@ -41,6 +42,10 @@ export interface RecallResult {
   bestScore: number;
   residentBytes: number;
   contextQueries: number;
+  diagnostics: { lexicalQueryCandidates: number; lexicalContextCandidates: number;
+    semanticCandidates: number; semanticValidated: number; uniqueCandidates: number;
+    scopeOrTimeFiltered: number; belowThreshold: number; budgetOrLimitExcluded: number;
+    returnedQuery: number; returnedResident: number; returnedAssociation: number };
   excluded: Array<{ id: string; reason: string; score?: number }>;
   picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[]; matched: boolean;
     channel: 'resident' | 'query' | 'association'; semanticScore: number | null; fusionScore: number | null }>;

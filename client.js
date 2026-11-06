@@ -11,6 +11,7 @@ window.__ModuleLoader__.load({
     const kinds = { user_statement: '用户明确陈述', observation: '观测', inference: '推断',
       reflection: '主观反思', historical: '历史资料' };
     const horizons = { unspecified: '待归类', task: '任务期间', event: '历史事件', long_term: '长期有效' };
+    const taskStates = { queued: '排队中', running: '运行中', completed: '已完成', cancelled: '已让出', failed: '失败' };
     const horizonsByLayer = { L0: 'unspecified', L1: 'task', L2: 'event', L3: 'long_term' };
     const css = `
       .tidal{--tidal-accent:var(--dsw-alias-state-business-primary,#197b85);--tidal-muted:var(--dsw-alias-label-secondary,#617381);--tidal-border:var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l2,#d4dfe3));--tidal-surface:var(--dsw-alias-settings-card-fill,var(--dsw-alias-bg-layer-1,transparent));font-family:inherit;color:var(--dsw-alias-label-primary,#182c3a);max-width:1120px;margin:auto;padding:4px 0 20px;box-sizing:border-box}
@@ -285,8 +286,10 @@ window.__ModuleLoader__.load({
                   reasons.has('低于相关性门槛') ?
                     `有候选低于相关性门槛（${trace.threshold ?? '未知'}）；可检查查询表述及记录别名。` :
                     '没有形成可评分的词面候选；检查是否保存了对应记忆，或为同义名称补充工作区别名。';
-            return h('details', { key: i }, h('summary', null, `${trace.at} · ${trace.picked.length} 条`),
-              h('p', { className: 'muted' }, explanation), h('pre', null, JSON.stringify(trace, null, 2)));
+            return h('details', { key: trace.requestId || i }, h('summary', null, `${trace.at} · ${trace.picked.length} 条`),
+              h('p', { className: 'muted' }, explanation),
+              trace.diagnostics ? h('small', null, `请求 ${trace.requestId} · 当前词面 ${trace.diagnostics.lexicalQueryCandidates} · 情境词面 ${trace.diagnostics.lexicalContextCandidates} · 语义 ${trace.diagnostics.semanticCandidates} · 范围/时间过滤 ${trace.diagnostics.scopeOrTimeFiltered} · 预算/条数排除 ${trace.diagnostics.budgetOrLimitExcluded}`) : null,
+              h('pre', null, JSON.stringify(trace, null, 2)));
           })));
       else if (tab === 'private') content = h('div', { className: 'stack' },
         h('div', { className: 'private-card stack' }, h('div', { className: 'eyebrow' }, 'PRIVATE JOURNAL'),
@@ -328,6 +331,10 @@ window.__ModuleLoader__.load({
               .map(([value, label]) => h('option', { key: value, value }, label)))),
           h('p', { className: 'muted' }, '三个组合共用同一记忆库。首次模型下载须手动执行随包安装脚本，之后只读本地模型，不向 embedding 服务上传正文。先保存选择，再准备索引；关闭语义仍保留完整四层记忆。增强指模型规模，不保证在每种记忆上都优于 CPU 组合。'),
           h('p', null, `当前：${status.semantic?.ready ? '模型就绪' : '未加载 / 未就绪'} · 覆盖 ${status.semantic?.index?.indexed ?? 0} / ${status.semantic?.index?.total ?? '?'} 条`),
+          (status.semantic?.tasks?.[0] || status.semantic?.lastTask) ? h('small', null, (() => {
+            const task = status.semantic.tasks?.[0] || status.semantic.lastTask;
+            return `${task.kind === 'prewarm' ? '空闲索引准备' : '前台语义请求'}：${taskStates[task.state] || task.state}${task.code ? `（${task.code}）` : ''}`;
+          })()) : null,
           status.semantic?.directory ? h('code', { className: 'path' }, status.semantic.directory) : null,
           status.semantic?.error ? h('div', { className: 'message error', role: 'alert' },
             `${status.semantic.error.code} · ${status.semantic.error.message}`) : null,
@@ -348,7 +355,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'row' }, button('保存语义设置', saveConfig, 'primary'),
             button('准备本地语义索引', () => run(() => request(space, '/semantic/prepare', {}), '本地模型与语义索引已就绪。')),
             button('重新校验模型并重建语义索引', () => run(() => request(space, '/semantic/rebuild', {}), '模型已重新校验，派生语义索引已重建。'))),
-          h('small', null, '私人日记和 L0 不进入向量索引。模型、向量与缓存不进入记忆备份；删除普通记忆同时清理其向量。')),
+          h('small', null, '空间空闲时只为已启用的本地语义组合准备普通索引，前台请求优先。私人日记和 L0 不进入向量索引。模型、向量与缓存不进入记忆备份；删除普通记忆同时清理其向量。')),
         h('div', { className: 'panel stack' }, h('h3', null, '模型文件与下载'),
           ...(status.modelPacks ?? []).map(pack => h('div', { className: 'stack', key: pack.edition },
             h('strong', null, `${pack.modelId} · ${pack.dimension} 维 · 权重 ${(pack.weightBytes / 1024 / 1024).toFixed(1)} MiB`),

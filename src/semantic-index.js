@@ -37,64 +37,120 @@ export class SemanticIndex {
     this.queue = Promise.resolve();
     this.state = 'idle';
     this.closed = false;
+    this.initialized = false;
+    this.dirty = new Set();
   }
   invalidate(record) {
     if (record.layer === 'L0' || this.closed) return;
+    const alreadyDirty = this.dirty.has(record.id);
+    this.dirty.add(record.id);
     const previous = this.db.prepare('SELECT content_hash FROM documents WHERE id=?').get(record.id);
-    if (!previous) return;
-    if (!indexable(record) || previous.content_hash !== memoryContentHash(record))
-      this.db.prepare('DELETE FROM documents WHERE id=?').run(record.id);
-    else this.db.prepare('UPDATE documents SET revision=? WHERE id=?').run(record.revision, record.id);
+    if (!indexable(record)) {
+      if (previous) this.db.prepare('DELETE FROM documents WHERE id=?').run(record.id);
+      this.dirty.delete(record.id);
+    } else if (!previous || previous.content_hash !== memoryContentHash(record)) {
+      if (previous)
+        this.db.prepare('DELETE FROM documents WHERE id=?').run(record.id);
+    } else if (!alreadyDirty) this.dirty.delete(record.id);
   }
   forget(ids) {
+    for (const id of ids) this.dirty.delete(id);
     transaction(this.db, () => { for (const id of ids) this.db.prepare('DELETE FROM documents WHERE id=?').run(id); });
   }
-  sync(embedder) {
+  reconcile(pack) {
+    const records = this.store.all().filter(indexable);
+    const byId = new Map(records.map(record => [record.id, record]));
+    const existing = this.db.prepare(`SELECT id,content_hash,chunks,
+      (SELECT count(*) FROM vectors v WHERE v.id=d.id AND length(v.vector)=?) AS present
+      FROM documents d`).all(pack.dimension * 4);
+    const seen = new Set(), remove = [];
+    for (const row of existing) {
+      const record = byId.get(row.id);
+      if (!record || row.content_hash !== memoryContentHash(record) || row.present !== row.chunks) {
+        remove.push(row.id);
+        if (record) this.dirty.add(record.id);
+      } else {
+        seen.add(row.id);
+      }
+    }
+    for (const record of records) if (!seen.has(record.id)) this.dirty.add(record.id);
+    if (remove.length) transaction(this.db, () => {
+      const removeDocument = this.db.prepare('DELETE FROM documents WHERE id=?');
+      for (const id of remove) removeDocument.run(id);
+    });
+    this.initialized = true;
+  }
+  sync(embedder, { signal } = {}) {
     const run = async () => {
       requireValue(!this.closed, 'CLOSED', '语义索引已关闭。', 503);
+      const modelKey = embedder.key;
+      const check = () => {
+        requireValue(!signal?.aborted, 'SEMANTIC_CANCELLED', '本地语义准备已取消。', 409);
+        requireValue(!this.closed && embedder.key === modelKey, 'MODEL_CHANGED', '索引已关闭或模型已切换。', 409);
+      };
+      check();
       this.state = 'indexing';
       try {
-        const modelKey = embedder.key;
         const pack = await embedder.ready();
-        requireValue(embedder.key === modelKey, 'MODEL_CHANGED', '索引模型已切换，请重试。', 409);
+        check();
         if (this.db.prepare("SELECT value FROM metadata WHERE key='model'").get()?.value !== pack.fingerprint) {
           transaction(this.db, () => {
             this.db.exec('DELETE FROM documents');
             this.db.prepare("INSERT OR REPLACE INTO metadata VALUES('model',?)").run(pack.fingerprint);
           });
+          this.initialized = false;
+          this.dirty.clear();
         }
-        const records = this.store.all().filter(indexable);
-        this.db.prepare('DELETE FROM documents WHERE id NOT IN (SELECT value FROM json_each(?))')
-          .run(JSON.stringify(records.map(record => record.id)));
+        if (!this.initialized || (!this.dirty.size && this.status().pending)) this.reconcile(pack);
         let indexed = 0;
-        for (const record of records) {
-          requireValue(!this.closed && embedder.key === modelKey, 'MODEL_CHANGED', '索引已关闭或模型已切换。', 409);
-          const contentHash = memoryContentHash(record);
-          const previous = this.db.prepare(`SELECT content_hash,chunks,
-            (SELECT count(*) FROM vectors v WHERE v.id=d.id AND length(v.vector)=?) AS present
-            FROM documents d WHERE id=?`).get(pack.dimension * 4, record.id);
-          if (previous?.content_hash === contentHash && previous.present === previous.chunks) { this.invalidate(record); continue; }
-          const chunks = semanticChunks(memorySearchText(record), pack.chunkSize), vectors = [];
-          for (let offset = 0; offset < chunks.length; offset += 16)
-            vectors.push(...await embedder.embed(chunks.slice(offset, offset + 16), 'document'));
-          requireValue(!this.closed && embedder.key === modelKey, 'MODEL_CHANGED', '索引已关闭或模型已切换。', 409);
-          const current = this.store.raw(record.id);
-          if (!current || !indexable(current) || memoryContentHash(current) !== contentHash) continue;
+        const prepared = [];
+        const flush = () => {
+          if (!prepared.length) return;
+          check();
+          const committed = [];
           transaction(this.db, () => {
-            this.db.prepare('DELETE FROM documents WHERE id=?').run(record.id);
-            this.db.prepare('INSERT INTO documents VALUES(?,?,?,?)').run(record.id, contentHash, current.revision, chunks.length);
-            const insert = this.db.prepare('INSERT INTO vectors VALUES(?,?,?)');
-            vectors.forEach((vector, part) => insert.run(record.id, part,
-              Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
+            const remove = this.db.prepare('DELETE FROM documents WHERE id=?');
+            const insertDocument = this.db.prepare('INSERT INTO documents VALUES(?,?,?,?)');
+            const insertVector = this.db.prepare('INSERT INTO vectors VALUES(?,?,?)');
+            for (const item of prepared) {
+              const current = this.store.raw(item.id);
+              if (!current || !indexable(current) || memoryContentHash(current) !== item.contentHash) continue;
+              remove.run(item.id);
+              insertDocument.run(item.id, item.contentHash, current.revision, item.vectors.length);
+              item.vectors.forEach((vector, part) => insertVector.run(item.id, part,
+                Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
+              committed.push(item.id);
+            }
           });
-          indexed++;
+          for (const id of committed) this.dirty.delete(id);
+          indexed += committed.length;
+          prepared.length = 0;
+        };
+        for (const id of [...this.dirty]) {
+          check();
+          const record = this.store.raw(id);
+          if (!record || !indexable(record)) {
+            this.db.prepare('DELETE FROM documents WHERE id=?').run(id);
+            this.dirty.delete(id);
+            continue;
+          }
+          const contentHash = memoryContentHash(record);
+          const chunks = semanticChunks(memorySearchText(record), pack.chunkSize), vectors = [];
+          for (let offset = 0; offset < chunks.length; offset += 16) {
+            vectors.push(...await embedder.embed(chunks.slice(offset, offset + 16), 'document'));
+            check();
+          }
+          prepared.push({ id, contentHash, vectors });
+          if (prepared.length >= 16) flush();
         }
-        this.state = this.status().pending ? 'partial' : 'ready';
+        flush();
+        this.state = this.status().pending || this.dirty.size ? 'partial' : 'ready';
         this.error = null;
         return { indexed, fingerprint: pack.fingerprint };
       } catch (error) {
-        this.state = 'error';
-        this.error = { code: error.code ?? 'INDEX_FAILED', message: error.message };
+        this.state = error.code === 'SEMANTIC_CANCELLED' ? 'partial' : 'error';
+        this.error = error.code === 'SEMANTIC_CANCELLED' ? null :
+          { code: error.code ?? 'INDEX_FAILED', message: error.message };
         throw error;
       }
     };
@@ -108,8 +164,8 @@ export class SemanticIndex {
     const scores = new Map(), documents = new Map();
     for (const row of this.db.prepare('SELECT * FROM documents').all()) {
       const record = this.store.raw(row.id);
-      if (record && indexable(record) && accept(record) && row.content_hash === memoryContentHash(record) &&
-        row.revision === record.revision) documents.set(row.id, row);
+      if (record && indexable(record) && accept(record) && row.content_hash === memoryContentHash(record))
+        documents.set(row.id, { ...row, currentRevision: record.revision });
     }
     for (const row of this.db.prepare('SELECT id,vector FROM vectors').all()) {
       if (!documents.has(row.id)) continue;
@@ -129,7 +185,7 @@ export class SemanticIndex {
     const threshold = Math.max(pack.minScore, best * pack.relativeFloor);
     return [...scores].filter(([, score]) => score >= threshold).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .slice(0, limit).map(([id, score]) => ({ id, score, contentHash: documents.get(id).content_hash,
-        revision: documents.get(id).revision }));
+        revision: documents.get(id).currentRevision }));
   }
   status() {
     const indexed = this.db.prepare(`SELECT count(*) AS n FROM documents d
@@ -141,6 +197,11 @@ export class SemanticIndex {
       fingerprint: this.db.prepare("SELECT value FROM metadata WHERE key='model'").get()?.value ?? null,
       error: this.error ?? null };
   }
-  clear() { this.db.exec('DELETE FROM documents; DELETE FROM metadata'); this.state = 'idle'; }
+  clear() {
+    this.db.exec('DELETE FROM documents; DELETE FROM metadata');
+    this.dirty.clear();
+    this.initialized = false;
+    this.state = 'idle';
+  }
   close() { if (!this.closed) { this.closed = true; this.db.close(); } }
 }

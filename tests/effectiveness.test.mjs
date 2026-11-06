@@ -37,6 +37,21 @@ test('effective L3 residency has independent capacity and does not masquerade as
   assert.ok(space.recall('stable preference 7', admin).picked.length);
 });
 
+test('recall diagnostics use the same request ID and distinguish query and context candidates', t => {
+  const { space } = fixture(t, { config: { residentBudget: 0 } });
+  const target = create(space, 'violet protocol');
+  const result = space.recall('unrelated topic', { sessionId: 's' }, { contextQueries: ['violet protocol'] });
+  assert.ok(result.picked.some(item => item.id === target.id && item.reason === '近期用户情境匹配'));
+  assert.equal(result.diagnostics.lexicalQueryCandidates, 0);
+  assert.ok(result.diagnostics.lexicalContextCandidates >= 1);
+  assert.equal(space.traces(admin)[0].requestId, result.requestId);
+  assert.deepEqual(space.traces(admin)[0].diagnostics, result.diagnostics);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  const stopWordsOnly = space.recall('我', admin, { contextQueries: ['violet protocol'] });
+  assert.ok(stopWordsOnly.picked.some(item => item.id === target.id && item.reason === '近期用户情境匹配'));
+  assert.equal(stopWordsOnly.diagnostics.lexicalQueryCandidates, 0);
+});
+
 test('evidence retrieval is turn-idempotent, crash-recoverable and distinct from confirmation', t => {
   const { root, space } = fixture(t);
   const record = create(space, 'violet protocol');
@@ -230,6 +245,26 @@ test('capture keeps all qualifying sentences and distinguishes ongoing work from
   for (const text of ['我不知道你喜欢什么。', '我不确定项目使用 pnpm。', '我喜欢咖啡吗']) {
     assert.deepEqual(localCandidates(text), [], text);
   }
+});
+
+test('explicit and ordinary future meeting statements share task classification without guessing dates', t => {
+  const text = '我明天下午三点开会';
+  assert.deepEqual(classifyRememberDirective(`记住：${text}`),
+    { text, layer: 'L1', horizon: 'task', category: 'task' });
+  assert.equal(localCandidates(text)[0].layer, 'L1');
+  assert.equal(localCandidates('如果我明天下午三点开会，就先取消。').length, 0);
+  const { space } = fixture(t);
+  const captured = space.capture({ sessionId: 's', eventId: 1, role: 'user', text: `记住：${text}` });
+  space.organizePending(1, captured.id);
+  const saved = space.all().find(record => record.layer === 'L1');
+  assert.equal(saved.text, text);
+  assert.equal(saved.occurredAt, captured.occurredAt);
+  assert.equal(saved.horizon, 'task');
+  const followup = space.capture({ sessionId: 'other', eventId: 2, role: 'user', text: '明天 开会' });
+  space.organizePending(1, followup.id);
+  assert.ok(space.recall('明天 开会', { sessionId: 'other' }).picked.some(item => item.id === saved.id));
+  const differentDay = space.create({ layer: 'L1', text: '我今天开会。', kind: 'user_statement' }, { admin: true });
+  assert.equal(space.recall('明天 开会', { sessionId: 'other' }).picked.some(item => item.id === differentDay.id), false);
 });
 
 test('working lifetime renews on new evidence only, can be disabled, and never reopens completed tasks', t => {

@@ -107,9 +107,12 @@ if (process.argv[2] === '--worker') {
     const ref = process.argv[3] ?? 'e389bcd6adbb4a4c3a93efb386f089edfd08bd2a';
     const baselineCommit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`],
       { cwd: repo, encoding: 'utf8' }).trim();
-    for (const file of ['store.js', 'database.js', 'model.js']) {
-      writeFileSync(join(baseline, 'src', file),
-        execFileSync('git', ['show', `${baselineCommit}:src/${file}`], { cwd: repo }));
+    const sourceFiles = execFileSync('git', ['ls-tree', '-r', '--name-only', baselineCommit, '--', 'src'],
+      { cwd: repo, encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+    for (const file of sourceFiles) {
+      const target = join(baseline, ...file.split('/'));
+      mkdirSync(join(target, '..'), { recursive: true });
+      writeFileSync(target, execFileSync('git', ['show', `${baselineCommit}:${file}`], { cwd: repo }));
     }
     const run = (name, source) => {
       const child = spawnSync(process.execPath, [script, '--worker', source, join(temp, name), String(count)],
@@ -127,6 +130,7 @@ if (process.argv[2] === '--worker') {
       ], baseline: run('old-data', baseline), current: run('new-data', repo) };
     mkdirSync(join(repo, '.preview'), { recursive: true });
     writeFileSync(join(repo, '.preview', 'benchmark.json'), JSON.stringify(report, null, 2));
+    writeFileSync(join(repo, '.preview', `benchmark-${count}.json`), JSON.stringify(report, null, 2));
     const compact = ({ results, ...metrics }) => metrics;
     console.log(JSON.stringify({ baselineCommit, baseline: compact(report.baseline), current: compact(report.current) }, null, 2));
   } finally { rmSync(temp, { recursive: true, force: true }); }

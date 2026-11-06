@@ -84,6 +84,27 @@ test('aliases survive rebuild and remain scoped; editing text invalidates old st
   assert.equal(record.claim, null);
 });
 
+test('exact workspace aliases retrieve mixed editor rewrites without equating vim and neovim', t => {
+  const { root } = fixture(t);
+  for (const [index, item] of [
+    { text: '我写代码用 neovim。', alias: 'nvim', query: '编辑器是 nvim' },
+    { text: '我的编辑器是 nvim。', alias: 'neovim', query: '写代码用 neovim' },
+  ].entries()) {
+    const space = new MemorySpace(root, `editor-${index}`, { config: { residentBudget: 0 } });
+    try {
+      const record = space.create({ layer: 'L2', text: item.text, aliases: [item.alias],
+        kind: 'user_statement' }, admin);
+      const unrelated = space.create({ layer: 'L2', text: '他以前使用 Vim。', aliases: ['vim'],
+        kind: 'user_statement' }, admin);
+      const result = space.recall(item.query, { sessionId: 'other' });
+      assert.ok(result.picked.some(row => row.id === record.id && row.channel === 'query' &&
+        row.reason === '工作区别名精确匹配'));
+      assert.equal(result.picked.some(row => row.id === unrelated.id), false);
+      assert.equal(space.get(record.id, admin).text, item.text);
+    } finally { space.close(); }
+  }
+});
+
 test('explicit task completion records an episode; expiration never fabricates completion', t => {
   const { space, capture, advance } = fixture(t);
   capture('请完成数据库迁移。');

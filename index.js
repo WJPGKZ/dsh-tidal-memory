@@ -24,7 +24,7 @@ export const Config = z.object({
   embeddingTimeoutSeconds: integer(DEFAULTS.embeddingTimeoutSeconds, 5, 3600, '语义准备等待秒数，包含冷启动和增量索引；超时明确降级，不影响记忆保存。'),
   embeddingMinScore: z.number().min(-1).max(1).default(-1).volatile().description('语义最低相似度；-1 使用模型建议值，或设为 0–1。不是事实可信度。'),
   embeddingRelativeFloor: z.number().min(-1).max(1).default(-1).volatile().description('语义相对最高分门槛；-1 使用模型建议值，或设为 0–1。'),
-  autoConsolidate: z.boolean().default(DEFAULTS.autoConsolidate).volatile().description('空闲时执行轻整理；不调用模型。'),
+  autoConsolidate: z.boolean().default(DEFAULTS.autoConsolidate).volatile().description('空闲时执行本地规则轻整理，不调用生成模型；已启用的本地语义组合可独立预热索引。'),
   autoArchive: z.boolean().default(DEFAULTS.autoArchive).volatile().description('低重要、未强化、未召回 L2 保存满八个半衰期后归档，不删除。'),
   dailyConsolidateAt: z.string().default(DEFAULTS.dailyConsolidateAt).volatile().description('每日深度整理时间（本机时区，HH:mm）；默认 03:00，留空关闭自动深度整理。'),
   workingHours: integer(DEFAULTS.workingHours, 0, 8760, '会话自动捕获的 L1 有效时长（小时）；0 不自动到期。已保存的有效期不随设置改写。'),

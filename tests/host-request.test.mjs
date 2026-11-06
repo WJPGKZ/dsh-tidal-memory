@@ -19,6 +19,13 @@ for (const scenario of [
   { name: 'semantic context honors runtime suppression', semantic: 'cpu', captured: true, suppressed: true, expected: false },
   { name: 'semantic context honors complete prompt', semantic: 'cpu', captured: true, complete: true, expected: true },
   { name: 'enhanced semantic first request', semantic: 'enhanced', captured: true, expected: true },
+  { name: 'explicit future meeting in another session', scheduled: true, captured: true, expected: true },
+  { name: 'standard exact editor alias in another session', cross: true, expected: true,
+    editor: { memory: '我写代码用 neovim。', query: '编辑器是 nvim', alias: 'nvim' } },
+  { name: 'CPU editor rewrite in another session', semantic: 'cpu', cross: true, expected: true,
+    editor: { memory: '我写代码用 neovim。', query: '编辑器是 nvim' } },
+  { name: 'enhanced reverse editor rewrite in another session', semantic: 'enhanced', cross: true, expected: true,
+    editor: { memory: '我的编辑器是 nvim。', query: '写代码用 neovim' } },
 ]) {
   test(`real rc5 agent-loop request: ${scenario.name}`, {
     timeout: scenario.semantic ? 60000 : 15000, skip: scenario.semantic && !process.env.TIDAL_MODEL_ROOT,
@@ -33,8 +40,11 @@ for (const scenario of [
     const root = mkdtempSync(join(tmpdir(), 'tidal-request-'));
     const cwd = join(root, 'workspace');
     const ctx = new Context(), fibers = [], requests = [];
-    const canary = scenario.semantic ? '这个项目用 SQLite 数据库存储用户信息。' :
-      scenario.captured ? '这个项目用 SQLite 存储。' : 'omega protocol {{must_stay_literal}}';
+    const canary = scenario.editor?.memory ?? (scenario.scheduled ? '我明天下午三点开会' :
+      scenario.semantic ? '这个项目用 SQLite 数据库存储用户信息。' :
+      scenario.captured ? '这个项目用 SQLite 存储。' : 'omega protocol {{must_stay_literal}}');
+    const query = scenario.editor?.query ?? (scenario.scheduled ? '明天 开会' :
+      scenario.semantic ? '用户数据放在哪种数据库里？' : scenario.captured ? 'SQLite' : 'omega protocol');
     try {
       ctx.provide('llm', {
         async prepareCall(config) {
@@ -57,6 +67,7 @@ for (const scenario of [
       fibers.push(await ctx.plugin(plugin, {
         dataRoot: root, bindings: [{ cwd, space: 'shared' }], autoBackup: false,
         injectContext: !scenario.disabled,
+        ...(scenario.editor ? { residentBudget: 0 } : {}),
         ...(scenario.semantic ? { embeddingMode: scenario.semantic, minScore: 1, residentBudget: 0,
           embeddingModelPath: join(process.env.TIDAL_MODEL_ROOT, 'models',
             scenario.semantic === 'cpu' ? 'bge-small-zh-v1.5' : 'qwen3-embedding-0.6b') } : {}),
@@ -65,15 +76,17 @@ for (const scenario of [
       if (scenario.suppressed) ctx.systemPrompt.suppressRuntimeContext();
       const agent = await ctx.agentLoop.create('request-session', { provider: 'synthetic', model: 'no-network' }, { cwd });
       if (!scenario.captured) {
-        const memory = ctx.tidalMemory.forAgent(agent).proposeMemory({ layer: 'L3', text: canary });
+        const memory = ctx.tidalMemory.forAgent(agent).proposeMemory({ layer: scenario.editor ? 'L2' : 'L3', text: canary,
+          ...(scenario.editor?.alias ? { aliases: [scenario.editor.alias] } : {}) });
         assert.equal(memory.status, 'active');
       }
       for (let turn = 0; turn < 2; turn++) {
-        const current = scenario.captured && turn ? await ctx.agentLoop.create('other-session',
+        const current = (scenario.captured || scenario.cross) && turn ? await ctx.agentLoop.create('other-session',
           { provider: 'synthetic', model: 'no-network' }, { cwd }) : agent;
         current.followup(createUserMessage({ content: [{ type: 'text', text: scenario.captured ?
-          (turn ? scenario.semantic ? '用户数据放在哪种数据库里？' : 'SQLite' : canary) :
-          scenario.long ? 'omega protocol '.repeat(300) : 'omega protocol' }], source: { kind: 'user' } }));
+          (turn ? query : scenario.scheduled ? `记住：${canary}` : canary) :
+          scenario.editor ? (turn ? query : '先记录编辑器信息。') :
+            scenario.long ? 'omega protocol '.repeat(300) : 'omega protocol' }], source: { kind: 'user' } }));
         await current.whenIdle();
       }
       assert.equal(requests.length, 2, JSON.stringify(agent.session.snapshotEvents()));
@@ -91,11 +104,11 @@ for (const scenario of [
       }
       const recalled = await ctx.tools.execute({
         callId: 'recall-after-request', name: 'tidal_recall',
-        arguments: { query: scenario.semantic ? '用户数据放在哪种数据库里？' : scenario.captured ? 'SQLite' : 'omega protocol' },
+        arguments: { query },
         agent, signal: new AbortController().signal,
       });
       assert.equal(recalled.isError, false, JSON.stringify(recalled));
-      assert.ok(recalled.value.picked.length > 0);
+      assert.ok(recalled.value.picked.length > 0, JSON.stringify(recalled.value));
       assert.deepEqual(JSON.parse(recalled.content[0].text), recalled.value);
       if (scenario.semantic) {
         assert.equal(recalled.value.semanticStatus.state, 'ready');

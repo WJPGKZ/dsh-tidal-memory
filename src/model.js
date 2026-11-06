@@ -204,6 +204,7 @@ const TASK_CUE = /(?:本次任务|这次任务|当前任务|这个任务|此任�
 const LONG_TERM_CUE = /(?:以后|今后|长期|一直|始终|总是|默认|偏好|习惯|我喜欢|我不喜欢|喜欢|不喜欢|每次都)/;
 const TASK_ACTION = /(?:修复|实现|检查|整理|分析|编写|创建|查找|解释|比较|验证|完成|发布|部署|迁移|重构|优化|更新|安装|删除|设计|测试|处理|归纳|总结|记录|回答|搜索|研究|看一下|看看|写进|写到|拆成|拆分|加入|添加|放到|放进|改成|改为|运行|跑一下|打开|保存)/;
 const TASK_REQUEST = /(?:请(?:你|帮我|协助我)?|麻烦(?:你|帮我)?|帮我|替我|能否|能不能|可以(?:帮我|请)?|接下来|下一步|现在|这次|本轮|我们先|先)/;
+const SCHEDULED_TASK = /^(?:我|我们)?(?:明天|后天|本周|下周).{0,30}(?:开会|会议|交付|提交|发布|复查|验收)/;
 
 export function classifyRememberDirective(text) {
   if (typeof text !== 'string') return null;
@@ -213,7 +214,8 @@ export function classifyRememberDirective(text) {
   if (!content) return null;
   if (/(?:昨天|上次|去年|之前|刚才|刚刚|完成了|解决了)/.test(content))
     return { text: content, layer: 'L2', horizon: 'event', category: 'event' };
-  if (TASK_CUE.test(content)) return { text: content, layer: 'L1', horizon: 'task', category: 'task' };
+  if (TASK_CUE.test(content) || SCHEDULED_TASK.test(content))
+    return { text: content, layer: 'L1', horizon: 'task', category: 'task' };
   if (EVENT_CUE.test(content)) return { text: content, layer: 'L2', horizon: 'event', category: 'event' };
   if (LONG_TERM_CUE.test(content)) {
     const preference = /(?:偏好|习惯|喜欢|不喜欢)/.test(content);
@@ -249,7 +251,7 @@ export function localCandidates(text) {
       rule = 'event'; category = 'event'; horizon = 'event';
     } else if (continuationTask || TASK_CUE.test(quote)) {
       rule = 'active-topic'; layer = 'L1'; category = 'task'; horizon = 'task';
-    } else if (/^(?:明天|后天|本周|下周).{0,30}(?:开会|会议|交付|提交|发布|复查|验收)/.test(quote)) {
+    } else if (SCHEDULED_TASK.test(quote)) {
       rule = 'scheduled-task'; layer = 'L1'; category = 'task'; horizon = 'task';
     } else if (agreement) {
       rule = 'agreement'; category = 'agreement'; horizon = 'long_term';
@@ -402,5 +404,7 @@ export function rankMemory(memory, queryTerms, now, halfLifeDays, idf = new Map(
   const age = Math.max(0, now - Date.parse(memory.lastRecalledAt ?? memory.reinforcedAt ?? memory.occurredAt ?? memory.createdAt)) / 86400000;
   const freshness = memory.pinned || memory.layer === 'L3' ? 1 : 2 ** (-age / (halfLifeDays * memory.stability));
   const specificity = idfCeiling > 0 ? Math.min(1, Math.max(0, ...hits.map(weight)) / idfCeiling) : 1;
-  return { score: direct * specificity * (0.65 + 0.2 * freshness + 0.15 * memory.importance), hits, freshness, specificity };
+  // A complete multi-term match remains useful when IDF has little separation in a small corpus.
+  const scoreSpecificity = hits.length >= 2 && hits.length === queryTerms.length ? Math.max(specificity, 0.5) : specificity;
+  return { score: direct * scoreSpecificity * (0.65 + 0.2 * freshness + 0.15 * memory.importance), hits, freshness, specificity };
 }

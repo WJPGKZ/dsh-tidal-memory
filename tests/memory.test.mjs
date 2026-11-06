@@ -84,6 +84,73 @@ test('passive previews never reinforce; manual confirmation is idempotent', t =>
   space.reinforce(a.id, 'confirmation-1', admin);
   assert.equal(space.get(a.id, admin).stability, 1.25);
 });
+test('usage reinforcement preserves optimistic revisions without rewriting content history or views', t => {
+  const { space } = fixture(t);
+  const record = create(space, 'usage-only evidence');
+  const db = space.db(record.layer);
+  const view = join(space.directory, LAYERS[record.layer].directory, 'views', `${record.id}.md`);
+  const originalView = readFileSync(view, 'utf8');
+  const originalPersist = space.persist.bind(space), originalWriteView = space.writeView.bind(space);
+  space.persist = () => { throw new Error('usage must not rewrite persistent content'); };
+  space.writeView = () => { throw new Error('usage must not rewrite content views'); };
+  try {
+    space.recordRetrieval(record.id, 'turn-1');
+    space.recordRetrieval(record.id, 'turn-1');
+  } finally {
+    space.persist = originalPersist;
+    space.writeView = originalWriteView;
+  }
+  const current = space.get(record.id, admin);
+  assert.equal(current.recallCount, 1);
+  assert.equal(current.revision, record.revision + 1);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM revisions WHERE id=?').get(record.id).n, 1);
+  assert.equal(readFileSync(view, 'utf8'), originalView);
+  assert.equal(space.revisions(record.id, admin)[0].revision, current.revision);
+  assert.throws(() => space.update(record.id, { text: 'stale edit' }, record.revision, admin), /已被修改/);
+});
+test('recovering a prepared usage operation keeps later content edits and records the evidence once', t => {
+  const { space } = fixture(t);
+  const record = create(space, 'before usage recovery');
+  space.failpoint = point => { if (point === 'after-reinforcement-prepare') throw new Error('usage interrupted'); };
+  assert.throws(() => space.recordRetrieval(record.id, 'turn-1'), /usage interrupted/);
+  space.failpoint = () => {};
+  const changed = space.update(record.id, { text: 'after usage recovery' }, record.revision, admin);
+  space.recover();
+  space.recordRetrieval(record.id, 'turn-1');
+  const current = space.get(record.id, admin);
+  assert.equal(current.text, changed.text);
+  assert.equal(current.recallCount, 1);
+  assert.equal(current.revision, changed.revision + 1);
+});
+test('word statistics and FTS change only when their corpus or status changes', t => {
+  const { space } = fixture(t, { config: { residentBudget: 0 } });
+  let record = create(space, 'violet protocol', { layer: 'L2' });
+  let statisticsQueries = 0, ftsWrites = 0;
+  for (const db of space.dbs.values()) {
+    const prepare = db.prepare.bind(db);
+    db.prepare = sql => {
+      if (sql.includes('SELECT count(*) AS n FROM search JOIN memories')) statisticsQueries++;
+      if (/^(?:DELETE FROM|INSERT INTO) search\b/i.test(sql.trim())) ftsWrites++;
+      return prepare(sql);
+    };
+  }
+  const recall = () => space.recall('violet protocol', { sessionId: 's' });
+  recall();
+  const firstQueries = statisticsQueries;
+  assert.ok(firstQueries > 0);
+  recall();
+  space.recordRetrieval(record.id, 'turn-1');
+  recall();
+  assert.equal(statisticsQueries, firstQueries);
+  assert.equal(ftsWrites, 0);
+  record = space.get(record.id, admin);
+  record = space.update(record.id, { status: 'archived' }, record.revision, admin);
+  assert.equal(ftsWrites, 0);
+  assert.equal(recall().picked.length, 0);
+  assert.ok(statisticsQueries > firstQueries);
+  space.update(record.id, { text: 'different protocol' }, record.revision, admin);
+  assert.equal(ftsWrites, 2);
+});
 test('reinforcement recovers if the layer write succeeds before its idempotency marker', t => {
   const root = mkdtempSync(join(tmpdir(), 'tidal-reinforcement-recovery-'));
   let fail = true;
@@ -184,6 +251,54 @@ test('encrypted backup authenticates and restores private content into a new spa
   const restored = own(new MemorySpace(root, 'restored'));
   assert.equal(restored.all().length, 1);
   assert.equal(restored.privateStatus().count, 1);
+});
+test('backup preserves usage and manual evidence idempotency, including after interrupted writes', t => {
+  const { root, space, own } = fixture(t);
+  const record = create(space, 'backup evidence', { layer: 'L2' });
+  let interrupted = true;
+  space.failpoint = point => {
+    if (point === 'after-reinforcement-write' && interrupted) {
+      interrupted = false;
+      throw new Error('interrupted usage');
+    }
+  };
+  assert.throws(() => space.recordRetrieval(record.id, 'turn-1'), /interrupted usage/);
+  space.failpoint = () => {};
+  space.reinforce(record.id, 'manual-confirmation', admin);
+  const before = space.get(record.id, admin);
+  const backup = packBackup(space);
+  const document = unpackBackup(backup);
+  assert.equal(document.reinforcements.length, 2);
+  assert.equal(document.retrievalEvents.length, 1);
+  assert.equal(backup.includes('turn-1'), false);
+  restoreBackup(root, 'evidence-restored', backup, '', {});
+  const restored = own(new MemorySpace(root, 'evidence-restored'));
+  restored.recordRetrieval(record.id, 'turn-1');
+  restored.reinforce(record.id, 'manual-confirmation', admin);
+  assert.equal(restored.get(record.id, admin).revision, before.revision);
+  assert.equal(restored.get(record.id, admin).stability, before.stability);
+  restored.recordRetrieval(record.id, 'turn-2');
+  assert.equal(restored.get(record.id, admin).recallCount, before.recallCount + 1);
+
+  delete document.reinforcements;
+  delete document.retrievalEvents;
+  const payload = JSON.stringify(document);
+  const legacy = JSON.stringify({ format: 'tidal-backup', version: 1, sha256: hash(payload), payload });
+  restoreBackup(root, 'old-evidence-backup', legacy, '', {});
+  const oldRestore = own(new MemorySpace(root, 'old-evidence-backup'));
+  assert.equal(oldRestore.get(record.id, admin).recallCount, before.recallCount);
+});
+test('restore rejects invalid backup evidence references without publishing a space', t => {
+  const { root, space } = fixture(t);
+  const record = create(space, 'evidence reference', { layer: 'L2' });
+  space.recordRetrieval(record.id, 'turn-1');
+  const envelope = JSON.parse(packBackup(space));
+  const document = JSON.parse(envelope.payload);
+  document.retrievalEvents[0].layer = 'L3';
+  envelope.payload = JSON.stringify(document);
+  envelope.sha256 = hash(envelope.payload);
+  assert.throws(() => restoreBackup(root, 'bad-evidence', JSON.stringify(envelope), '', {}), /召回依据引用无效/);
+  assert.equal(existsSync(join(root, 'spaces', 'bad-evidence')), false);
 });
 test('malformed restore never publishes a partially restored space', t => {
   const { root, space } = fixture(t);

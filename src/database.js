@@ -40,6 +40,9 @@ export function createLayer(db) {
       id TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL,
       PRIMARY KEY(id, revision)
     );
+    CREATE TABLE IF NOT EXISTS retrieval_events (
+      id TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(id, evidence)
+    );
     CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(id UNINDEXED, words, tokenize='unicode61');
     CREATE TABLE IF NOT EXISTS index_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
@@ -59,6 +62,7 @@ export function createLayer(db) {
       CREATE INDEX IF NOT EXISTS by_exact_text ON memories(json_extract(data,'$.text'));
       CREATE INDEX IF NOT EXISTS by_has_parents ON memories(id) WHERE json_array_length(data,'$.parents')>0;
       CREATE INDEX IF NOT EXISTS by_status_expiry ON memories(status,valid_until);
+      CREATE INDEX IF NOT EXISTS by_status_valid_from ON memories(status,json_extract(data,'$.validFrom'));
       PRAGMA user_version=3;`);
   });
 }

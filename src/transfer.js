@@ -48,7 +48,9 @@ export function unpackBackup(text, password = '') {
   }
   const document = JSON.parse(payload);
   requireValue(document.schema === 'tidal-memory' && document.version === 1 &&
-    Array.isArray(document.records) && Array.isArray(document.revisions) && Array.isArray(document.tombstones),
+    Array.isArray(document.records) && Array.isArray(document.revisions) && Array.isArray(document.tombstones) &&
+    (document.reinforcements === undefined || Array.isArray(document.reinforcements)) &&
+    (document.retrievalEvents === undefined || Array.isArray(document.retrievalEvents)),
   'INVALID_BACKUP', '记忆快照结构无效。');
   requireValue(envelope.format === 'tidal-encrypted-backup' || !document.privateEntries, 'PRIVATE_PLAINTEXT', '拒绝包含私人日记的明文备份。');
   return document;
@@ -70,8 +72,8 @@ export function restoreBackup(root, name, text, password, config) {
     return result;
   };
   const normalized = document.records.map(validate);
-  const ids = new Set(normalized.map(record => record.id));
-  requireValue(ids.size === normalized.length, 'INVALID_BACKUP', '备份包含重复 ID。');
+  const records = new Map(normalized.map(record => [record.id, record]));
+  requireValue(records.size === normalized.length, 'INVALID_BACKUP', '备份包含重复 ID。');
   const staging = `restore-${randomUUID()}`;
   let store;
   let completed = false;
@@ -79,9 +81,9 @@ export function restoreBackup(root, name, text, password, config) {
     store = new MemorySpace(root, staging, { config });
     for (const record of normalized) store.persist(record);
     for (const revision of document.revisions) {
-      requireValue(ids.has(revision.record.id) && revision.layer === revision.record.layer, 'INVALID_BACKUP', '版本历史引用无效。');
+      requireValue(records.has(revision.record.id) && revision.layer === revision.record.layer, 'INVALID_BACKUP', '版本历史引用无效。');
       const validated = validate(revision.record);
-      const current = normalized.find(record => record.id === validated.id);
+      const current = records.get(validated.id);
       requireValue(current.layer === revision.layer && validated.revision <= current.revision,
         'INVALID_BACKUP', '版本历史层级或编号无效。');
       store.db(revision.layer).prepare('INSERT OR REPLACE INTO revisions VALUES(?,?,?)')
@@ -95,6 +97,17 @@ export function restoreBackup(root, name, text, password, config) {
     for (const key of document.forgottenKeys ?? []) {
       requireValue(typeof key === 'string' && /^[a-f0-9]{64}$/.test(key), 'INVALID_BACKUP', '遗忘标记无效。');
       store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(key);
+    }
+    for (const row of document.reinforcements ?? []) {
+      requireValue(row && typeof row === 'object' && records.has(row.id), 'INVALID_BACKUP', '强化依据引用无效。');
+      string(row.evidence, '强化依据', 256);
+      store.system.prepare('INSERT INTO reinforcements VALUES(?,?)').run(row.id, row.evidence);
+    }
+    for (const row of document.retrievalEvents ?? []) {
+      requireValue(row && typeof row === 'object' && records.get(row.id)?.layer === row.layer &&
+        row.layer !== 'L0' && typeof row.evidence === 'string' && /^recall:[a-f0-9]{64}$/.test(row.evidence),
+      'INVALID_BACKUP', '召回依据引用无效。');
+      store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
     }
     for (const entry of document.privateEntries ?? []) {
       string(entry.id, '私人记录 ID', 64);

@@ -64,6 +64,10 @@ export class TidalRuntime {
     this.embedding = embedding ?? new LocalEmbedding(this.root);
     this.embedding.configure(this.config);
     this.semanticQueries = new Map();
+    this.semanticResults = new Map();
+    this.semanticTasks = new Set();
+    this.lastSemanticTask = new Map();
+    this.prewarmQueue = Promise.resolve();
     this.spaces = new Map();
     this.spaceErrors = new Map();
     this.plans = new Map();
@@ -83,7 +87,11 @@ export class TidalRuntime {
     this.config = config;
     const modelKey = this.embedding.key;
     this.embedding.configure(config);
-    if (modelKey !== this.embedding.key) this.semanticQueries.clear();
+    if (modelKey !== this.embedding.key) {
+      for (const task of this.semanticTasks) task.controller.abort();
+      this.semanticQueries.clear();
+      this.semanticResults.clear();
+    } else if (changed) this.semanticResults.clear();
     for (const store of this.spaces.values()) store.setConfig(config);
     if (windowChanged) this.sessions.clear();
     if (changed) for (const state of this.sessions.values()) { state.context = null; state.semantic = null; }
@@ -95,7 +103,11 @@ export class TidalRuntime {
     if (!this.spaces.has(name)) {
       try {
         this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config, clock: () => this.clock().getTime() }));
-        this.spaces.get(name).onForget = () => { this.semanticQueries.clear(); this.invalidateSpace(name); };
+        this.spaces.get(name).onForget = () => {
+          this.semanticQueries.clear();
+          this.semanticResults.clear();
+          this.invalidateSpace(name);
+        };
         this.spaceErrors.delete(name);
       } catch (error) {
         this.spaceErrors.set(name, { code: error.code ?? 'OPEN_FAILED',
@@ -151,7 +163,7 @@ export class TidalRuntime {
   recallForAgent(agent, query, options = {}) {
     const { store, actor, space } = this.forAgent(agent);
     const state = this.sessionState(agent.session, space);
-    const cached = this.cachedSemantic(store, query, options.contextQueries ?? [], state);
+    const cached = this.cachedSemantic(store, actor, query, options.contextQueries ?? [], state, options);
     return store.recall(query, actor, { ...options, ...cached,
       evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
   }
@@ -165,13 +177,58 @@ export class TidalRuntime {
   semanticKey(store, query, contextQueries) {
     return JSON.stringify([this.embedding.key, store.name, query, contextQueries]);
   }
-  cachedSemantic(store, query, contextQueries, state) {
+  semanticResultKey(store, actor, query, contextQueries, options = {}) {
+    const scope = store.recallScope(actor, options);
+    return JSON.stringify([this.semanticKey(store, query, contextQueries), store.generation,
+      actor?.admin === true, actor?.sessionId ?? null, options.mode ?? 'current', scope.at,
+      options.includeArchived === true, this.config.embeddingMinScore, this.config.embeddingRelativeFloor, this.config.maxRecall]);
+  }
+  cachedSemantic(store, actor, query, contextQueries, state, options = {}) {
     if (this.config.embeddingMode === 'off') return { semantic: [], semanticStatus: { mode: 'off', state: 'disabled' } };
     const cached = state?.semantic;
-    if (cached?.key === this.semanticKey(store, query, contextQueries) && cached.generation === store.generation)
+    if (cached?.resultKey === this.semanticResultKey(store, actor, query, contextQueries, options) &&
+        (cached.expiresAt === null || this.clock().getTime() < cached.expiresAt))
       return { semantic: cached.hits, semanticStatus: cached.status };
     return { semantic: [], semanticStatus: { mode: this.config.embeddingMode, state: 'lexical',
       code: 'SEMANTIC_NOT_PREPARED', message: '语义线索尚未就绪或记忆已经变化，本次只使用词面检索。' } };
+  }
+  trackSemanticTask(task, job) {
+    task.promise = job;
+    this.semanticTasks.add(task);
+    this.jobs.add(job);
+    const finish = (state, error) => {
+      task.state = state;
+      this.semanticTasks.delete(task);
+      this.jobs.delete(job);
+      this.lastSemanticTask.set(task.space, { kind: task.kind, state, at: this.clock().toISOString(),
+        ...(error && state === 'failed' ? { code: error.code ?? 'SEMANTIC_FAILED' } : {}) });
+    };
+    job.then(() => finish('completed'), error =>
+      finish(task.controller.signal.aborted || error?.code === 'SEMANTIC_CANCELLED' ? 'cancelled' : 'failed', error));
+    return job;
+  }
+  cancelPrewarm() {
+    for (const task of this.semanticTasks) if (task.kind === 'prewarm') task.controller.abort();
+  }
+  requestPrewarm(store) {
+    if (this.disposed || this.config.embeddingMode === 'off') return { state: 'disabled' };
+    if ([...this.semanticTasks].some(task => task.space === store.name)) return { state: 'busy' };
+    const task = { space: store.name, kind: 'prewarm', state: 'queued', controller: new AbortController() };
+    const run = async () => {
+      requireValue(!this.disposed && !task.controller.signal.aborted, 'SEMANTIC_CANCELLED', '后台索引准备已取消。', 409);
+      task.state = 'running';
+      store.semanticIndex ??= new SemanticIndex(store);
+      await store.semanticIndex.sync(this.embedding, { signal: task.controller.signal });
+    };
+    const job = this.prewarmQueue.then(run, run);
+    this.prewarmQueue = job;
+    this.trackSemanticTask(task, job);
+    job.catch(error => {
+      if (error.code !== 'SEMANTIC_CANCELLED' && !this.disposed)
+        this.noteError(error.code ?? 'SEMANTIC_PREWARM_FAILED', '后台语义索引准备未完成，请检查模型状态。',
+          { operation: 'semantic', space: store.name });
+    });
+    return { state: 'queued' };
   }
   async prepareSemantic(store, actor, query, options = {}, signal) {
     const contextQueries = options.contextQueries ?? [];
@@ -181,13 +238,31 @@ export class TidalRuntime {
     store.recallScope(actor, options);
     const mode = this.config.embeddingMode;
     const key = this.semanticKey(store, query, contextQueries);
-    if (mode === 'off') return { key, generation: store.generation, hits: [], status: { mode, state: 'disabled' } };
+    if (mode === 'off') return { key, resultKey: this.semanticResultKey(store, actor, query, contextQueries, options),
+      generation: store.generation, expiresAt: null, hits: [], status: { mode, state: 'disabled' } };
     if (signal?.aborted) throw new MemoryError('SEMANTIC_CANCELLED', '当前语义检索已取消。', 409);
+    this.cancelPrewarm();
     const modelKey = this.embedding.key;
+    const task = { space: store.name, kind: 'foreground', state: 'running', controller: new AbortController() };
+    const abort = () => task.controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    const check = () => {
+      requireValue(!task.controller.signal.aborted, 'SEMANTIC_CANCELLED', '当前语义检索已取消。', 409);
+      requireValue(modelKey === this.embedding.key && !this.disposed, 'MODEL_CHANGED', '本地模型已切换或停止。', 409);
+    };
     const job = (async () => {
+      check();
       store.semanticIndex ??= new SemanticIndex(store);
-      await store.semanticIndex.sync(this.embedding);
+      await store.semanticIndex.sync(this.embedding, { signal: task.controller.signal });
+      check();
       const pack = await this.embedding.ready();
+      check();
+      const scope = store.recallScope(actor, options);
+      const resultKey = this.semanticResultKey(store, actor, query, contextQueries, options);
+      const cached = this.semanticResults.get(resultKey);
+      if (cached && cached.status.fingerprint === pack.fingerprint &&
+          (cached.expiresAt === null || scope.now < cached.expiresAt) &&
+          store.semanticIndex.status().pending === 0) return cached;
       let queries = this.semanticQueries.get(key);
       if (!queries) {
         const chunks = [query, ...contextQueries].flatMap((text, contextIndex) =>
@@ -196,9 +271,10 @@ export class TidalRuntime {
         for (let offset = 0; offset < chunks.length; offset += 16) {
           const batch = chunks.slice(offset, offset + 16);
           const vectors = await this.embedding.embed(batch.map(item => item.text), 'query');
+          check();
           queries.push(...vectors.map((vector, index) => ({ vector, contextIndex: batch[index].contextIndex })));
         }
-        requireValue(modelKey === this.embedding.key && !this.disposed, 'MODEL_CHANGED', '本地模型已切换或停止。', 409);
+        check();
         if (this.semanticQueries.size >= 64) this.semanticQueries.delete(this.semanticQueries.keys().next().value);
         this.semanticQueries.set(key, queries);
       }
@@ -206,26 +282,35 @@ export class TidalRuntime {
         minScore: this.config.embeddingMinScore === -1 ? pack.minScore : this.config.embeddingMinScore,
         relativeFloor: this.config.embeddingRelativeFloor === -1 ? pack.relativeFloor : this.config.embeddingRelativeFloor };
       const hits = queries.length ? store.semanticIndex.search(queries, policy,
-        { accept: store.recallScope(actor, options).accept, limit: Math.max(60, this.config.maxRecall * 4) }) : [];
+        { accept: scope.accept, limit: Math.max(60, this.config.maxRecall * 4) }) : [];
       const index = store.semanticIndex.status();
-      return { key, generation: store.generation, hits, status: { mode, state: index.pending ? 'partial' : 'ready',
+      const expiresAt = (options.mode ?? 'current') === 'current' ? store.nextEligibilityChange(scope.statuses, scope.now) : null;
+      const result = { key, resultKey, generation: store.generation, expiresAt, hits,
+        status: { mode, state: index.pending || index.state !== 'ready' ? 'partial' : 'ready',
         model: pack.modelId, fingerprint: pack.fingerprint, candidates: hits.length, index,
         minScore: policy.minScore, relativeFloor: policy.relativeFloor } };
+      if (result.status.state === 'ready') {
+        if (this.semanticResults.size >= 128) this.semanticResults.delete(this.semanticResults.keys().next().value);
+        this.semanticResults.set(resultKey, result);
+      }
+      return result;
     })();
-    this.jobs.add(job);
-    job.then(() => this.jobs.delete(job), () => this.jobs.delete(job));
+    this.trackSemanticTask(task, job);
     try {
-      const result = await waitForLocal(job, this.config.embeddingTimeoutSeconds * 1000, signal);
+      const result = await waitForLocal(job, this.config.embeddingTimeoutSeconds * 1000, task.controller.signal);
       if (result.status.state === 'ready' && this.lastError?.operation === 'semantic' && this.lastError.space === store.name)
         this.lastError = null;
       return result;
     }
     catch (error) {
-      this.noteError(error.code ?? 'SEMANTIC_FAILED', `本地语义检索未完成：${error.message}`,
-        { operation: 'semantic', space: store.name });
-      return { key, generation: store.generation, hits: [], status: { mode, state: 'degraded',
+      task.controller.abort();
+      if (error.code !== 'SEMANTIC_CANCELLED')
+        this.noteError(error.code ?? 'SEMANTIC_FAILED', `本地语义检索未完成：${error.message}`,
+          { operation: 'semantic', space: store.name });
+      return { key, resultKey: this.semanticResultKey(store, actor, query, contextQueries, options),
+        generation: store.generation, expiresAt: null, hits: [], status: { mode, state: 'degraded',
         code: error.code ?? 'SEMANTIC_FAILED', message: error.message } };
-    }
+    } finally { signal?.removeEventListener('abort', abort); }
   }
   async recallAsync(store, actor, query, options = {}, signal) {
     const result = await this.prepareSemantic(store, actor, query, options, signal);
@@ -233,7 +318,11 @@ export class TidalRuntime {
     this.syncConfig();
     requireValue(!signal?.aborted && result.key === this.semanticKey(store, query, options.contextQueries ?? []),
       'SEMANTIC_OBSOLETE', '查询已取消或模型配置已变化，请重新检索。', 409);
-    return store.recall(query, actor, { ...options, semantic: result.hits, semanticStatus: result.status });
+    const current = result.resultKey === this.semanticResultKey(store, actor, query, options.contextQueries ?? [], options) &&
+      (result.expiresAt === null || this.clock().getTime() < result.expiresAt);
+    return store.recall(query, actor, { ...options, semantic: current ? result.hits : [],
+      semanticStatus: current ? result.status : { mode: this.config.embeddingMode, state: 'partial',
+        code: 'SEMANTIC_OBSOLETE', message: '语义准备期间记忆或有效时间发生变化，本次只使用词面检索。' } });
   }
   async recallForAgentAsync(agent, query, options = {}, signal) {
     const { store, actor, space } = this.forAgent(agent);
@@ -244,8 +333,12 @@ export class TidalRuntime {
     requireValue(current.store === store && !signal?.aborted &&
       result.key === this.semanticKey(store, query, options.contextQueries ?? []),
     'SEMANTIC_OBSOLETE', '查询范围、模型或会话状态已变化，请重新检索。', 409);
+    const valid = result.resultKey === this.semanticResultKey(store, current.actor, query, options.contextQueries ?? [], options) &&
+      (result.expiresAt === null || this.clock().getTime() < result.expiresAt);
     return store.recall(query, current.actor, { ...options, evidenceId,
-      semantic: result.hits, semanticStatus: result.status });
+      semantic: valid ? result.hits : [], semanticStatus: valid ? result.status :
+        { mode: this.config.embeddingMode, state: 'partial', code: 'SEMANTIC_OBSOLETE',
+          message: '语义准备期间记忆或有效时间发生变化，本次只使用词面检索。' } });
   }
   async preStep({ agent, signal }, next) {
     const decision = await next();
@@ -253,6 +346,7 @@ export class TidalRuntime {
     try {
       this.syncConfig();
       if (!this.config.enabled || agent.session?.header.origin === 'subagent') return decision;
+      this.cancelPrewarm();
       const binding = bindingFor(this.config, agent.session?.header.cwd);
       if (!binding) return decision;
       this.forAgent(agent);
@@ -268,7 +362,9 @@ export class TidalRuntime {
         const { store, actor } = this.forAgent(agent);
         const result = await this.prepareSemantic(store, actor, query, { contextQueries }, signal);
         if (!signal?.aborted && !this.disposed && this.sessions.get(agent.id) === state &&
-          state.semanticRequest === token && result.key === this.semanticKey(store, query, contextQueries)) {
+          state.semanticRequest === token && result.key === this.semanticKey(store, query, contextQueries) &&
+          result.resultKey === this.semanticResultKey(store, actor, query, contextQueries, { contextQueries }) &&
+          (result.expiresAt === null || this.clock().getTime() < result.expiresAt)) {
           state.semantic = result;
           state.context = null;
         }
@@ -283,6 +379,7 @@ export class TidalRuntime {
     try {
       this.syncConfig();
       if (!this.config.enabled || session.header.origin === 'subagent') return;
+      this.cancelPrewarm();
       const binding = bindingFor(this.config, session.header.cwd);
       if (!binding) return;
       const state = this.sessionState(session, binding.space);
@@ -342,16 +439,20 @@ export class TidalRuntime {
       const { store, actor, space } = this.forAgent(agent);
       const state = this.sessionState(agent.session, space);
       state.space = space;
-      if (state.context === null || state.generation !== store.generation) {
+      if (state.context === null || state.generation !== store.generation ||
+          (state.contextExpiresAt !== null && state.contextExpiresAt !== undefined &&
+            this.clock().getTime() >= state.contextExpiresAt)) {
         const { query, contextQueries, pending } = this.queryWindow(state);
         const recalled = store.recall(query, actor, { contextQueries,
-          ...this.cachedSemantic(store, query, contextQueries, state),
+          ...this.cachedSemantic(store, actor, query, contextQueries, state),
           evidenceId: pending || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
         const incomplete = this.config.embeddingMode !== 'off' && recalled.semanticStatus?.state !== 'ready';
         state.context = recalled.text + (incomplete ? '\n[本地语义联想尚未完整就绪，召回可能遗漏；不要据此断言不存在相关历史。]' : '');
         if (pending) state.pendingRecall = { query,
           ids: recalled.picked.filter(item => item.matched).map(item => item.id) };
         state.generation = store.generation;
+        const scope = store.recallScope(actor);
+        state.contextExpiresAt = store.nextEligibilityChange(scope.statuses, scope.now);
         if (this.lastError?.operation === 'recall' && this.lastError.space === space) this.lastError = null;
       }
       return state.context;
@@ -390,7 +491,8 @@ export class TidalRuntime {
         const consolidation = this.config.autoConsolidate ? store.consolidate() : { disabled: true };
         const maintenance = store.maintenance();
         this.invalidateSpace(name);
-        results.push({ space: name, ...maintenance, localOrganization, consolidation });
+        const semanticPrewarm = this.requestPrewarm(store);
+        results.push({ space: name, ...maintenance, localOrganization, consolidation, semanticPrewarm });
         if (this.config.autoBackup) automaticBackup(store, this.root);
       }
       return { results };
@@ -556,7 +658,10 @@ export class TidalRuntime {
           backups: join(this.root, 'backups', spaceName) },
         modelPacks: modelInventory(this.root).map(item => ({ ...item,
           installCommand: `${command} --edition ${item.edition} --root ${quote(this.root)}` })),
-        semantic: { ...this.embedding.state, index: this.spaces.get(spaceName)?.semanticIndex?.status() ?? null },
+        semantic: { ...this.embedding.state, index: this.spaces.get(spaceName)?.semanticIndex?.status() ?? null,
+          tasks: [...this.semanticTasks].filter(task => task.space === spaceName)
+            .map(task => ({ kind: task.kind, state: task.state })),
+          lastTask: this.lastSemanticTask.get(spaceName) ?? null },
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
         dailyConsolidation: details.dailyConsolidation ?? null,
         nextDailyConsolidationAt: this.config.enabled && this.config.dailyConsolidateAt && !details.unavailable ?
@@ -630,13 +735,18 @@ export class TidalRuntime {
       return result.status;
     }
     if (method === 'POST' && path === '/semantic/rebuild') {
-      requireValue(!this.jobs.size, 'SEMANTIC_BUSY', '语义任务正在运行，请稍后重建。', 409);
       requireValue(this.config.embeddingMode !== 'off', 'SEMANTIC_DISABLED', '请先启用语义组合。');
+      requireValue(![...this.semanticTasks].some(task => task.kind === 'foreground'), 'SEMANTIC_BUSY',
+        '共享本地模型正在响应前台语义请求，请稍后重建。', 409);
+      const prewarm = [...this.semanticTasks].filter(task => task.kind === 'prewarm');
+      this.cancelPrewarm();
+      this.embedding.reload();
+      await Promise.allSettled(prewarm.map(task => task.promise));
       store.semanticIndex?.close();
       store.semanticIndex = null;
       clearSemanticFiles(store.directory);
-      this.embedding.reload();
       this.semanticQueries.clear();
+      this.semanticResults.clear();
       this.invalidateSpace(spaceName);
       const result = await this.prepareSemantic(store, ADMIN, '');
       requireValue(result.status.state === 'ready', result.status.code ?? 'SEMANTIC_FAILED',
@@ -731,6 +841,7 @@ export class TidalRuntime {
   async close() {
     this.disposed = true;
     const errors = [];
+    for (const task of this.semanticTasks) task.controller.abort();
     try { await this.embedding.close(); } catch (error) { errors.push(error); }
     await Promise.allSettled([...this.jobs]);
     for (const store of this.spaces.values()) {

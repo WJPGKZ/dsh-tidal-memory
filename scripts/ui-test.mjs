@@ -47,6 +47,7 @@ try {
   await page.getByText(/工作区名称尽量使用英文/).waitFor();
   await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
   await page.getByRole('heading', { name: '模型文件与下载', exact: true }).waitFor();
+  await page.getByText(/空间空闲时只为已启用的本地语义组合准备普通索引/).waitFor();
   assert.equal(await page.getByRole('link', { name: '查看固定版本的模型下载来源' }).count(), 2);
   await page.getByLabel('本地语义组合', { exact: true }).selectOption('cpu');
   await page.getByRole('button', { name: '保存语义设置', exact: true }).click();

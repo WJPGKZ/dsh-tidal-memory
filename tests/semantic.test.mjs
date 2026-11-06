@@ -121,6 +121,128 @@ test('index revisions update without recomputing unchanged content; edits and fo
   assert.equal((await runtime.recallForAgentAsync(agent, '水上运动')).picked.length, 0);
 });
 
+test('unchanged preparation and usage reinforcement perform no semantic document writes', async t => {
+  const { runtime, store, embedding, agent } = fixture(t);
+  const memory = store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);
+  await runtime.recallForAgentAsync(agent, '数据保存在哪里？');
+  const db = store.semanticIndex.db;
+  db.exec(`CREATE TEMP TABLE document_writes (kind TEXT NOT NULL);
+    CREATE TEMP TRIGGER document_inserted AFTER INSERT ON main.documents BEGIN INSERT INTO document_writes VALUES('insert'); END;
+    CREATE TEMP TRIGGER document_updated AFTER UPDATE ON main.documents BEGIN INSERT INTO document_writes VALUES('update'); END;
+    CREATE TEMP TRIGGER document_deleted AFTER DELETE ON main.documents BEGIN INSERT INTO document_writes VALUES('delete'); END;`);
+  const documentsBefore = embedding.calls.filter(call => call.kind === 'document').length;
+  await store.semanticIndex.sync(embedding);
+  store.recordRetrieval(memory.id, 'new-evidence');
+  await store.semanticIndex.sync(embedding);
+  assert.equal(embedding.calls.filter(call => call.kind === 'document').length, documentsBefore);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM document_writes').get().n, 0);
+  assert.ok((await runtime.recallForAgentAsync(agent, '数据保存在哪里？')).picked.some(item => item.id === memory.id));
+});
+
+test('semantic result cache respects actor, time mode, eligibility transitions and usage revisions', async t => {
+  const { runtime, store, embedding, agent } = fixture(t);
+  let now = Date.parse('2026-01-01T00:00:00Z');
+  runtime.clock = () => new Date(now);
+  const old = store.create({ layer: 'L2', text: 'SQLite old',
+    validUntil: '2026-01-02T00:00:00Z' }, ADMIN);
+  const future = store.create({ layer: 'L2', text: 'SQLite future',
+    validFrom: '2026-01-02T00:00:00Z' }, ADMIN);
+  const query = '数据保存在哪里？';
+  assert.deepEqual((await runtime.recallForAgentAsync(agent, query)).picked.map(item => item.id), [old.id]);
+  const search = store.semanticIndex.search.bind(store.semanticIndex);
+  let searches = 0;
+  store.semanticIndex.search = (...args) => { searches++; return search(...args); };
+  const queryCalls = embedding.calls.filter(call => call.kind === 'query').length;
+  store.recordRetrieval(old.id, 'cache-evidence');
+  assert.deepEqual((await runtime.recallForAgentAsync(agent, query)).picked.map(item => item.id), [old.id]);
+  assert.equal(searches, 0);
+  const history = await runtime.recallForAgentAsync(agent, query, { mode: 'history' });
+  assert.deepEqual(new Set(history.picked.map(item => item.id)), new Set([old.id, future.id]));
+  const past = await runtime.recallForAgentAsync(agent, query, { mode: 'as-of', asOf: '2025-12-31T12:00:00Z' });
+  assert.deepEqual(past.picked.map(item => item.id), [old.id]);
+  await runtime.recallAsync(store, ADMIN, query);
+  assert.equal(searches, 3);
+  now = Date.parse('2026-01-02T00:00:00Z');
+  assert.deepEqual((await runtime.recallForAgentAsync(agent, query)).picked.map(item => item.id), [future.id]);
+  assert.equal(searches, 4);
+  assert.equal(embedding.calls.filter(call => call.kind === 'query').length, queryCalls);
+});
+
+test('idle maintenance prewarms only ordinary vectors and foreground work can preempt it', async t => {
+  const { runtime, store, embedding, agent } = fixture(t);
+  const memory = store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);
+  store.capture({ text: 'BUFFER_CANARY', sessionId: 's', eventId: 1, role: 'user' });
+  store.appendPrivate('test-author', 'PRIVATE_CANARY');
+  const embed = embedding.embed.bind(embedding);
+  let started, release;
+  const startedDocument = new Promise(resolve => { started = resolve; });
+  const pausedDocument = new Promise(resolve => { release = resolve; });
+  let pause = true;
+  embedding.embed = async (texts, kind) => {
+    if (kind === 'document' && pause) {
+      pause = false;
+      started();
+      await pausedDocument;
+    }
+    return embed(texts, kind);
+  };
+  await runtime.tick(true, 'shared');
+  await startedDocument;
+  const foreground = runtime.recallForAgentAsync(agent, '数据保存在哪里？');
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  const result = await foreground;
+  await Promise.allSettled([...runtime.jobs]);
+  assert.equal(result.semanticStatus.state, 'ready');
+  assert.ok(result.picked.some(item => item.id === memory.id));
+  assert.equal(store.semanticIndex.status().indexed, 1);
+  assert.equal(JSON.stringify(embedding.calls).includes('CANARY'), false);
+});
+
+test('a late embedding cannot replace a record changed or forgotten while it was running', async t => {
+  const { runtime, store, embedding, agent } = fixture(t);
+  const memory = store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);
+  const embed = embedding.embed.bind(embedding);
+  let started, release;
+  const startedDocument = new Promise(resolve => { started = resolve; });
+  const pausedDocument = new Promise(resolve => { release = resolve; });
+  let pause = true;
+  embedding.embed = async (texts, kind) => {
+    if (kind === 'document' && pause) {
+      pause = false;
+      started();
+      await pausedDocument;
+    }
+    return embed(texts, kind);
+  };
+  const first = runtime.recallForAgentAsync(agent, '数据保存在哪里？');
+  await startedDocument;
+  store.update(memory.id, { text: '我喜欢帆船。' }, memory.revision, ADMIN);
+  release();
+  const stale = await first;
+  assert.equal(stale.picked.some(item => item.id === memory.id), false);
+  assert.equal(stale.semanticStatus.state, 'partial');
+  const current = await runtime.recallForAgentAsync(agent, '水上运动');
+  assert.ok(current.picked.some(item => item.id === memory.id));
+  store.forget(memory.id, ADMIN);
+  assert.equal((await runtime.recallForAgentAsync(agent, '水上运动')).picked.length, 0);
+});
+
+test('semantic rebuild does not reject unrelated ordinary jobs', async t => {
+  const { runtime, store } = fixture(t);
+  store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);
+  let finish;
+  const ordinaryJob = new Promise(resolve => { finish = resolve; });
+  runtime.jobs.add(ordinaryJob);
+  try {
+    const result = await runtime.api('POST', '/semantic/rebuild', new URLSearchParams({ space: 'shared' }), {});
+    assert.equal(result.state, 'ready');
+  } finally {
+    finish();
+    runtime.jobs.delete(ordinaryJob);
+  }
+});
+
 test('semantic candidates respect time modes, hidden statuses and space boundaries before ranking', async t => {
   const { runtime, store, agent } = fixture(t);
   const old = store.create({ layer: 'L2', text: '过去使用 SQLite。', status: 'superseded', validUntil: '2020-01-01' }, ADMIN);
@@ -150,6 +272,8 @@ test('cancelled and configuration-obsolete preparation never injects late semant
   embedding.resume();
   await Promise.allSettled([...runtime.jobs]);
   assert.equal(runtime.sessions.get(agent.id).semantic, undefined);
+  assert.equal(runtime.semanticQueries.size, 0);
+  assert.equal(store.semanticIndex.status().indexed, 0);
   embedding.pause();
   const obsolete = runtime.preStep({ agent }, admit('数据保存在哪里？'));
   await new Promise(resolve => setImmediate(resolve));
