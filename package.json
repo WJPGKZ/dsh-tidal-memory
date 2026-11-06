@@ -1,6 +1,6 @@
 {
   "name": "dsh-tidal-memory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "四层独立存储、证据召回与受限私人记录的 DeepSeek Harness 记忆插件。",
   "type": "module",
   "packageManager": "pnpm@11.28.5",

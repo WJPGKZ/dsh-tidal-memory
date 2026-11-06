@@ -211,6 +211,12 @@ test('labeled lexical and abstention fixtures remain reproducible on a small cor
   }
 });
 
+test('workspace aliases bridge explicit editor name variants in lexical recall', t => {
+  const { space } = fixture(t);
+  const editor = create(space, '我写代码用 neovim。', { aliases: ['nvim'] });
+  assert.ok(space.recall('nvim', admin).picked.some(item => item.id === editor.id && item.matched));
+});
+
 test('strict and phrase search use local FTS and versioned rebuild repairs stale entries', t => {
   const { space } = fixture(t);
   const exact = create(space, 'alpha beta');
@@ -259,19 +265,21 @@ test('runtime opens spaces lazily, skips assistant capture and isolates lock con
   assert.equal(runtime.spaces.size, 0);
   assert.equal(existsSync(join(root, 'spaces', 'default')), false);
   owner = new MemorySpace(root, 'test');
-  const unavailable = await runtime.api('GET', '/status', new URLSearchParams('space=test'));
-  assert.equal(unavailable.unavailable, true);
-  assert.equal(unavailable.spaceError.code, 'SPACE_BUSY');
+  const status = await runtime.api('GET', '/status', new URLSearchParams('space=test'));
+  assert.equal(status.unavailable, true);
+  assert.equal(status.spaceError.code, 'SPACE_BUSY');
+  assert.equal(runtime.spaces.has('test'), false);
   const maintenance = await runtime.requestMaintenance(true, 'test');
   assert.equal(maintenance.results[0].unavailable, true);
   assert.throws(() => runtime.forAgent(agent), e => e.code === 'SPACE_BUSY');
   owner.close();
   const available = await runtime.api('GET', '/status', new URLSearchParams('space=test'));
   assert.equal(available.unavailable, undefined);
-  assert.equal(runtime.spaceErrors.size, 0);
+  assert.equal(runtime.spaceErrors.size, 1);
   runtime.onEvent(session, { type: 'assistant/message', seq: 1, time: Date.now(),
     data: { message: { role: 'assistant', content: [{ type: 'text', text: '我喜欢自动编造偏好。' }] } } });
   assert.equal(runtime.space('test').all().length, 0);
+  assert.equal(runtime.spaceErrors.size, 0);
   runtime.onEvent(session, { type: 'user/message', seq: 2, time: Date.now(),
     data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '我偏好简短回答。' }] } });
   assert.equal(runtime.space('test').all().filter(r => r.status === 'active').length, 1);

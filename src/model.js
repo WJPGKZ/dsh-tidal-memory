@@ -234,19 +234,20 @@ export function localCandidates(text) {
     if (quote.length < 4 || quote.length > 16000 || /^[>"“「]/.test(quote) ||
       /(?:假设|假如|如果|例如|比如|举例|示例|引用|他说|她说|不要记|不用记|别记)/.test(quote)) continue;
     const action = TASK_ACTION.test(quote) && (TASK_REQUEST.test(quote) || /^把.{1,100}(?:写进|写到|放到|放进|拆成|拆分|改成|改为|加入|添加|保存)/.test(quote));
+    const continuationTask = /^(?:接下来|下一步|然后|待办(?:事项)?[：:]?)\s*.{0,80}(?:检查|修复|处理|确认|整理|迁移|编写|更新|测试|验证|排查|提交|发布|合并|部署)/.test(quote);
     if ((/[?？]|(?:是否|吗|呢)$/.test(quote) && !action) ||
         /(?:我不知道|我不确定|据说|听说|他喜欢|她喜欢)/.test(quote)) continue;
     let rule, layer = 'L2', category = 'knowledge', horizon = 'unspecified';
     const preference = /(?:我.{0,24}(?:喜欢|偏好|习惯|希望|想要|讨厌|不喜欢|不习惯)|对我来说|(?:prefer|preference|I like|I dislike)\b)/i.test(quote);
-    const agreement = /(?:我们.{0,16}(?:约定|说好)|(?:约定|规矩|规则|教训)\s*[：:]|(?:以后|今后|始终|每次都|默认).{0,24}(?:回答|叫我|使用|采用|称呼|回复|用\s*\S|改成|改为))/i.test(quote);
+    const agreement = /(?:我们.{0,16}(?:约定|说好)|(?:约定|规矩|规则|教训)\s*[：:]|(?:以后|今后|始终|每次都|默认).{0,40}(?:回答|叫我|使用|采用|称呼|回复|用\s*\S|改成|改为|发送|发到|不要发|不发))/i.test(quote);
     const decision = /(?:我(?:们)?(?:最终)?(?:决定|选择)|最后(?:决定|选择)|决定采用|选定|we decided)\s*.{0,80}/i.test(quote);
-    const fact = /(?:(?:本项目|当前项目|项目|服务|开发服务器|测试环境|构建工具|包管理器|数据库|运行时|仓库).{0,80}?(?:使用|采用|运行在|位于|端口|路径|版本|是|用\s*\S)|^我(?:现在|目前)?用的是\s*\S|(?:the )?project uses\b)/i.test(quote);
+    const fact = /(?:(?:本项目|当前项目|项目|服务|开发服务器|测试环境|构建工具|包管理器|数据库|运行时|仓库).{0,80}?(?:使用|采用|运行在|位于|端口|路径|版本|是|用\s*\S)|^我(?:现在|目前)?(?:写代码用|用的是)\s*\S|^编辑器是\s*\S|(?:the )?project uses\b)/i.test(quote);
     const event = EVENT_CUE.test(quote) && /(?:我|我们|自己|完成|去了|看了|买了|做了|试了|发现|遇到|经历|解决|发生)/.test(quote);
     if (/^(?:不对[，,：:]|更正[：:]|纠正[：:]|我说错了[，,：:]|correction:)/i.test(quote)) {
       rule = 'correction'; category = 'knowledge';
     } else if (event && /(?:完成了|解决了|取消了)/.test(quote)) {
       rule = 'event'; category = 'event'; horizon = 'event';
-    } else if (TASK_CUE.test(quote)) {
+    } else if (continuationTask || TASK_CUE.test(quote)) {
       rule = 'active-topic'; layer = 'L1'; category = 'task'; horizon = 'task';
     } else if (/^(?:明天|后天|本周|下周).{0,30}(?:开会|会议|交付|提交|发布|复查|验收)/.test(quote)) {
       rule = 'scheduled-task'; layer = 'L1'; category = 'task'; horizon = 'task';

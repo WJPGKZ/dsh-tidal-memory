@@ -221,6 +221,10 @@ test('capture keeps all qualifying sentences and distinguishes ongoing work from
     assert.equal(item.horizon, 'long_term', text);
   }
   assert.equal(localCandidates('我希望你先检查数据。')[0].layer, 'L1');
+  assert.equal(localCandidates('然后检查构建错误。')[0].layer, 'L1');
+  assert.equal(localCandidates('以后周报发到邮箱，不要发群里。')[0].rule, 'agreement');
+  assert.equal(localCandidates('我写代码用 neovim。')[0].rule, 'fact');
+  assert.equal(localCandidates('编辑器是 nvim。')[0].rule, 'fact');
   assert.equal(localCandidates('我昨天完成了这个任务。')[0].category, 'event');
   assert.equal(classifyRememberDirective('记住：昨天完成了这个任务。').layer, 'L2');
   for (const text of ['我不知道你喜欢什么。', '我不确定项目使用 pnpm。', '我喜欢咖啡吗']) {

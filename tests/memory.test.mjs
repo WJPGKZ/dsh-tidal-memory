@@ -263,6 +263,22 @@ test('forget blocks earlier revisions and promotion reintroducing forgotten cont
   const source = create(space, 'first version', { layer: 'L2' });
   assert.throws(() => space.promote(source.id, { layer: 'L3' }, admin), /已被遗忘/);
 });
+test('manual edits cannot revive forgotten text or create duplicate content', t => {
+  const { space } = fixture(t);
+  const forgotten = create(space, 'remembered then forgotten');
+  const editable = create(space, 'a different active memory');
+  const duplicate = create(space, 'yet another memory');
+  space.forget(forgotten.id, admin);
+  assert.throws(() => space.update(editable.id, { text: forgotten.text }, editable.revision, admin), /已被遗忘/);
+  assert.throws(() => space.update(duplicate.id, { text: editable.text }, duplicate.revision, admin), /相同内容已存在/);
+});
+test('space close continues releasing every database after one resource fails', t => {
+  const { root, space } = fixture(t);
+  space.semanticIndex = { close() { throw new Error('injected close failure'); } };
+  assert.throws(() => space.close(), AggregateError);
+  const reopened = new MemorySpace(root, 'test');
+  reopened.close();
+});
 test('restore rejects private provenance hidden in a secondary source', t => {
   const { root, space } = fixture(t);
   create(space, 'public');

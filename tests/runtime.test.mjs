@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { TidalRuntime, recallQuery } from '../src/runtime.js';
 import { MAX_RECALL_QUERY_LENGTH, MemoryError } from '../src/model.js';
 import { MemorySpace } from '../src/store.js';
@@ -32,6 +33,56 @@ test('status version matches the installed package manifest', async t => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
   assert.equal(status.version, manifest.version);
+});
+
+test('status on a new space is read-only and does not create its data directory', async t => {
+  const { runtime, root } = fixture(t);
+  const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
+  assert.equal(status.layers.length, 4);
+  assert.ok(status.layers.every(layer => layer.count === 0 && layer.pending === 0));
+  assert.equal(existsSync(join(root, 'spaces')), false);
+  assert.equal(runtime.spaces.has('shared'), false);
+});
+
+test('status reads existing workspace databases without modifying their files', async t => {
+  const { runtime, root } = fixture(t);
+  const store = runtime.space('shared');
+  store.create({ layer: 'L3', text: 'status probe', status: 'active' }, { admin: true });
+  store.close();
+  runtime.spaces.delete('shared');
+  const snapshot = directory => readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? snapshot(path) : [[path, statSync(path).size, statSync(path).mtimeMs]];
+  }).sort((a, b) => a[0].localeCompare(b[0]));
+  const before = snapshot(join(root, 'spaces', 'shared'));
+  const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
+  assert.equal(status.layers.find(layer => layer.id === 'L3').count, 1);
+  assert.deepEqual(snapshot(join(root, 'spaces', 'shared')), before);
+});
+
+test('runtime close still releases open spaces if embedding shutdown fails', async t => {
+  const { runtime } = fixture(t);
+  const store = runtime.space('shared');
+  const closeEmbedding = runtime.embedding.close.bind(runtime.embedding);
+  runtime.embedding.close = async () => { throw new Error('injected embedding close failure'); };
+  await assert.rejects(runtime.close(), AggregateError);
+  assert.equal(store.closed, true);
+  runtime.embedding.close = closeEmbedding;
+});
+
+test('restore requests may exceed the ordinary 12 MiB write limit', async t => {
+  const { runtime } = fixture(t);
+  runtime.ctx.connection = { requestRejection: () => undefined };
+  const req = Readable.from([Buffer.from(JSON.stringify({
+    name: 'restore-probe', text: 'x'.repeat(13 * 1024 * 1024),
+  }))]);
+  req.method = 'POST';
+  req.url = '/tidal-memory/restore';
+  req.headers = { 'x-tidal-request': '1', 'content-type': 'application/json' };
+  const res = { writableEnded: false, setHeader() {}, end(body) { this.body = body; this.writableEnded = true; } };
+  await runtime.handle(req, res);
+  assert.notEqual(res.statusCode, 413);
+  assert.equal(JSON.parse(res.body).ok, false);
 });
 
 test('maintenance uses local rules and never calls the configured model', async t => {
@@ -171,13 +222,14 @@ test('a failed recovery point prevents organizing pending records or marking a d
   assert.equal(runtime.busy, false);
 });
 
-test('status remains available under writer contention without opening the space a second time', async t => {
+test('status avoids reading WAL while another writer is active', async t => {
   const { runtime, root } = fixture(t);
   const owner = new MemorySpace(root, 'shared');
   try {
     const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
     assert.equal(status.unavailable, true);
     assert.equal(status.spaceError.code, 'SPACE_BUSY');
+    assert.equal(runtime.spaces.has('shared'), false);
     assert.equal(status.dailyConsolidation, null);
     assert.equal(status.nextDailyConsolidationAt, null);
   } finally { owner.close(); }

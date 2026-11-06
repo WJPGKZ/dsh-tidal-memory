@@ -1,16 +1,19 @@
-import { readdirSync, existsSync, readFileSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { MemorySpace } from './store.js';
 import { LocalEmbedding, modelInventory } from './embedding.js';
 import { SemanticIndex, semanticChunks, clearSemanticFiles } from './semantic-index.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup } from './transfer.js';
-import { bindingFor, classifyRememberDirective, configOf, MAX_RECALL_QUERY_LENGTH, MemoryError, requireValue, slug, splitCapture, string } from './model.js';
+import { bindingFor, classifyRememberDirective, configOf, ENCODING_VERSION, LAYERS, MAX_RECALL_QUERY_LENGTH,
+  MemoryError, requireValue, SEARCH_VERSION, slug, splitCapture, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
 const MAX_BODY = 12 * 1024 * 1024;
+const MAX_RESTORE_BODY = 128 * 1024 * 1024;
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 async function waitForLocal(promise, timeout, signal) {
   let timer, onAbort;
@@ -409,6 +412,80 @@ export class TidalRuntime {
     });
     return job;
   }
+  readOnlyStatus(name) {
+    const directory = join(this.root, 'spaces', name);
+    const databaseFiles = [
+      ...Object.values(LAYERS).map(info => join(directory, info.directory, info.file)),
+      join(directory, 'system', 'operations.sqlite3'),
+      join(directory, 'private', 'journal.sqlite3'),
+    ];
+    if (databaseFiles.some(file => existsSync(`${file}-wal`))) {
+      return { space: name, directory, unavailable: true,
+        spaceError: { code: 'SPACE_BUSY', message: '空间仍有活动 WAL 写入；为避免创建 SQLite 辅助文件，状态暂不可读。' },
+        layers: [], dailyConsolidation: null };
+    }
+    const databases = [];
+    const open = file => {
+      if (!existsSync(file)) return null;
+      const db = new DatabaseSync(`${pathToFileURL(file).href}?immutable=1`, { readOnly: true });
+      databases.push(db);
+      return db;
+    };
+    let readError;
+    try {
+      const layerDatabases = new Map();
+      const layers = Object.entries(LAYERS).map(([id, info]) => {
+        const file = join(directory, info.directory, info.file);
+        const db = open(file);
+        if (db) layerDatabases.set(id, db);
+        return {
+          id, name: info.name,
+          count: db?.prepare('SELECT count(*) AS n FROM memories').get().n ?? 0,
+          pending: db?.prepare("SELECT count(*) AS n FROM memories WHERE status IN ('pending','candidate','review')").get().n ?? 0,
+          directory: join(directory, info.directory), file,
+        };
+      });
+      const searchIndex = Object.entries(LAYERS).map(([layer, info]) => {
+        const db = layerDatabases.get(layer);
+        return { layer, current: db?.prepare("SELECT value FROM index_state WHERE key='tokenizer'").get()?.value === SEARCH_VERSION,
+          expectedVersion: SEARCH_VERSION };
+      });
+      const system = open(join(directory, 'system', 'operations.sqlite3'));
+      const metadata = new Map((system?.prepare('SELECT key,value FROM metadata').all() ?? [])
+        .map(row => [row.key, row.value]));
+      const encoded = (system?.prepare('SELECT result FROM encodings').all() ?? []).map(row => JSON.parse(row.result));
+      const reasons = {};
+      for (const row of encoded) reasons[row.reason] = (reasons[row.reason] ?? 0) + 1;
+      const privateFile = join(directory, 'private', 'journal.sqlite3');
+      const privateDb = open(privateFile);
+      const count = privateDb?.prepare('SELECT count(*) AS count,max(created_at) AS lastWritten FROM entries').get() ??
+        { count: 0, lastWritten: null };
+      let bytes = 0;
+      for (const file of [privateFile, `${privateFile}-wal`]) {
+        try { bytes += statSync(file).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      return {
+        space: name, directory, layers, errors: [], searchIndex,
+        private: { ...count, bytes, directory: join(directory, 'private'), authors: this.config.privateWriters,
+          contentVisible: false, generation: '由获准的外部作者插件提供，本插件不生成拟人人格日记。' },
+        encoding: { version: ENCODING_VERSION, inspected: encoded.length,
+          saved: encoded.reduce((total, row) => total + row.saved, 0), reasons },
+        maintenance: JSON.parse(metadata.get('maintenance') ?? 'null'),
+        dailyConsolidation: JSON.parse(metadata.get('daily-consolidation') ?? 'null'),
+        deepConsolidation: JSON.parse(metadata.get('deep-consolidation') ?? 'null'),
+      };
+    } catch (error) {
+      readError = error;
+      throw error;
+    } finally {
+      const closeErrors = [];
+      for (const db of databases.reverse()) {
+        try { db.close(); } catch (error) { closeErrors.push(error); }
+      }
+      if (closeErrors.length) throw new AggregateError(
+        readError ? [readError, ...closeErrors] : closeErrors, '只读状态连接未能全部关闭。');
+    }
+  }
   async checkDailyConsolidation(now = this.clock()) {
     if (this.disposed || this.busy) return { busy: true };
     this.syncConfig();
@@ -465,7 +542,7 @@ export class TidalRuntime {
     const spaceName = slug(query.get('space') ?? 'default');
     if (method === 'GET' && path === '/status') {
       let details;
-      try { details = this.space(spaceName).status(); } catch (error) {
+      try { details = this.spaces.get(spaceName)?.status() ?? this.readOnlyStatus(spaceName); } catch (error) {
         if (error.code !== 'SPACE_BUSY') throw error;
         details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
       }
@@ -630,11 +707,13 @@ export class TidalRuntime {
       if (req.method === 'POST') {
         requireValue(req.headers['x-tidal-request'] === '1' &&
           String(req.headers['content-type'] ?? '').startsWith('application/json'), 'CSRF', '缺少受信任的请求标记。', 403);
+        const limit = url.pathname === `${PREFIX}/restore` ? MAX_RESTORE_BODY : MAX_BODY;
         const chunks = [];
         let size = 0;
         for await (const chunk of req) {
           size += chunk.length;
-          requireValue(size <= MAX_BODY, 'BODY_TOO_LARGE', '请求超过 12 MiB。', 413);
+          requireValue(size <= limit, 'BODY_TOO_LARGE',
+            limit === MAX_BODY ? '请求超过 12 MiB。' : '恢复请求超过 128 MiB。', 413);
           chunks.push(chunk);
         }
         body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -651,10 +730,14 @@ export class TidalRuntime {
   }
   async close() {
     this.disposed = true;
-    await this.embedding.close();
+    const errors = [];
+    try { await this.embedding.close(); } catch (error) { errors.push(error); }
     await Promise.allSettled([...this.jobs]);
-    for (const store of this.spaces.values()) store.close();
+    for (const store of this.spaces.values()) {
+      try { store.close(); } catch (error) { errors.push(error); }
+    }
     this.spaces.clear();
     this.plans.clear();
+    if (errors.length) throw new AggregateError(errors, '部分潮汐记忆资源未能关闭。');
   }
 }

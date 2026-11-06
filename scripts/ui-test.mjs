@@ -44,6 +44,7 @@ try {
   const rejected = await page.request.post(`${preview.url}/tidal-memory/memories`, { data: { text: 'csrf' } });
   assert.equal(rejected.status(), 403);
   await page.getByRole('tab', { name: '设置与迁移' }).click();
+  await page.getByText(/工作区名称尽量使用英文/).waitFor();
   await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
   await page.getByRole('heading', { name: '模型文件与下载', exact: true }).waitFor();
   assert.equal(await page.getByRole('link', { name: '查看固定版本的模型下载来源' }).count(), 2);
@@ -77,6 +78,17 @@ try {
   await page.getByText(/上次深度整理：.*手动.*提炼/).waitFor();
   await page.getByRole('button', { name: '重建搜索索引', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '搜索索引已重建' }).waitFor();
+  await page.getByRole('tab', { name: '回忆与整理' }).click();
+  await page.getByRole('textbox', { name: '检索内容' }).fill('unique query with no saved match');
+  await page.getByRole('button', { name: '普通召回' }).click();
+  await page.waitForFunction(() => {
+    const button = [...document.querySelectorAll('.tidal button')].find(item => item.textContent === '普通召回');
+    return button && !button.disabled;
+  });
+  await page.getByRole('tab', { name: '总览' }).click();
+  await page.getByRole('tab', { name: '回忆与整理' }).click();
+  await page.locator('.tidal .panel details').first().locator('summary').click();
+  await page.getByText(/没有查询匹配；仍附带/).waitFor();
   const shared = preview.runtime.space('default').all().find(r => r.text === 'UI 创建的跨会话共享记录');
   assert.equal(shared.status, 'active');
   assert.equal(preview.runtime.space('default').get(shared.id, { sessionId: 'another-session' }).text, shared.text);

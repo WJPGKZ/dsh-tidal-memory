@@ -411,6 +411,13 @@ export class MemorySpace {
       requireValue(JSON.stringify(record.sources).length <= MAX_PROVENANCE_BYTES, 'PROVENANCE_LIMIT', '修订来源集合过大，本次修订未保存。', 409);
     }
     requireValue(typeof record.pinned === 'boolean', 'INVALID_INPUT', '保护标记必须是布尔值。');
+    if (record.dedupeKey !== previous.dedupeKey) {
+      requireValue(!this.system.prepare('SELECT 1 FROM forgotten_keys WHERE dedupe_key=?').get(record.dedupeKey) &&
+        !this.system.prepare('SELECT 1 FROM tombstones WHERE dedupe_key=?').get(record.dedupeKey),
+      'FORGOTTEN', '此内容已被遗忘，不允许通过修订重新保存。', 409);
+      const duplicate = this.db(record.layer).prepare('SELECT id FROM memories WHERE dedupe_key=?').get(record.dedupeKey);
+      requireValue(!duplicate || duplicate.id === id, 'DUPLICATE_MEMORY', '相同内容已存在，请编辑现有记忆。', 409);
+    }
     for (const parent of record.parents) this.get(parent, actor);
     if (record.factKey && record.status === 'active') {
       requireValue(!this.all().some(other => other.id !== id && other.status === 'active' &&
@@ -1127,8 +1134,10 @@ export class MemorySpace {
   close() {
     if (this.closed) return;
     this.closed = true;
-    this.semanticIndex?.close();
-    for (const db of [...this.dbs.values(), this.privateDb, this.system].filter(Boolean)) db.close();
-    if (this.lock) this.lock.close();
+    const errors = [];
+    for (const resource of [this.semanticIndex, ...this.dbs.values(), this.privateDb, this.system, this.lock].filter(Boolean)) {
+      try { resource.close(); } catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, '部分记忆空间资源未能关闭。');
   }
 }

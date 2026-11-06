@@ -270,9 +270,24 @@ window.__ModuleLoader__.load({
             button('已存情景时间线', () => run(async () => { setRecall(await request(space, '/timeline', { query })); }))),
           recall ? h('pre', null, JSON.stringify(recall, null, 2)) : null),
         h('div', { className: 'panel' }, h('h3', null, '最近召回记录'),
-          h('small', null, '只记录普通记忆的选择原因和预算，不包含私人日记。'),
-          ...traces.map((trace, i) => h('details', { key: i }, h('summary', null, `${trace.at} · ${trace.picked.length} 条`),
-            h('pre', null, JSON.stringify(trace, null, 2))))));
+          h('small', null, '只记录普通记忆的选择原因和预算，不包含私人日记或查询正文。'),
+          ...traces.map((trace, i) => {
+            const reasons = new Set((trace.excluded ?? []).map(item => item.reason));
+            const semantic = trace.semanticStatus;
+            const matches = (trace.picked ?? []).filter(item => item.matched);
+            const supporting = (trace.picked ?? []).filter(item => !item.matched);
+            const explanation = matches.length ? `查询匹配 ${matches.length} 条，最高分 ${trace.bestScore ?? '未知'}。` :
+              supporting.length ? `没有查询匹配；仍附带 ${supporting.length} 条常驻背景或来源关联记忆。` :
+              semantic?.mode !== 'off' && semantic?.state !== 'ready' ?
+                `本轮未选记忆；语义状态为 ${semantic?.state ?? '未知'}${semantic?.code ? `（${semantic.code}）` : ''}，可先检查本地模型与索引。` :
+                reasons.has('预算或条数上限') || reasons.has('相关记忆条数上限') ?
+                  '已找到候选，但受上下文预算或条数上限限制。' :
+                  reasons.has('低于相关性门槛') ?
+                    `有候选低于相关性门槛（${trace.threshold ?? '未知'}）；可检查查询表述及记录别名。` :
+                    '没有形成可评分的词面候选；检查是否保存了对应记忆，或为同义名称补充工作区别名。';
+            return h('details', { key: i }, h('summary', null, `${trace.at} · ${trace.picked.length} 条`),
+              h('p', { className: 'muted' }, explanation), h('pre', null, JSON.stringify(trace, null, 2)));
+          })));
       else if (tab === 'private') content = h('div', { className: 'stack' },
         h('div', { className: 'private-card stack' }, h('div', { className: 'eyebrow' }, 'PRIVATE JOURNAL'),
           h('h2', null, '私人记录，不展示正文'),
@@ -296,7 +311,7 @@ window.__ModuleLoader__.load({
               h('p', { className: 'path' }, status.paths?.[key]))),
           h('small', null, '普通记忆数据库的位置见总览四层卡片；私人日记位置只在私人页展示，不提供正文。模型与备份不放在插件代码目录，更新插件不会替换记忆或重新下载模型。')),
         h('div', { className: 'panel stack' }, h('h3', null, '工作区绑定'),
-          h('small', null, '一个工作区对应一个空间。同工作区的全部原生会话共享记忆；子代理第一版默认不参与。'),
+          h('small', null, '一个工作区对应一个空间。同工作区的全部原生会话共享记忆；子代理第一版默认不参与。工作区名称尽量使用英文，便于 DSH 与终端管理；中文绝对路径仍可用，路径需与宿主工作目录一致，不会自动继承子目录。'),
           ...config.bindings.map((binding, i) => h('div', { className: 'row', key: binding.cwd },
             h('code', { className: 'path' }, `${binding.cwd} → ${binding.space}`),
             button('解除', () => patchConfig('bindings', config.bindings.filter((_, index) => index !== i))))),
