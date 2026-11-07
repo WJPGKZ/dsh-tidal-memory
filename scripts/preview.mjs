@@ -8,7 +8,7 @@ import { TidalRuntime } from '../src/runtime.js';
 import { configOf } from '../src/model.js';
 
 const repository = dirname(dirname(fileURLToPath(import.meta.url)));
-export async function startPreview(port = 0) {
+export async function startPreview(port = 0, { embedding } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tidal-preview-'));
   const cwd = join(root, 'workspace-a'), otherCwd = join(root, 'workspace-b');
   const config = configOf({
@@ -37,12 +37,12 @@ export async function startPreview(port = 0) {
     } },
     logger: { warn: message => console.warn(message) },
   };
-  const runtime = new TidalRuntime(ctx, config, root);
+  const runtime = new TidalRuntime(ctx, config, root, { embedding });
   const store = runtime.space('default');
   store.create({ layer: 'L3', text: '测试工作区使用蓝色主题。', status: 'active', kind: 'user_statement',
     category: 'preference', source: { kind: 'synthetic-fixture' } }, { admin: true });
   store.create({ layer: 'L1', text: '完成四层记忆管理页面的可用性检查。', status: 'active', kind: 'observation',
-    category: 'task', source: { kind: 'synthetic-fixture' } }, { admin: true });
+    category: 'task', tags: ['图谱体验'], source: { kind: 'synthetic-fixture' } }, { admin: true });
   store.create({ layer: 'L2', text: '一次合成测试确认了跨会话共享，不同工作区保持隔离。', status: 'active',
     kind: 'historical', occurredAt: '2026-01-01T10:00:00Z', source: { kind: 'synthetic-fixture' } }, { admin: true });
   store.appendPrivate('demo-author', 'PRIVATE_CANARY_SYNTHETIC_9038');

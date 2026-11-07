@@ -4,7 +4,27 @@ import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { startPreview } from './preview.mjs';
 import { MemorySpace } from '../src/store.js';
+import { MODEL_PACKS } from '../src/model-packs.js';
 import { unpackBackup } from '../src/transfer.js';
+
+class SyntheticEmbedding {
+  constructor() { this.state = { ready: false }; }
+  configure(config) {
+    this.key = config.embeddingMode;
+    this.pack = { ...MODEL_PACKS.cpu, fingerprint: 'synthetic-ui-model',
+      files: { 'model/onnx/model.onnx': MODEL_PACKS.cpu.weightHash } };
+    this.state = { mode: config.embeddingMode, ready: config.embeddingMode === 'cpu' };
+  }
+  async ready() { return this.pack; }
+  async embed(texts) {
+    return texts.map(text => {
+      const vector = new Float32Array(this.pack.dimension);
+      vector[text.includes('UI_GRAPH_SEMANTIC') ? 0 : 1] = 1;
+      return vector;
+    });
+  }
+  async close() {}
+}
 
 const preview = await startPreview();
 const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -45,9 +65,42 @@ try {
   await page.getByRole('textbox', { name: '记忆正文' }).fill('UI 创建的跨会话共享记录');
   await page.getByLabel('主题（逗号分隔，用于关联和检索，不改变层级）').fill('人工体验,项目导航');
   await page.getByLabel('实体别名（逗号分隔，仅当前工作区）').fill('别名一,别名二');
+  await page.getByLabel('标签（逗号分隔）').fill('图谱体验');
   await page.getByLabel('状态', { exact: true }).selectOption('active');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await page.getByText('UI 创建的跨会话共享记录', { exact: true }).waitFor();
+  await page.getByRole('tab', { name: '记忆图谱' }).click();
+  await page.getByText(/索引：已就绪/).waitFor();
+  await page.getByLabel('筛选主题或标签（精确名称）').fill('图谱体验');
+  await page.locator('.graph-list button').filter({ hasText: 'UI 创建的跨会话共享记录' }).click();
+  await page.getByRole('heading', { name: '节点与关联依据' }).waitFor();
+  await page.getByText('同一标签：图谱体验', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '查找可能相关', exact: true }).click();
+  await page.getByText('标准组合没有本地语义候选；请先选择并准备本地语义组合。', { exact: true }).waitFor();
+  const graphTransform = page.locator('.graph-canvas > g');
+  const originalTransform = await graphTransform.getAttribute('transform');
+  await page.getByRole('button', { name: '放大图谱' }).click();
+  assert.notEqual(await graphTransform.getAttribute('transform'), originalTransform);
+  const bounds = await page.locator('.graph-canvas').boundingBox();
+  const zoomedTransform = await graphTransform.getAttribute('transform');
+  await page.mouse.move(bounds.x + 10, bounds.y + 10);
+  await page.mouse.down();
+  await page.mouse.move(bounds.x + 40, bounds.y + 30);
+  await page.mouse.up();
+  assert.notEqual(await graphTransform.getAttribute('transform'), zoomedTransform);
+  await page.getByRole('button', { name: '确认关联', exact: true }).click();
+  await page.getByText('人工确认关联', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '排除关联', exact: true }).click();
+  await page.getByText('人工排除关联', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '撤销修正', exact: true }).click();
+  await page.getByText('同一标签：图谱体验', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '查看正文和出处', exact: true }).click();
+  await page.getByText('正文与出处', { exact: true }).waitFor();
+  assert.equal((await page.locator('body').innerText()).includes('PRIVATE_CANARY_SYNTHETIC_9038'), false);
+  await page.getByRole('button', { name: '编辑这条记忆', exact: true }).click();
+  await page.getByLabel('标签（逗号分隔）').fill('合成标签');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '已保存' }).waitFor();
   await page.getByRole('tab', { name: '私人日记' }).click();
   await page.getByText('私人记录，不展示正文', { exact: true }).waitFor();
   assert.equal(await page.getByLabel('私人日记整理方式').inputValue(), 'local');
@@ -72,6 +125,7 @@ try {
   assert.equal(await page.getByRole('option', { name: /宿主自选模型/ }).evaluate(option => option.disabled), true);
   await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
   await page.getByText('当前空间的派生主题索引', { exact: true }).waitFor();
+  await page.getByText('当前空间的派生图谱索引', { exact: true }).waitFor();
   await page.getByText('自动备份受保护口令', { exact: true }).waitFor();
   await page.getByText('同谱系恢复的遗忘标记（无正文）', { exact: true }).waitFor();
   await page.getByRole('heading', { name: '模型文件与下载', exact: true }).waitFor();
@@ -110,6 +164,9 @@ try {
   await page.getByLabel('每日深度整理时间（本机时间，留空关闭）').fill('04:30');
   assert.equal(await page.getByLabel('自动记录并召回用户陈述（本地规则，无需审核）').isChecked(), true);
   assert.equal(await page.getByLabel('额外保存助手全文到短期 L0（默认关闭）').isChecked(), false);
+  const graphRecall = page.getByLabel('已确认图谱关联辅助召回（默认关闭）');
+  assert.equal(await graphRecall.isChecked(), false);
+  await graphRecall.check();
   await page.getByLabel('最低相关性分数').fill('0.5');
   await page.getByRole('button', { name: '保存设置', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
@@ -120,6 +177,11 @@ try {
   assert.equal(status.data.config.workingHours, 48);
   assert.equal(status.data.config.dailyConsolidateAt, '04:30');
   assert.equal(status.data.config.minScore, 0.5);
+  assert.equal(status.data.config.graphRecall, true);
+  await graphRecall.uncheck();
+  await page.getByRole('button', { name: '保存设置', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
+  assert.equal(preview.runtime.config.graphRecall, false);
   await page.getByRole('button', { name: '立即深度整理一次' }).click();
   await page.getByRole('status').filter({ hasText: '深度整理完成' }).waitFor();
   await page.getByText(/上次深度整理：.*手动.*提炼/).waitFor();
@@ -189,6 +251,9 @@ try {
   await page.getByRole('combobox', { name: '记忆空间' }).selectOption('workspace-b');
   await page.getByRole('tab', { name: '分层记忆' }).click();
   await page.getByText('这一层还没有记忆。', { exact: true }).waitFor();
+  await page.getByRole('tab', { name: '记忆图谱' }).click();
+  await page.getByText('此页没有符合条件的条目。', { exact: true }).waitFor();
+  assert.equal((await page.locator('body').innerText()).includes('UI 创建的跨会话共享记录'), false);
   owner = new MemorySpace(preview.runtime.root, 'contended');
   await page.getByRole('button', { name: '刷新', exact: true }).click();
   await page.getByRole('combobox', { name: '记忆空间' }).selectOption('contended');
@@ -225,6 +290,32 @@ try {
   await unavailablePage.getByRole('alert').filter({ hasText: 'synthetic status unavailable' }).waitFor();
   assert.equal(await unavailablePage.locator('.tidal .brand .version').innerText(), '版本未知');
   await unavailablePage.close();
+  const semanticPreview = await startPreview(0, { embedding: new SyntheticEmbedding() });
+  try {
+    semanticPreview.runtime.rawConfig.embeddingMode = 'cpu';
+    semanticPreview.runtime.syncConfig();
+    const graphStore = semanticPreview.runtime.space('default');
+    const center = graphStore.create({ layer: 'L3', text: 'UI_GRAPH_SEMANTIC 中心节点' }, { admin: true });
+    const candidate = graphStore.create({ layer: 'L2', text: 'UI_GRAPH_SEMANTIC 候选节点' }, { admin: true });
+    await semanticPreview.runtime.prepareSemantic(graphStore, { admin: true }, '');
+    const semanticPage = await browser.newPage();
+    semanticPage.on('pageerror', error => errors.push(error.message));
+    try {
+      await semanticPage.goto(semanticPreview.url);
+      await semanticPage.getByRole('button', { name: '设置', exact: true }).click();
+      await semanticPage.getByRole('button', { name: '潮汐记忆', exact: true }).click();
+      await semanticPage.getByRole('tab', { name: '记忆图谱' }).click();
+      await semanticPage.getByText(/索引：已就绪/).waitFor();
+      await semanticPage.locator('.graph-list button').filter({ hasText: center.text }).click();
+      await semanticPage.getByRole('button', { name: '查找可能相关', exact: true }).click();
+      await semanticPage.getByText('可能相关（本地语义）', { exact: false }).waitFor();
+      await semanticPage.getByText(candidate.text, { exact: false }).first().waitFor();
+      await semanticPage.getByRole('button', { name: '确认语义关联', exact: true }).click();
+      await semanticPage.getByText('人工确认关联', { exact: true }).waitFor();
+      assert.equal(graphStore.graphNeighbors({ id: center.id }, { admin: true }).items
+        .find(item => item.id === candidate.id).relation.kind, 'confirmed');
+    } finally { await semanticPage.close(); }
+  } finally { await semanticPreview.close(); }
   assert.deepEqual(errors, []);
   console.log('Browser UI checks passed: CRUD, workspace sharing/isolation, settings, privacy, index repair, lock retry, CSRF.');
 } finally {

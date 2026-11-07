@@ -282,6 +282,8 @@ test('backup preserves usage and manual evidence idempotency, including after in
 
   delete document.reinforcements;
   delete document.retrievalEvents;
+  delete document.graphRelations;
+  document.version = 1;
   const payload = JSON.stringify(document);
   const legacy = JSON.stringify({ format: 'tidal-backup', version: 1, sha256: hash(payload), payload });
   restoreBackup(root, 'old-evidence-backup', legacy, '', {});

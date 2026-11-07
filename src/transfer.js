@@ -23,22 +23,24 @@ export function packBackup(space, password = '', { includePrivate = Boolean(pass
 function packSnapshot(snapshot, password = '') {
   if (password) string(password, '备份口令', 256);
   requireValue(!password || password.length >= 12, 'WEAK_PASSWORD', '加密备份口令至少 12 个字符。');
+  requireValue(snapshot.version === 1 || snapshot.version === 2, 'BACKUP_VERSION', '不支持此备份版本。');
+  const version = snapshot.version;
   const payload = JSON.stringify(snapshot);
-  if (!password) return checkBackupSize(JSON.stringify({ format: 'tidal-backup', version: 1, sha256: hash(payload), payload }));
+  if (!password) return checkBackupSize(JSON.stringify({ format: 'tidal-backup', version, sha256: hash(payload), payload }));
   const salt = randomBytes(16), iv = randomBytes(12);
   const key = scryptSync(password, salt, 32);
   try {
     const cipher = createCipheriv('aes-256-gcm', key, iv);
-    cipher.setAAD(Buffer.from('tidal-backup-v1'));
+    cipher.setAAD(Buffer.from(`tidal-backup-v${version}`));
     const data = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()]);
-    return checkBackupSize(JSON.stringify({ format: 'tidal-encrypted-backup', version: 1, salt: salt.toString('base64'),
+    return checkBackupSize(JSON.stringify({ format: 'tidal-encrypted-backup', version, salt: salt.toString('base64'),
       iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: data.toString('base64') }));
   } finally { key.fill(0); }
 }
 export function unpackBackup(text, password = '') {
   checkBackupSize(text);
   const envelope = JSON.parse(text);
-  requireValue(envelope.version === 1, 'BACKUP_VERSION', '不支持此备份版本。');
+  requireValue(envelope.version === 1 || envelope.version === 2, 'BACKUP_VERSION', '不支持此备份版本。');
   let payload;
   if (envelope.format === 'tidal-encrypted-backup') {
     requireValue(typeof password === 'string' && password.length >= 12 && password.length <= 256, 'PASSWORD_REQUIRED', '请提供正确的备份口令。');
@@ -49,7 +51,7 @@ export function unpackBackup(text, password = '') {
     const key = scryptSync(password, Buffer.from(envelope.salt, 'base64'), 32);
     try {
       const cipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
-      cipher.setAAD(Buffer.from('tidal-backup-v1'));
+      cipher.setAAD(Buffer.from(`tidal-backup-v${envelope.version}`));
       cipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
       payload = Buffer.concat([cipher.update(Buffer.from(envelope.data, 'base64')), cipher.final()]).toString('utf8');
     } catch {
@@ -62,8 +64,9 @@ export function unpackBackup(text, password = '') {
     payload = envelope.payload;
   }
   const document = JSON.parse(payload);
-  requireValue(document.schema === 'tidal-memory' && document.version === 1 &&
+  requireValue(document.schema === 'tidal-memory' && document.version === envelope.version &&
     Array.isArray(document.records) && Array.isArray(document.revisions) && Array.isArray(document.tombstones) &&
+    (document.version === 1 ? document.graphRelations === undefined : Array.isArray(document.graphRelations)) &&
     (document.forgottenKeys === undefined || Array.isArray(document.forgottenKeys)) &&
     (document.reinforcements === undefined || Array.isArray(document.reinforcements)) &&
     (document.retrievalEvents === undefined || Array.isArray(document.retrievalEvents)),
@@ -188,6 +191,23 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
         row.layer !== 'L0' && typeof row.evidence === 'string' && /^recall:[a-f0-9]{64}$/.test(row.evidence),
       'INVALID_BACKUP', '召回依据引用无效。');
       if (!skipped.has(row.id)) store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
+    }
+    const graphPairs = new Set();
+    for (const row of document.graphRelations ?? []) {
+      const left = records.get(row?.leftId), right = records.get(row?.rightId);
+      requireValue(left && right && left.layer !== 'L0' && right.layer !== 'L0' &&
+        (left.layer === 'L3' || right.layer === 'L3') && row.leftId < row.rightId &&
+        ['confirmed', 'excluded'].includes(row.state) &&
+        typeof row.leftHash === 'string' && /^[a-f0-9]{64}$/.test(row.leftHash) &&
+        typeof row.rightHash === 'string' && /^[a-f0-9]{64}$/.test(row.rightHash) &&
+        timestamp(row.updatedAt, '图谱修正时间'), 'INVALID_BACKUP', '图谱修正引用或格式无效。');
+      const key = `${row.leftId}:${row.rightId}`;
+      requireValue(!graphPairs.has(key), 'INVALID_BACKUP', '备份包含重复图谱修正。');
+      graphPairs.add(key);
+      if (!skipped.has(row.leftId) && !skipped.has(row.rightId)) {
+        store.system.prepare('INSERT INTO graph_relations VALUES(?,?,?,?,?,?)')
+          .run(row.leftId, row.rightId, row.state, row.leftHash, row.rightHash, row.updatedAt);
+      }
     }
     requireValue((document.privateEntries === undefined || Array.isArray(document.privateEntries)) &&
       (document.privateAliases === undefined || Array.isArray(document.privateAliases)) &&

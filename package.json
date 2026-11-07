@@ -1,6 +1,6 @@
 {
   "name": "dsh-tidal-memory",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "四层独立存储、证据召回与受限私人记录的 DeepSeek Harness 记忆插件。",
   "type": "module",
   "packageManager": "pnpm@11.28.5",
@@ -12,12 +12,16 @@
     "./core": "./src/store.js",
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "index.d.ts", "client.js", "src", "scripts/setup-model.mjs", "scripts/bench-topics.mjs",
-    "scripts/bench-backup.mjs", "cordis.patch.yml", "README.md", "CONTRIBUTING.md", "LICENSE"],
+  "files": ["index.js", "index.d.ts", "client.js", "src/backup-key.js", "src/database.js", "src/edition.json",
+    "src/embedding-worker.js", "src/embedding.js", "src/forget-ledger.js", "src/graph-index.js", "src/graph-semantic.js", "src/graph.js",
+    "src/host-deps.js", "src/model-packs.js", "src/model.js", "src/private-journal.js", "src/runtime.js",
+    "src/semantic-index.js", "src/sleep-context.js", "src/store.js", "src/topic-index.js", "src/transfer.js",
+    "scripts/setup-model.mjs", "scripts/bench-topics.mjs", "scripts/bench-backup.mjs",
+    "cordis.patch.yml", "README.md", "CONTRIBUTING.md", "LICENSE"],
   "engines": {"node": ">=24.0.0", "dsh": "0.2.1-rc.5"},
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:unit": "node --test --test-concurrency=2 tests/memory.test.mjs tests/runtime.test.mjs tests/review.test.mjs tests/effectiveness.test.mjs tests/encoding.test.mjs tests/sleep-context.test.mjs tests/private-journal.test.mjs tests/semantic.test.mjs tests/process-lock.test.mjs tests/topics.test.mjs tests/backup-encryption.test.mjs tests/backup-boundary.test.mjs tests/restore-forget.test.mjs tests/lifecycle.test.mjs",
+    "test:unit": "node --test --test-concurrency=2 tests/memory.test.mjs tests/runtime.test.mjs tests/review.test.mjs tests/effectiveness.test.mjs tests/encoding.test.mjs tests/sleep-context.test.mjs tests/private-journal.test.mjs tests/semantic.test.mjs tests/process-lock.test.mjs tests/topics.test.mjs tests/graph.test.mjs tests/graph-semantic.test.mjs tests/release-policy.test.mjs tests/backup-encryption.test.mjs tests/backup-boundary.test.mjs tests/restore-forget.test.mjs tests/lifecycle.test.mjs",
     "test:models": "node --test tests/local-model.test.mjs",
     "pack:editions": "node scripts/pack-editions.mjs",
     "test:host": "node --test tests/host*.test.mjs",
@@ -27,6 +31,7 @@
     "bench": "node scripts/bench.mjs",
     "bench:index": "node scripts/bench-index.mjs",
     "bench:topics": "node scripts/bench-topics.mjs",
+    "bench:graph": "node scripts/bench-graph.mjs",
     "bench:backup": "node scripts/bench-backup.mjs",
     "probe:editor": "node scripts/probe-editor-alias.mjs",
     "preview": "node scripts/preview.mjs"

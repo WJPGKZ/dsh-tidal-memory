@@ -41,6 +41,7 @@ export interface RecallResult {
   topicCards: Array<{ id: string; kind: 'topic' | 'fact' | 'task' | 'alias' | 'scene';
     label: string; count: number; evidenceIds: string[] }>;
   topicStatus: { state: 'ready' | 'unavailable'; code?: string; message?: string };
+  graphStatus: { state: 'disabled' | 'ready' | 'unprepared' | 'unavailable'; code?: string; message?: string };
   text: string;
   estimatedTokens: number;
   budget: number;
@@ -52,10 +53,11 @@ export interface RecallResult {
   diagnostics: { lexicalQueryCandidates: number; lexicalContextCandidates: number;
     semanticCandidates: number; semanticValidated: number; uniqueCandidates: number;
     scopeOrTimeFiltered: number; belowThreshold: number; budgetOrLimitExcluded: number;
-    returnedQuery: number; returnedResident: number; returnedAssociation: number };
+    returnedQuery: number; returnedResident: number; returnedAssociation: number; returnedGraph: number };
   excluded: Array<{ id: string; reason: string; score?: number }>;
   picked: Array<{ id: string; layer: Layer; reason: string; score: number; specificity: number; hits: string[]; matched: boolean;
-    channel: 'resident' | 'query' | 'association'; semanticScore: number | null; fusionScore: number | null }>;
+    channel: 'resident' | 'query' | 'association'; semanticScore: number | null; fusionScore: number | null;
+    graphRelation?: { kind: 'confirmed'; seedId: string } }>;
 }
 export interface RecallOptions {
   mode?: 'current' | 'history' | 'as-of';

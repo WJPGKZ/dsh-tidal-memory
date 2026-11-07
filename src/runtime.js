@@ -7,6 +7,8 @@ import { MemorySpace } from './store.js';
 import { LocalEmbedding, modelInventory } from './embedding.js';
 import { SemanticIndex, semanticChunks, clearSemanticFiles } from './semantic-index.js';
 import { clearTopicFiles } from './topic-index.js';
+import { clearGraphFiles } from './graph-index.js';
+import { graphSemanticSuggestions } from './graph-semantic.js';
 import { privateJournalStatus } from './private-journal.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup, MAX_RESTORE_BODY_BYTES } from './transfer.js';
 import { automaticKeyStatus, readAutomaticKey, saveAutomaticKey } from './backup-key.js';
@@ -69,6 +71,8 @@ export class TidalRuntime {
     this.semanticQueries = new Map();
     this.semanticResults = new Map();
     this.semanticTasks = new Set();
+    this.graphTasks = new Map();
+    this.graphSuggestionTasks = new Map();
     this.lastSemanticTask = new Map();
     this.prewarmQueue = Promise.resolve();
     this.spaces = new Map();
@@ -92,6 +96,7 @@ export class TidalRuntime {
     this.embedding.configure(config);
     if (modelKey !== this.embedding.key) {
       for (const task of this.semanticTasks) task.controller.abort();
+      for (const task of this.graphSuggestionTasks.values()) task.controller.abort();
       this.semanticQueries.clear();
       this.semanticResults.clear();
     } else if (changed) this.semanticResults.clear();
@@ -216,6 +221,57 @@ export class TidalRuntime {
   }
   cancelPrewarm() {
     for (const task of this.semanticTasks) if (task.kind === 'prewarm') task.controller.abort();
+  }
+  cancelGraphBuild(name) {
+    this.graphTasks.get(name)?.controller.abort();
+    this.graphSuggestionTasks.get(name)?.controller.abort();
+  }
+  requestGraphBuild(store) {
+    if (this.disposed) return { state: 'closed' };
+    const active = this.graphTasks.get(store.name);
+    if (active) return store.graph().status();
+    const index = store.graph();
+    if (index.state === 'ready') return index.status();
+    const task = { controller: new AbortController(), promise: null };
+    const shouldPause = () => this.disposed || [...this.ctx.agents.list()].some(agent =>
+      agent.status === 'running' && bindingFor(this.config, agent.session.header.cwd)?.space === store.name);
+    const job = index.sync({ signal: task.controller.signal, shouldPause });
+    task.promise = job;
+    this.graphTasks.set(store.name, task);
+    this.jobs.add(job);
+    const finish = error => {
+      if (this.graphTasks.get(store.name) === task) this.graphTasks.delete(store.name);
+      this.jobs.delete(job);
+      if (error && error.code !== 'GRAPH_PAUSED' && !this.disposed)
+        this.noteError(error.code ?? 'GRAPH_INDEX_FAILED', '后台图谱建立未完成，可在图谱页重试或重建。',
+          { operation: 'graph', space: store.name });
+    };
+    job.then(() => finish(), error => finish(error));
+    return index.status();
+  }
+  async requestGraphSuggestions(store, options) {
+    requireValue(this.config.embeddingMode !== 'off', 'SEMANTIC_DISABLED',
+      '标准组合没有本地语义候选；请先选择并准备本地语义组合。', 409);
+    requireValue(this.embedding.state.ready && this.embedding.pack, 'SEMANTIC_NOT_PREPARED',
+      '请先完成当前空间的本地语义索引准备。', 409);
+    const shouldPause = () => this.disposed || [...this.ctx.agents.list()].some(agent =>
+      agent.status === 'running' && bindingFor(this.config, agent.session.header.cwd)?.space === store.name);
+    requireValue(!shouldPause(), 'CONVERSATION_BUSY', '当前空间正在生成回复，请空闲后再查找语义候选。', 409);
+    this.graphSuggestionTasks.get(store.name)?.controller.abort();
+    const task = { controller: new AbortController() };
+    const key = this.embedding.key, index = store.semanticIndex, pack = this.embedding.pack;
+    this.graphSuggestionTasks.set(store.name, task);
+    const job = graphSemanticSuggestions(store, index, pack, options, ADMIN, {
+      signal: task.controller.signal, shouldPause,
+      validateModel: () => !this.disposed && this.embedding.key === key &&
+        this.embedding.state.ready && store.semanticIndex === index,
+    });
+    this.jobs.add(job);
+    try { return await job; }
+    finally {
+      this.jobs.delete(job);
+      if (this.graphSuggestionTasks.get(store.name) === task) this.graphSuggestionTasks.delete(store.name);
+    }
   }
   requestPrewarm(store) {
     if (this.disposed || this.config.embeddingMode === 'off') return { state: 'disabled' };
@@ -356,6 +412,7 @@ export class TidalRuntime {
       this.cancelPrewarm();
       const binding = bindingFor(this.config, agent.session?.header.cwd);
       if (!binding) return decision;
+      this.cancelGraphBuild(binding.space);
       this.forAgent(agent);
       const state = this.sessionState(agent.session, binding.space);
       // rc5 appends admitted user events after its final runtime-context refresh.
@@ -389,6 +446,7 @@ export class TidalRuntime {
       this.cancelPrewarm();
       const binding = bindingFor(this.config, session.header.cwd);
       if (!binding) return;
+      this.cancelGraphBuild(binding.space);
       const state = this.sessionState(session, binding.space);
       state.space = binding.space;
       state.lastSeen = this.clock().getTime();
@@ -508,7 +566,9 @@ export class TidalRuntime {
         const maintenance = store.maintenance();
         this.invalidateSpace(name);
         const semanticPrewarm = this.requestPrewarm(store);
-        results.push({ space: name, ...maintenance, localOrganization, consolidation, semanticPrewarm });
+        const graphPreparation = this.config.graphRecall || store.graphIndex ?
+          this.requestGraphBuild(store) : { state: 'disabled' };
+        results.push({ space: name, ...maintenance, localOrganization, consolidation, semanticPrewarm, graphPreparation });
         if (this.config.autoBackup) automaticBackup(store, this.root);
       }
       return { results };
@@ -666,7 +726,7 @@ export class TidalRuntime {
   modelOrganizationStatus() {
     return this.config.deepOrganizationMode === 'selected'
       ? { mode: 'selected', state: 'unavailable', code: 'HOST_AUDIT_REQUIRED',
-        message: '宿主自选模型整理尚未满足可回放审计要求，未发送数据；本地规则仍可独立运行。' }
+        message: 'rc5 要求模型输入可从会话日志重建，但尚无允许外部插件使用的隔离后台整理记录接口；未发送数据，本地规则仍可运行。' }
       : { mode: 'local', state: 'rules-only', code: 'LOCAL_GENERATOR_NOT_CONFIGURED',
         message: '本地生成模型未配置；仅运行本地规则和已启用的语义索引。' };
   }
@@ -716,6 +776,7 @@ export class TidalRuntime {
         paths: { plugin: fileURLToPath(new URL('../', import.meta.url)), models: join(this.root, 'models'),
           semanticIndex: join(this.root, 'spaces', spaceName, 'indexes', 'semantic.sqlite3'),
           topicIndex: join(this.root, 'spaces', spaceName, 'indexes', 'topics.sqlite3'),
+          graphIndex: join(this.root, 'spaces', spaceName, 'indexes', 'graph.sqlite3'),
           backups: join(this.root, 'backups', spaceName),
           backupKey: automaticKeyStatus(this.root).path,
           forgetLedger: join(this.root, 'system', 'forget-ledger.sqlite3') },
@@ -726,6 +787,8 @@ export class TidalRuntime {
           tasks: [...this.semanticTasks].filter(task => task.space === spaceName)
             .map(task => ({ kind: task.kind, state: task.state })),
           lastTask: this.lastSemanticTask.get(spaceName) ?? null },
+        graph: this.spaces.get(spaceName)?.graphIndex?.status() ??
+          { state: 'unprepared', progress: { phase: 'waiting', scanned: 0 }, indexed: 0, error: null },
         config: this.config, legacyModelExtractionIgnored: this.legacyModelExtractionIgnored,
         organizationModels: { ordinary: this.modelOrganizationStatus(),
           private: { mode: this.config.privateOrganizationMode, authorAvailable: false,
@@ -801,6 +864,37 @@ export class TidalRuntime {
     if (method === 'POST' && path === '/recall') return this.recallAsync(store, ADMIN, body.query, {
       includeArchived: body.includeArchived === true, mode: body.mode ?? 'current', asOf: body.asOf });
     if (method === 'POST' && path === '/topics/read') return store.readEvidence(body, ADMIN);
+    if (method === 'GET' && path === '/graph/status') return store.graph().status();
+    if (method === 'POST' && path === '/graph/prepare') return this.requestGraphBuild(store);
+    if (method === 'POST' && path === '/graph/list') return store.graphList(body, ADMIN);
+    if (method === 'POST' && path === '/graph/neighbors') return store.graphNeighbors(body, ADMIN);
+    if (method === 'POST' && path === '/graph/suggestions') return this.requestGraphSuggestions(store, body);
+    if (method === 'GET' && path === '/graph/record') {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        store.reconcileForgetLedger();
+        const version = store.reconciledForgetVersion;
+        const record = store.rawOrdinary(query.get('id'));
+        requireValue(record && store.visible(record, ADMIN), 'NOT_FOUND', '找不到此范围内的普通记忆。', 404);
+        if (version === store.forgetVersion()) return record;
+      }
+      throw new MemoryError('FORGET_CONFLICT', '读取图谱正文期间遗忘标记持续变化，请稍后重试。', 409);
+    }
+    if (method === 'POST' && path === '/graph/decision') {
+      const result = store.graphDecision(body, ADMIN);
+      this.invalidateSpace(spaceName);
+      return result;
+    }
+    if (method === 'POST' && path === '/graph/rebuild') {
+      const task = this.graphTasks.get(spaceName);
+      if (task) {
+        task.controller.abort();
+        await Promise.allSettled([task.promise]);
+      }
+      store.graphIndex?.close();
+      store.graphIndex = null;
+      clearGraphFiles(store.directory);
+      return this.requestGraphBuild(store);
+    }
     if (method === 'POST' && path === '/semantic/prepare') {
       requireValue(this.config.embeddingMode !== 'off', 'SEMANTIC_DISABLED', '请先选择并保存本地语义组合。');
       const result = await this.prepareSemantic(store, ADMIN, '');
@@ -944,6 +1038,8 @@ export class TidalRuntime {
     this.disposed = true;
     const errors = [];
     for (const task of this.semanticTasks) task.controller.abort();
+    for (const task of this.graphTasks.values()) task.controller.abort();
+    for (const task of this.graphSuggestionTasks.values()) task.controller.abort();
     try { await this.embedding.close(); } catch (error) { errors.push(error); }
     await Promise.allSettled([...this.jobs]);
     for (const store of this.spaces.values()) {

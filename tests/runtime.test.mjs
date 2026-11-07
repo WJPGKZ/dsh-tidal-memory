@@ -35,6 +35,29 @@ test('status version matches the installed package manifest', async t => {
   assert.equal(status.version, manifest.version);
 });
 
+test('graph record editing does not return a concurrent sibling forget', async t => {
+  const { runtime, root } = fixture(t);
+  const store = runtime.space('shared');
+  const record = store.create({ layer: 'L3', text: 'synthetic graph record' }, { admin: true });
+  restoreBackup(root, 'sibling', packBackup(store), '', store.config);
+  const sibling = runtime.space('sibling');
+  const visible = store.visible;
+  let forgotten = false;
+  store.visible = function (item, actor) {
+    const accepted = visible.call(this, item, actor);
+    if (!forgotten && item.id === record.id) {
+      forgotten = true;
+      sibling.forget(record.id, { admin: true });
+    }
+    return accepted;
+  };
+  try {
+    await assert.rejects(runtime.api('GET', '/graph/record',
+      new URLSearchParams({ space: 'shared', id: record.id })), { code: 'NOT_FOUND' });
+    assert.equal(forgotten, true);
+  } finally { store.visible = visible; }
+});
+
 test('status on a new space is read-only and does not create its data directory', async t => {
   const { runtime, root } = fixture(t);
   const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));

@@ -19,6 +19,7 @@ export const DEFAULTS = Object.freeze({
   autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
   injectContext: true, autoBackup: true, autoBackupMode: 'plain', backupKeep: 14, privateWriters: [],
   deepOrganizationMode: 'local', privateOrganizationMode: 'local',
+  graphRecall: false,
   embeddingMode: edition.embeddingMode, embeddingModelPath: '', embeddingDevice: 'auto',
   embeddingTimeoutSeconds: 300,
   embeddingMinScore: -1, embeddingRelativeFloor: -1,
@@ -70,7 +71,7 @@ export function configOf(raw = {}) {
   delete result.captureBatch;
   delete result.maxModelCallsPerDay;
   delete result.maxModelOutputTokens;
-  for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant', 'autoConsolidate', 'autoArchive']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
+  for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant', 'autoConsolidate', 'autoArchive', 'graphRecall']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
   choice(result.residentMode, ['all', 'core', 'pinned'], 'L3 常驻模式');
   choice(result.embeddingMode, ['off', 'cpu', 'enhanced'], '本地语义组合');
   choice(result.embeddingDevice, ['auto', 'cpu'], '本地推理设备');

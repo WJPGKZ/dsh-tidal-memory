@@ -49,6 +49,12 @@ window.__ModuleLoader__.load({
       .tidal .check{display:flex;gap:8px;align-items:center;padding:8px 0}.tidal .check span{margin:0}
       .tidal .private-card{padding:26px;border:1px dashed var(--tidal-accent);border-radius:12px;background:var(--tidal-surface)}
       .tidal .import-list{max-height:280px;overflow:auto}.tidal .import-list label{display:flex;gap:8px;margin-bottom:8px}
+      .tidal .graph-canvas{display:block;width:100%;height:460px;border:1px solid var(--tidal-border);border-radius:10px;touch-action:none;cursor:grab}
+      .tidal .graph-canvas:active{cursor:grabbing}.tidal .graph-node{cursor:pointer}.tidal .graph-node rect{fill:var(--dsw-alias-settings-card-fill,#fff);stroke:var(--tidal-accent);stroke-width:1.5}
+      .tidal .graph-node text{fill:var(--dsw-alias-label-primary,#182c3a);font-size:13px;pointer-events:none}.tidal .graph-node.selected rect{stroke-width:3}
+      .tidal .graph-edge{stroke:var(--tidal-accent);stroke-width:1.5;opacity:.7}.tidal .graph-edge.suggested{stroke-dasharray:6 5}
+      .tidal .graph-edge.excluded{stroke:var(--dsw-alias-state-error-primary,#b43e46);stroke-dasharray:3 5}
+      .tidal .graph-list{max-height:520px;overflow:auto}.tidal .graph-list h4{margin:14px 0 6px}
       @media(max-width:760px){.tidal .cards{grid-template-columns:repeat(2,1fr)}.tidal .split,.tidal .fields{grid-template-columns:1fr}.tidal{padding:10px}}
     `;
     async function request(space, path, body) {
@@ -77,6 +83,237 @@ window.__ModuleLoader__.load({
       return h('label', { className: 'check' }, h('input', {
         type: 'checkbox', checked: Boolean(value), onChange: event => set(event.target.checked),
       }), h('span', null, label));
+    }
+    function GraphView({ space, busy, run, openEditor }) {
+      const [layer, setLayer] = React.useState('L3');
+      const [statusFilter, setStatusFilter] = React.useState('active');
+      const [search, setSearch] = React.useState('');
+      const [topic, setTopic] = React.useState('');
+      const [relation, setRelation] = React.useState('all');
+      const [cursor, setCursor] = React.useState('');
+      const [history, setHistory] = React.useState([]);
+      const [page, setPage] = React.useState({ items: [], nextCursor: null });
+      const [index, setIndex] = React.useState({ state: 'unprepared' });
+      const [selected, setSelected] = React.useState(null);
+      const [neighbors, setNeighbors] = React.useState(null);
+      const [suggestions, setSuggestions] = React.useState(null);
+      const [evidence, setEvidence] = React.useState(null);
+      const [target, setTarget] = React.useState('');
+      const [error, setError] = React.useState(null);
+      const [revision, setRevision] = React.useState(0);
+      const [zoom, setZoom] = React.useState(1);
+      const [pan, setPan] = React.useState({ x: 0, y: 0 });
+      const drag = React.useRef(null);
+      const selectedRequest = React.useRef(0);
+      const previousIndexState = React.useRef(null);
+      const mode = statusFilter === 'active' ? 'current' : 'history';
+      const act = (label, action, style = '') =>
+        h('button', { type: 'button', disabled: busy, className: style, onClick: action }, label);
+      const reset = setter => value => {
+        setter(value); setCursor(''); setHistory([]); setSelected(null); setNeighbors(null); setSuggestions(null); setEvidence(null);
+      };
+      React.useEffect(() => {
+        let live = true;
+        const update = value => {
+          if (!live) return;
+          setIndex(value);
+          if (value.state === 'ready' && previousIndexState.current !== 'ready')
+            setRevision(current => current + 1);
+          previousIndexState.current = value.state;
+        };
+        request(space, '/graph/prepare', {}).then(update)
+          .catch(reason => { if (live) setError(reason.message); });
+        const timer = setInterval(() => request(space, '/graph/status').then(update)
+          .catch(reason => { if (live) setError(reason.message); }), 2000);
+        return () => { live = false; clearInterval(timer); selectedRequest.current++; };
+      }, [space]);
+      React.useEffect(() => {
+        let live = true;
+        const timer = setTimeout(() => {
+          request(space, '/graph/list', { layer, status: statusFilter, query: search, topic, relation, cursor })
+            .then(value => { if (live) { setPage(value); setIndex(value.index); setError(null); } })
+            .catch(reason => { if (live) setError(reason.message); });
+        }, 150);
+        return () => { live = false; clearTimeout(timer); };
+      }, [space, layer, statusFilter, search, topic, relation, cursor, revision]);
+      async function select(item, nextCursor = '') {
+        const requestId = ++selectedRequest.current;
+        if (!nextCursor) { setSelected(item); setNeighbors(null); setSuggestions(null); setEvidence(null); }
+        try {
+          const value = await request(space, '/graph/neighbors', { id: item.id, mode, cursor: nextCursor });
+          if (requestId === selectedRequest.current) { setNeighbors(value); setError(null); }
+        } catch (reason) { if (requestId === selectedRequest.current) setError(reason.message); }
+      }
+      const revise = (otherId, decision, otherRevision) => run(async () => {
+        await request(space, '/graph/decision', { id: selected.id, otherId, decision,
+          revision: neighbors?.center?.revision ?? selected.revision, ...(otherRevision ? { otherRevision } : {}) });
+        await select(selected);
+        setRevision(current => current + 1);
+        setTarget('');
+      }, decision === 'reset' ? '已撤销图谱修正。' :
+        decision === 'excluded' ? '已排除该关联，不再沿此关联扩散。' : '已确认关联；这不代表两条事实相同。');
+      const findSuggestions = (nextCursor = '') => run(async () => {
+        const requestId = ++selectedRequest.current;
+        const value = await request(space, '/graph/suggestions', { id: selected.id, mode, cursor: nextCursor });
+        if (requestId === selectedRequest.current) setSuggestions(value);
+      });
+      const groups = new Map();
+      for (const item of page.items) {
+        const group = item.topics[0] || item.tags.find(value => value.trim()) || '待归类';
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push(item);
+      }
+      const shownNeighbors = (neighbors?.items ?? []).filter(item =>
+        relation === 'all' || relation === item.relation.kind);
+      const shownSuggestions = relation === 'all' ? suggestions?.items ?? [] : [];
+      const points = selected && neighbors ? [
+        { item: neighbors.center, x: 450, y: 350, center: true },
+        ...[...shownNeighbors, ...shownSuggestions].map((item, index, all) => {
+          const ring = Math.floor(index / 18), count = Math.min(18, all.length - ring * 18);
+          const angle = 2 * Math.PI * (index % 18) / Math.max(1, count) - Math.PI / 2;
+          const radius = 145 + ring * 90;
+          return { item, x: 450 + Math.cos(angle) * radius, y: 350 + Math.sin(angle) * radius };
+        }),
+      ] : page.items.map((item, index) => ({
+        item, x: 105 + (index % 5) * 172, y: 45 + Math.floor(index / 5) * 67,
+      }));
+      const stateText = {
+        unprepared: '尚未建立', building: '正在分批建立', ready: '已就绪',
+        partial: '已让出，空闲后可继续', error: '索引不可用',
+      }[index.state] || index.state;
+      return h('div', { className: 'stack' },
+        h('div', { className: 'panel stack' },
+          h('h3', null, '记忆图谱'),
+          h('p', { className: 'muted' }, '以普通 L3 为中心，查看来源、主题和人工关联。连线只是导航依据，不表示事实相同或已核实；L0 与私人日记不进入图谱。'),
+          h('div', { className: 'row' },
+            h('span', { className: 'badge' }, `索引：${stateText} · ${index.indexed ?? 0} 条`),
+            index.progress?.scanned ? h('small', null, `本轮检查 ${index.progress.scanned} 条`) : null,
+            act('继续建立', () => run(async () => {
+              const value = await request(space, '/graph/prepare', {}); setIndex(value);
+            }, '图谱索引已开始或已就绪。')),
+            act('重建图谱索引', () => {
+              if (window.confirm('只重建派生索引，不删除记忆或人工修正。继续吗？'))
+                run(async () => { const value = await request(space, '/graph/rebuild', {}); setIndex(value); },
+                  '派生图谱已重新建立任务。');
+            })),
+          index.error ? h('p', { className: 'message error', role: 'alert' }, `${index.error.code} · ${index.error.message}`) : null,
+          error ? h('p', { className: 'message error', role: 'alert' }, error) : null,
+          index.state !== 'ready' ? h('small', null, '索引未完成时关联可能不完整；普通记忆与原有召回仍可使用。') : null,
+          h('div', { className: 'fields' },
+            field('搜索图谱记忆', search, reset(setSearch)),
+            field('筛选主题或标签（精确名称）', topic, reset(setTopic)),
+            h('label', null, h('span', null, '图谱层级'),
+              h('select', { 'aria-label': '图谱层级', value: layer, onChange: event => reset(setLayer)(event.target.value) },
+                ...[['L3', 'L3 长期知识（默认）'], ['L2', 'L2 情景记忆'], ['L1', 'L1 工作记忆']]
+                  .map(([value, label]) => h('option', { key: value, value }, label)))),
+            h('label', null, h('span', null, '图谱状态'),
+              h('select', { 'aria-label': '图谱状态', value: statusFilter, onChange: event => reset(setStatusFilter)(event.target.value) },
+                ...[['active', '当前有效'], ['archived', '已归档'], ['superseded', '已替代'],
+                  ['completed', '已完成'], ['cancelled', '已取消']]
+                  .map(([value, label]) => h('option', { key: value, value }, label)))),
+            h('label', null, h('span', null, '图谱关系'),
+              h('select', { 'aria-label': '图谱关系', value: relation, onChange: event => reset(setRelation)(event.target.value) },
+                ...[['all', '全部'], ['isolated', '仅孤立项'], ['source', '来源关联'], ['topic', '同一主题'],
+                  ['tag', '同一标签'], ['fact', '同一事实键'], ['task', '同一任务键'], ['alias', '同一别名'],
+                  ['scene', '同一情景'], ['confirmed', '人工确认'], ['excluded', '人工排除'], ['stale', '确认已过期']]
+                  .map(([value, label]) => h('option', { key: value, value }, label))))),
+          page.incomplete ? h('p', { className: 'message' }, '部分密集关系超过本页检查上限，筛选结果可能不完整；请打开节点分页查看。') : null),
+        h('div', { className: 'split' },
+          h('div', { className: 'panel stack' },
+            h('div', { className: 'row' }, h('h3', null, '关系图'),
+              act('放大图谱', () => setZoom(value => Math.min(2.5, value * 1.2))),
+              act('缩小图谱', () => setZoom(value => Math.max(0.5, value / 1.2))),
+              act('重置图谱视图', () => { setZoom(1); setPan({ x: 0, y: 0 }); })),
+            h('small', null, '拖动画布、缩放并点击节点展开；虚线表示共享线索，红色虚线表示已排除或需重新确认。'),
+            h('svg', { className: 'graph-canvas', viewBox: '0 0 900 700', role: 'group', 'aria-label': '普通记忆关系图',
+              onPointerDown: event => {
+                if (event.target.closest?.('[data-graph-node]')) return;
+                event.currentTarget.setPointerCapture(event.pointerId);
+                drag.current = { x: event.clientX, y: event.clientY, pan };
+              },
+              onPointerMove: event => {
+                if (!drag.current) return;
+                const bounds = event.currentTarget.getBoundingClientRect();
+                setPan({ x: drag.current.pan.x + (event.clientX - drag.current.x) * 900 / bounds.width,
+                  y: drag.current.pan.y + (event.clientY - drag.current.y) * 700 / bounds.height });
+              },
+              onPointerUp: () => { drag.current = null; },
+              onPointerCancel: () => { drag.current = null; } },
+            h('g', { transform: `translate(${pan.x} ${pan.y}) translate(450 350) scale(${zoom}) translate(-450 -350)` },
+              ...(selected && neighbors ? points.slice(1).map(point => h('line', { key: `edge-${point.item.id}`,
+                className: `graph-edge ${['excluded', 'stale'].includes(point.item.relation.kind) ? 'excluded' :
+                  ['source', 'confirmed'].includes(point.item.relation.kind) ? '' : 'suggested'}`,
+                x1: 450, y1: 350, x2: point.x, y2: point.y })) : []),
+              ...points.map(point => h('g', { key: point.item.id, 'data-graph-node': '1',
+                className: `graph-node ${point.center ? 'selected' : ''}`,
+                role: 'button', tabIndex: 0, 'aria-label': `图谱节点 ${point.item.layer} ${point.item.text}`,
+                transform: `translate(${point.x} ${point.y})`,
+                onClick: () => select(point.item),
+                onKeyDown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(point.item); } } },
+              h('rect', { x: -72, y: -18, width: 144, height: 36, rx: 9 }),
+              h('text', { x: 0, y: 5, textAnchor: 'middle' },
+                `${point.item.layer} · ${[...point.item.text].slice(0, 10).join('')}`))))),
+            !points.length ? h('div', { className: 'empty' }, '没有符合条件的普通记忆。') : null),
+          h('div', { className: 'panel stack' },
+            h('h3', null, '分类列表'),
+            h('small', null, '按首个主题或标签分组；可用键盘选择。未填写主题或标签的条目列在待归类；孤立项按明确和人工关联判断。'),
+            h('div', { className: 'graph-list' },
+              ...[...groups.entries()].map(([group, entries]) => h('section', { key: group },
+                h('h4', null, group),
+                ...entries.map(item => h('button', { key: item.id, type: 'button', className: 'item',
+                  'aria-selected': selected?.id === item.id, onClick: () => select(item) },
+                h('small', null, `${item.layer} · ${statuses[item.status] || item.status}`),
+                h('p', null, `${item.text}${item.truncated ? '…' : ''}`),
+                h('small', null, [...item.topics, ...item.tags].join(' · ') || '待归类')))))),
+            !page.items.length ? h('div', { className: 'empty' }, '此页没有符合条件的条目。') : null,
+            h('div', { className: 'row' },
+              history.length ? act('上一页', () => { setCursor(history.at(-1)); setHistory(history.slice(0, -1)); }) : null,
+              page.nextCursor ? act('下一页', () => { setHistory([...history, cursor]); setCursor(page.nextCursor); }) : null))),
+        selected ? h('div', { className: 'panel stack' },
+          h('h3', null, '节点与关联依据'),
+          h('p', null, `${selected.layer} · ${statuses[selected.status] || selected.status} · ${selected.text}${selected.truncated ? '…' : ''}`),
+          h('small', null, `ID ${selected.id} · ${kinds[selected.kind] || selected.kind} · ${selected.occurredAt || '事件时间未知'}`),
+          h('div', { className: 'row' },
+            act('查看正文和出处', () => run(async () => {
+              setEvidence(await request(space, '/topics/read', { id: selected.id, mode }));
+            })),
+            act('编辑这条记忆', () => run(async () => {
+              const record = await request(space, `/graph/record?id=${encodeURIComponent(selected.id)}`);
+              openEditor(record);
+            }))),
+          evidence ? h('details', { open: true }, h('summary', null, '正文与出处'),
+            h('pre', null, JSON.stringify(evidence, null, 2))) : null,
+          field('手动关联的另一条记忆 ID', target, setTarget),
+          h('div', { className: 'row' },
+            act('确认手动关联', () => revise(target, 'confirmed'), 'primary'),
+            act('排除手动关联', () => revise(target, 'excluded'))),
+          !neighbors ? h('p', { className: 'muted' }, '正在读取关联…') :
+            h('div', { className: 'stack' },
+              ...shownNeighbors.map(item => h('div', { className: 'panel', key: item.id },
+                h('p', null, `${item.layer} · ${item.text}${item.truncated ? '…' : ''}`),
+                h('small', null, `${item.relation.label}${item.relation.evidence ? `：${item.relation.evidence}` : ''}`),
+                h('div', { className: 'row' },
+                  act('打开关联节点', () => select(item)),
+                  act('确认关联', () => revise(item.id, 'confirmed', item.revision)),
+                  act('排除关联', () => revise(item.id, 'excluded', item.revision)),
+                  item.relation.decision ? act('撤销修正', () => revise(item.id, 'reset', item.revision)) : null))),
+              !shownNeighbors.length ? h('p', { className: 'muted' }, '没有符合筛选条件的关联；孤立节点不会被强行连线。') : null,
+              neighbors.nextCursor ? act('展开下一页关联', () => select(selected, neighbors.nextCursor)) : null),
+          h('div', { className: 'panel stack' },
+            h('h3', null, '本地语义候选'),
+            h('small', null, '按节点查询已准备的本地向量，仅供导航，不自动参与召回，也不表示事实相同；标准组合无需模型，可直接使用明确关联。'),
+            act('查找可能相关', () => findSuggestions()),
+            suggestions ? h('div', { className: 'stack' },
+              h('small', null, `${suggestions.model} · 本批检查 ${suggestions.scanned} 条 · ${suggestions.note}`),
+              ...suggestions.items.map(item => h('div', { className: 'panel', key: item.id },
+                h('p', null, `${item.layer} · ${item.text}${item.truncated ? '…' : ''}`),
+                h('small', null, `${item.relation.label} · 相似度 ${item.relation.score}`),
+                h('div', { className: 'row' },
+                  act('打开语义节点', () => select(item)),
+                  act('确认语义关联', () => revise(item.id, 'confirmed', item.revision)),
+                  act('排除语义关联', () => revise(item.id, 'excluded', item.revision))))),
+              !suggestions.items.length ? h('p', { className: 'muted' }, '本批没有达到门槛的语义候选。') : null,
+              suggestions.nextCursor ? act('检查下一批语义候选', () => findSuggestions(suggestions.nextCursor)) : null) : null)) : null);
     }
     function Page() {
       const [space, setSpace] = React.useState('default');
@@ -163,7 +400,8 @@ window.__ModuleLoader__.load({
           aliases: (draft.aliasesInput ?? (draft.aliases || []).join(',')).split(',').map(value => value.trim()).filter(Boolean),
           topics: (draft.topicsInput ?? (draft.topics || []).join(',')).split(',').map(value => value.trim()).filter(Boolean),
           factKey: draft.factKey || '', pinned: Boolean(draft.pinned),
-          importance: Number(draft.importance ?? 0.5), tags: draft.tags || [],
+          importance: Number(draft.importance ?? 0.5),
+          tags: (draft.tagsInput ?? (draft.tags || []).join(',')).split(',').map(value => value.trim()).filter(Boolean),
           occurredAt: draft.occurredAt || null, validUntil: draft.validUntil || null,
           horizon: draft.horizon || 'unspecified', taskKey: draft.taskKey || '',
         };
@@ -216,6 +454,8 @@ window.__ModuleLoader__.load({
           status.semantic?.error ? h('p', { role: 'alert' }, `${status.semantic.error.code} · ${status.semantic.error.message}`) : null,
           button('选择语义组合', () => setTab('settings'))),
         status.maintenance ? h('div', { className: 'panel' }, h('h3', null, '最近维护'), h('pre', null, JSON.stringify(status.maintenance, null, 2))) : null);
+      else if (tab === 'graph') content = h(GraphView, { key: space, space, busy, run,
+        openEditor: record => { setLayer(record.layer); setOffset(0); setDraft(record); setTab('memories'); } });
       else if (tab === 'memories') content = h('div', { className: 'stack' },
         h('div', { className: 'row' },
           ...Object.keys(labels).map(id => button(`${id} ${labels[id]}`, () => { setLayer(id); setOffset(0); setDraft(null); setLifecycle(null); }, layer === id ? 'primary' : '')),
@@ -250,6 +490,8 @@ window.__ModuleLoader__.load({
               v => patchDraft('aliasesInput', v)),
             field('主题（逗号分隔，用于关联和检索，不改变层级）', draft.topicsInput ?? (draft.topics || []).join(','),
               v => patchDraft('topicsInput', v)),
+            field('标签（逗号分隔）', draft.tagsInput ?? (draft.tags || []).join(','),
+              v => patchDraft('tagsInput', v)),
             field('事件时间（ISO，未知留空）', draft.occurredAt || '', v => patchDraft('occurredAt', v)),
             field('失效时间（ISO，可选）', draft.validUntil || '', v => patchDraft('validUntil', v)),
             check('保护：不自动淡忘，不代表永远正确', draft.pinned, v => patchDraft('pinned', v)),
@@ -390,7 +632,8 @@ window.__ModuleLoader__.load({
       else content = h('div', { className: 'stack' },
         h('div', { className: 'panel stack' }, h('h3', null, '文件位置'),
           ...[['plugin', '插件代码'], ['models', '共享模型目录'], ['semanticIndex', '当前空间的派生语义索引'],
-            ['topicIndex', '当前空间的派生主题索引'], ['backups', '当前空间的恢复点'], ['backupKey', '自动备份受保护口令'],
+            ['topicIndex', '当前空间的派生主题索引'], ['graphIndex', '当前空间的派生图谱索引'],
+            ['backups', '当前空间的恢复点'], ['backupKey', '自动备份受保护口令'],
             ['forgetLedger', '同谱系恢复的遗忘标记（无正文）']]
             .map(([key, label]) => h('div', { key }, h('strong', null, label),
               h('p', { className: 'path' }, status.paths?.[key]))),
@@ -464,6 +707,9 @@ window.__ModuleLoader__.load({
           check('自动记录并召回用户陈述（本地规则，无需审核）', config.autoCandidates, value => patchConfig('autoCandidates', value)),
           check('额外保存助手全文到短期 L0（默认关闭）', config.captureAssistant, value => patchConfig('captureAssistant', value)),
           check('将本地召回的普通记忆附加到当前聊天请求', config.injectContext, value => patchConfig('injectContext', value)),
+          check('已确认图谱关联辅助召回（默认关闭）', config.graphRecall, value => patchConfig('graphRecall', value)),
+          h('p', { className: 'muted' }, '仅从通过本轮词面证据门槛的已选记忆扩展人工确认且仍有效的关联，最多补充 3 条，使用剩余预算；纯语义命中和主题相同不自动扩展。'),
+          h('p', { className: 'muted' }, '人工关联不保证与当前问题相关，可能带入不同主体、时期或冲突内容；大空间下也可能增加延迟。启用前可先在“回忆与整理”中检查结果。'),
           h('p', { className: 'muted' }, '关闭后不自动注入记忆，但模型主动调用记忆工具仍可读取普通记忆。整理不发起额外模型请求。'),
           h('div', { className: 'fields' },
             field('最低相关性分数', config.minScore, value => patchConfig('minScore', value), 'number', { min: 0, max: 1, step: 0.05 }),
@@ -494,6 +740,7 @@ window.__ModuleLoader__.load({
             h('option', { value: 'local' }, '本地规则 / 语义索引（默认）'),
             h('option', { value: 'selected', disabled: true }, '宿主自选模型（暂不可用）'))),
           h('small', null, status.organizationModels?.ordinary?.message),
+          h('small', null, 'rc5 暂无已验证的外部插件后台整理审计接口；宿主模型和手填 API 均暂不可用，不会为整理发送数据。'),
           h('div', { className: 'fields' },
             field('每日深度整理时间（本机时间，留空关闭）', config.dailyConsolidateAt,
               value => patchConfig('dailyConsolidateAt', value), 'time'),
@@ -588,7 +835,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'badge' }, status.unavailable ? '整理与检索：不可用' : '整理与检索：本地运行'),
           h('span', { className: 'badge' }, `上下文注入：${status.config.injectContext ? '已开启' : '已关闭'}`)) : null,
         h('nav', { className: 'tabs', 'aria-label': '记忆管理' },
-          ...[['overview', '总览'], ['memories', '分层记忆'], ['recall', '回忆与整理'], ['private', '私人日记'], ['settings', '设置与迁移']]
+          ...[['overview', '总览'], ['memories', '分层记忆'], ['graph', '记忆图谱'], ['recall', '回忆与整理'], ['private', '私人日记'], ['settings', '设置与迁移']]
             .map(([id, label]) => h('button', { key: id, type: 'button', role: 'tab', 'aria-selected': tab === id, onClick: () => { setTab(id); setNotice(null); } }, label))),
         notice ? h('div', { className: `message ${notice.error ? 'error' : ''}`, role: notice.error ? 'alert' : 'status' }, notice.text) : null,
         status?.error ? h('div', { className: 'message error' }, `${status.error.code} · ${status.error.message}`) : null,

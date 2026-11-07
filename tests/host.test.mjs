@@ -3,12 +3,74 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { hostModule } from '../src/host-deps.js';
 import { configOf } from '../src/model.js';
 import { MemorySpace } from '../src/store.js';
 import { prepareHost } from './host-env.mjs';
 
 prepareHost();
+
+test('real rc5 tool output preserves graph additions as lossless JSON', async () => {
+  const [plugin, { Context }, { SystemPrompt }, { ToolRuntime }] = await Promise.all([
+    import('../index.js'), hostModule('@deepseek-ai/cordis'),
+    hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-tools'),
+  ]);
+  const root = mkdtempSync(join(tmpdir(), 'tidal-graph-host-'));
+  const cwd = join(root, 'workspace'), ctx = new Context(), fibers = [];
+  const session = { id: 'reader', header: { cwd }, snapshotEvents: () => [] };
+  const agent = { id: session.id, session, status: 'idle' };
+  let route, seed, related;
+  try {
+    const store = new MemorySpace(root, 'shared', { config: { residentBudget: 0 } });
+    try {
+      seed = store.create({ layer: 'L2', text: 'synthetic violet protocol' }, { admin: true });
+      related = store.create({ layer: 'L3', text: 'synthetic supporting knowledge' }, { admin: true });
+      store.graphDecision({ id: seed.id, otherId: related.id, decision: 'confirmed' }, { admin: true });
+    } finally { store.close(); }
+    ctx.provide('agents', { get: id => id === agent.id ? agent : undefined, list: () => [agent] });
+    ctx.provide('sessions', {});
+    ctx.provide('webServer', { register: value => { route = value; return () => {}; } });
+    ctx.provide('connection', { requestRejection: () => undefined });
+    ctx.provide('settings', { describe: () => [] });
+    for (const dependency of [SystemPrompt, ToolRuntime]) fibers.push(await ctx.plugin(dependency, {}));
+    fibers.push(await ctx.plugin(plugin, { dataRoot: root, bindings: [{ cwd, space: 'shared' }],
+      autoBackup: false, residentBudget: 0, graphRecall: true }));
+    const request = async (method, path, body) => {
+      const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
+      req.method = method;
+      req.url = `/tidal-memory${path}?space=shared`;
+      req.headers = { 'x-tidal-request': '1', 'content-type': 'application/json' };
+      const res = { writableEnded: false, setHeader() {}, end(value) { this.body = value; this.writableEnded = true; } };
+      await route.handler(req, res);
+      const value = JSON.parse(res.body);
+      assert.equal(value.ok, true, JSON.stringify(value));
+      return value.data;
+    };
+    await request('POST', '/graph/prepare', {});
+    let status;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      status = await request('GET', '/graph/status');
+      if (status.state === 'ready') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(status.state, 'ready');
+    const result = await ctx.tools.execute({
+      callId: 'graph-recall-output', name: 'tidal_recall', arguments: { query: 'violet protocol' },
+      agent, signal: new AbortController().signal,
+    });
+    assert.equal(result.isError, false, JSON.stringify(result));
+    assert.deepEqual(JSON.parse(result.content[0].text), result.value);
+    const graph = result.value.picked.find(item => item.id === related.id);
+    assert.equal(graph.graphRelation.kind, 'confirmed');
+    assert.equal(graph.graphRelation.seedId, seed.id);
+    assert.equal(graph.semanticScore, null);
+    assert.equal(graph.matched, false);
+  } finally {
+    for (const fiber of fibers.reverse()) await fiber.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 for (const embeddingMode of ['off', 'cpu']) {
   test(`real rc5 recall output is lossless JSON: ${embeddingMode === 'off' ? 'standard' : 'missing model fallback'}`, async () => {
