@@ -1,7 +1,7 @@
 {
   "name": "dsh-tidal-memory",
-  "version": "0.7.0",
-  "description": "四层独立存储、证据召回与受限私人记录的 DeepSeek Harness 记忆插件。",
+  "version": "0.8.0",
+  "description": "四层共享记忆、场景经历召回与受控 Markdown 私人日记的 DeepSeek Harness 插件。",
   "type": "module",
   "packageManager": "pnpm@11.28.5",
   "main": "index.js",
@@ -14,7 +14,7 @@
   },
   "files": ["index.js", "index.d.ts", "client.js", "src/backup-key.js", "src/database.js", "src/edition.json",
     "src/embedding-worker.js", "src/embedding.js", "src/forget-ledger.js", "src/graph-index.js", "src/graph-semantic.js", "src/graph.js",
-    "src/host-deps.js", "src/model-packs.js", "src/model.js", "src/private-journal.js", "src/runtime.js",
+    "src/host-deps.js", "src/journal-files.js", "src/model-packs.js", "src/model.js", "src/private-journal.js", "src/private-session-registry.js", "src/runtime.js",
     "src/semantic-index.js", "src/sleep-context.js", "src/store.js", "src/topic-index.js", "src/transfer.js",
     "scripts/setup-model.mjs", "scripts/bench-topics.mjs", "scripts/bench-backup.mjs",
     "cordis.patch.yml", "README.md", "CONTRIBUTING.md", "LICENSE"],

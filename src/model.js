@@ -18,6 +18,7 @@ export const DEFAULTS = Object.freeze({
   halfLifeDays: 30, bufferHours: 72, idleMinutes: 20,
   autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
   injectContext: true, autoBackup: true, autoBackupMode: 'plain', backupKeep: 14, privateWriters: [],
+  privateMainSessions: [], privateContributionsEnabled: false, privateContextBudget: 8000,
   deepOrganizationMode: 'local', privateOrganizationMode: 'local',
   graphRecall: false,
   embeddingMode: edition.embeddingMode, embeddingModelPath: '', embeddingDevice: 'auto',
@@ -95,6 +96,7 @@ export function configOf(raw = {}) {
     ['workingHours', 0, 8760],
     ['bufferHours', 1, 720], ['idleMinutes', 1, 1440], ['backupKeep', 1, 90],
     ['embeddingTimeoutSeconds', 5, 3600],
+    ['privateContextBudget', 1024, 32000],
   ]) number(result[key], min, max, key, true);
   requireValue(typeof result.dataRoot === 'string' && (result.dataRoot === '' || isAbsolute(result.dataRoot)), 'INVALID_CONFIG', '数据根目录必须是绝对路径。');
   requireValue(Array.isArray(result.bindings) && result.bindings.length <= 100, 'INVALID_CONFIG', '工作区绑定无效。');
@@ -110,6 +112,21 @@ export function configOf(raw = {}) {
     return { cwd: resolve(cwd), space: slug(binding.space) };
   });
   requireValue(Array.isArray(result.privateWriters) && result.privateWriters.every(v => typeof v === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(v)), 'INVALID_CONFIG', '私人作者列表无效。');
+  requireValue(typeof result.privateContributionsEnabled === 'boolean', 'INVALID_CONFIG', '私人贡献开关无效。');
+  requireValue(Array.isArray(result.privateMainSessions) && result.privateMainSessions.length <= 100,
+    'INVALID_CONFIG', '私人主会话列表无效。');
+  const privateSpaces = new Set();
+  result.privateMainSessions = result.privateMainSessions.map(item => {
+    requireValue(item && typeof item === 'object' && !Array.isArray(item), 'INVALID_CONFIG', '私人主会话条目无效。');
+    const space = slug(item.space);
+    const sessionId = string(item.sessionId, '主会话 ID', 256);
+    const provider = string(item.provider, '主会话 provider', 128);
+    const model = string(item.model, '主会话 model', 256);
+    requireValue(spaces.has(space), 'INVALID_CONFIG', '私人主会话必须属于一个已绑定的工作区。');
+    requireValue(!privateSpaces.has(space), 'INVALID_CONFIG', '每个工作区只能配置一个私人日记主会话。');
+    privateSpaces.add(space);
+    return { space, sessionId, provider, model };
+  });
   return result;
 }
 export function canonicalCwd(cwd) {

@@ -35,4 +35,4 @@ for (const [name, embeddingMode] of [['standard', 'off'], ['cpu', 'cpu'], ['enha
     console.log(`${target} (${verified.length} verified files)`);
   } finally { rmSync(staging, { recursive: true, force: true }); }
 }
-atomicFile(join(destination, 'SHA256SUMS'), checksums.join('\n') + '\n');
+atomicFile(join(destination, `SHA256SUMS-${manifest.version}`), checksums.join('\n') + '\n');

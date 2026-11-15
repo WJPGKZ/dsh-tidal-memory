@@ -11,9 +11,14 @@ const BATCH_SIZE = 100;
 const ordinaryLayers = ['L1', 'L2', 'L3'];
 const normalize = value => value.toWellFormed().normalize('NFKC').trim().toLowerCase();
 
-export function graphReferences(record) {
+export function graphReferences(record, sceneTitle = null) {
   if (record.layer === 'L0') return [];
   const refs = topicReferences(record);
+  const taskRef = record.source?.taskRef;
+  const sceneRef = record.source?.sceneRef;
+  if (typeof taskRef === 'string') refs.push({ id: `task-ref:${taskRef}`, kind: 'task', label: taskRef });
+  if (typeof sceneRef === 'string')
+    refs.push({ id: `scene-ref:${sceneRef}`, kind: 'scene', label: sceneTitle || sceneRef });
   for (const tag of record.tags ?? []) {
     const label = normalize(tag);
     if (label) refs.push({ id: `tag:${hash(label)}`, kind: 'tag', label });
@@ -32,7 +37,6 @@ export function graphDecisionHash(record) {
 export function graphPair(left, right) {
   return left < right ? [left, right] : [right, left];
 }
-
 export function clearGraphFiles(directory) {
   for (const file of ['graph.sqlite3', 'graph.sqlite3-wal', 'graph.sqlite3-shm'])
     rmSync(join(directory, 'indexes', file), { force: true });
@@ -69,7 +73,7 @@ export class GraphIndex {
 
   replace(record) {
     if (record.layer === 'L0') return;
-    const refs = graphReferences(record);
+    const refs = graphReferences(record, this.store.sceneTitle(record.source?.sceneRef));
     const parents = [...new Set(record.parents ?? [])].sort().slice(0, PARENT_LIMIT);
     const fingerprint = hash(JSON.stringify([record.layer, refs.map(ref => ref.id), parents]));
     if (this.db.prepare('SELECT fingerprint FROM documents WHERE id=?').get(record.id)?.fingerprint === fingerprint) return;
@@ -187,9 +191,10 @@ export class GraphIndex {
     for (const row of this.db.prepare('SELECT child AS id FROM parents WHERE parent=? AND child>? ORDER BY child LIMIT ?')
       .all(record.id, cursor, count)) add(row.id, { kind: 'source', id: null, label: '来源关联' });
     const members = this.db.prepare('SELECT id FROM members WHERE ref=? AND id>? ORDER BY id LIMIT ?');
-    for (const ref of graphReferences(record)) {
+    for (const ref of graphReferences(record, this.store.sceneTitle(record.source?.sceneRef))) {
       for (const row of members.all(ref.id, cursor, count)) add(row.id, ref);
     }
+
     const decisions = this.store.system.prepare('SELECT right_id AS id FROM graph_relations WHERE left_id=? AND right_id>? ORDER BY right_id LIMIT ?');
     const reverse = this.store.system.prepare('SELECT left_id AS id FROM graph_relations WHERE right_id=? AND left_id>? ORDER BY left_id LIMIT ?');
     for (const row of decisions.all(record.id, cursor, count)) add(row.id, { kind: 'manual', id: null, label: '人工修正' });

@@ -44,18 +44,37 @@ export const Config = z.object({
   autoBackupMode: z.string().default(DEFAULTS.autoBackupMode).volatile().description('plain 普通明文 / encrypted 普通加密 / encrypted-private 加密并包含私人日记；加密需要先设置 Windows 账户保护的口令。'),
   backupKeep: integer(DEFAULTS.backupKeep, 1, 90, '每空间保留的自动恢复点数量。'),
   privateWriters: z.array(z.string()).default([]).volatile().description('允许写私人记录的插件名称。第一版不自动生成私人日记。'),
+  privateContributionsEnabled: z.boolean().default(DEFAULTS.privateContributionsEnabled).volatile()
+    .description('允许绑定工作区内的会话提交私人日记贡献；贡献者不能读取或整理私人正文。'),
+  privateContextBudget: integer(DEFAULTS.privateContextBudget, 1024, 32000, '每次主会话请求最多注入的私人日记 UTF-8 字节数；长日记分段回顾。'),
+  privateMainSessions: z.array(z.object({
+    space: z.string(), sessionId: z.string(), provider: z.string(), model: z.string(),
+  })).default([]).volatile()
+    .description('按工作区绑定私人日记主会话及精确模型路由。日记进入宿主会话历史；路由不匹配或历史被 fork 继承时阻止请求。'),
 });
 
 export function apply(ctx, rawConfig = {}) {
   const runtime = new TidalRuntime(ctx, rawConfig, resolveDshHome());
   ctx.effect(() => () => runtime.close());
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler: (req, res) => runtime.handle(req, res) }));
+  for (const agent of ctx.agents.list()) runtime.attachPrivateAgent(agent);
+  ctx.on('agent/created', value => runtime.attachPrivateAgent(value?.agent ?? value), { global: true });
   ctx.on('session/event', (session, event) => runtime.onEvent(session, event), { global: true });
   ctx.on('agent/pre-step', (payload, next) => runtime.preStep(payload, next), { global: true });
-  ctx.on('agent/disposed', ({ agent }) => runtime.sessions.delete(agent.id), { global: true });
+  ctx.on('agent/disposed', ({ agent }) => {
+    runtime.sessions.delete(agent.id);
+    runtime.privateCandidates.delete(agent.id);
+    runtime.pendingPrivateObservations.delete(agent.id);
+    runtime.privateAgentDisposers.get(agent.id)?.();
+    runtime.privateAgentDisposers.delete(agent.id);
+  }, { global: true });
   ctx.effect(() => ctx.systemPrompt.context({
     name: 'tidal-memory', order: 950, interpolate: false,
     text: context => runtime.context(context),
+  }));
+  ctx.effect(() => ctx.systemPrompt.context({
+    name: 'tidal-private-journal', order: 951, interpolate: false,
+    text: context => runtime.privateContext(context),
   }));
   const output = { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] };
   const text = description => ({ type: 'string', description, required: true });
@@ -113,10 +132,21 @@ export function apply(ctx, rawConfig = {}) {
         return result;
       },
     },
+    {
+      name: 'tidal_private_contribute', description: '向当前绑定工作区当天唯一的私人 Markdown 日记提交一条贡献；不读取日记正文，接收成功不代表主会话已回顾。',
+      parameters: { content: text('要提交的私人日记贡献'), operationId: { type: 'string', description: '可选的幂等重试 ID。' } },
+      execute: async (args, exec) => runtime.privateContribution(exec.agent, args.content, args.operationId),
+    },
+    {
+      name: 'tidal_private_journal_commit', description: '仅授权主会话可用：提交已完整回顾版本的日记整理段；结果只返回状态、日期和版本，不回显私人正文。',
+      parameters: { day: text('被回顾日记的日期 YYYY-MM-DD'), expectedHash: text('读取时的 Markdown SHA-256 版本'),
+        markdown: text('整理后的 Markdown 正文') },
+      execute: async (args, exec) => runtime.organizePrivateForAgent(exec.agent, args),
+    },
   ];
   for (const definition of definitions) ctx.effect(() => ctx.tools.register(defineTool({ ...definition, output })));
   ctx.provide('tidalMemory', Object.freeze({
-    version: 1,
+    version: 3,
     forAgent(agent) {
       const access = () => runtime.forAgent(agent);
       return Object.freeze({
@@ -132,6 +162,44 @@ export function apply(ctx, rawConfig = {}) {
           const { store, actor } = access();
           return store.readEvidence(options, actor);
         },
+        recordEvent: input => {
+          const { store, actor, space } = access();
+          const result = store.recordEvent(input, actor);
+          runtime.invalidateSpace(space);
+          return result;
+        },
+        createScene: input => {
+          const { store, actor, space } = access();
+          const result = store.createScene(input, actor);
+          runtime.invalidateSpace(space);
+          return result;
+        },
+        joinScene: sceneRef => {
+          const { store, actor, space } = access();
+          const result = store.joinScene(sceneRef, actor);
+          runtime.invalidateSpace(space);
+          return result;
+        },
+        scenes() {
+          const { store, actor } = access();
+          return store.listScenes(actor);
+        },
+        setFocus: input => {
+          const { store, actor, space } = access();
+          const result = store.setSessionFocus(input, actor);
+          runtime.invalidateSpace(space);
+          return result;
+        },
+        focus() {
+          const { store, actor } = access();
+          return store.sessionFocus(actor);
+        },
+        changes: (cursor, limit) => {
+          const { store, actor } = access();
+          return store.changePage(actor, cursor, limit);
+        },
+        contributePrivate: input => runtime.privateContribution(agent, input.content, input.operationId),
+        organizePrivateDay: input => runtime.organizePrivateForAgent(agent, input),
       });
     },
     privateWriter(ownerContext) {

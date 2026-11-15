@@ -267,25 +267,38 @@ test('failed publication rolls back lineage registration and markers', t => {
 test('private aliases are forgotten across live copies and older fragment backups', t => {
   const { root, space, open } = fixture(t);
   const at = new Date().toISOString();
-  const insert = space.privateDb.prepare('INSERT INTO entries VALUES(?,?,?,?,?)');
-  insert.run('old-private-a', 'test-author', 'PRIVATE_FRAGMENT_A', at, '[]');
-  insert.run('old-private-b', 'test-author', 'PRIVATE_FRAGMENT_B', at, '[]');
-  const fragments = packBackup(space, password);
-  const merged = space.appendPrivate('test-author', 'PRIVATE_FRAGMENT_C');
-  assert.equal(space.privateDb.prepare('SELECT entry_id FROM entry_aliases WHERE alias_id=?')
-    .get('old-private-b').entry_id, merged.id);
-  const mergedBackup = packBackup(space, password);
-  restoreBackup(root, 'private-live-copy', mergedBackup, password, space.config);
+  const legacyDocument = space.snapshot({ includePrivate: true });
+  legacyDocument.version = 2;
+  delete legacyDocument.privateFiles;
+  delete legacyDocument.privateDays;
+  delete legacyDocument.privateMetadata;
+  legacyDocument.privateEntries = [
+    { id: 'old-private-a', author: 'test-author', content: 'PRIVATE_FRAGMENT_A', created_at: at, source_ids: '[]' },
+    { id: 'old-private-b', author: 'test-author', content: 'PRIVATE_FRAGMENT_B', created_at: at, source_ids: '[]' },
+  ];
+  legacyDocument.privateAliases = [{ alias_id: 'old-private-b-alias', entry_id: 'old-private-b' }];
+  legacyDocument.privatePending = [{ entry_id: 'old-private-a' }];
+  legacyDocument.privateForgottenIds = [];
+  const fragments = packBackup({ snapshot: () => legacyDocument }, password);
+  restoreBackup(root, 'private-live-copy', fragments, password, space.config);
   const copy = open(root, 'private-live-copy');
-  space.clearPrivate(admin, 'DELETE PRIVATE JOURNAL');
+  const merged = copy.appendPrivate('test-author', 'PRIVATE_FRAGMENT_C');
+  assert.notEqual(merged.id, 'old-private-a');
+  assert.equal(copy.privateDb.prepare('SELECT entry_id FROM entry_aliases WHERE alias_id=?')
+    .get('old-private-b-alias').entry_id, 'old-private-b');
+  const mergedBackup = packBackup(copy, password);
+  restoreBackup(root, 'private-live-copy-2', mergedBackup, password, space.config);
+  const secondCopy = open(root, 'private-live-copy-2');
+  copy.clearPrivate(admin, 'DELETE PRIVATE JOURNAL');
   assert.equal(copy.privateStatus().count, 0);
+  assert.equal(secondCopy.privateStatus().count, 0);
   assert.equal(copy.privateDb.prepare('SELECT count(*) AS n FROM entry_aliases').get().n, 0);
   assert.equal(copy.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 0);
   const result = restoreBackup(root, 'old-fragments', fragments, password, space.config);
   assert.equal(result.privateCount, 0);
   assert.equal(result.skippedPrivate, 2);
   const fresh = copy.appendPrivate('test-author', 'NEW_AFTER_CLEAR');
-  assert.notEqual(fresh.id, merged.id);
+  assert.notEqual(fresh.id, 'old-private-a');
 });
 
 test('private clear blocks old same-root encrypted restore without exposing the private text', t => {

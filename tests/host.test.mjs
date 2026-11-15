@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { hostModule } from '../src/host-deps.js';
+import { openDatabase } from '../src/database.js';
 import { configOf } from '../src/model.js';
 import { MemorySpace } from '../src/store.js';
 import { prepareHost } from './host-env.mjs';
@@ -145,13 +147,29 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
   const cwd = join(root, 'workspace');
   const ctx = new Context();
   const tools = new Map(), routes = new Map(), agents = new Map();
-  const session = { id: 'session-a', header: { cwd }, snapshotEvents: () => [] };
-  const agent = { id: session.id, session, status: 'idle' };
+  const session = { id: 'session-a', header: { cwd }, snapshotEvents: () => [],
+    requestContext: () => ({ provider: 'fixture-provider', model: 'fixture-model' }) };
+  let requestHook;
+  const agent = { id: session.id, session, status: 'idle',
+    ctx: { on(name, callback) {
+      assert.equal(name, 'agent/request');
+      requestHook = callback;
+      return () => { requestHook = null; };
+    } } };
   agents.set(agent.id, agent);
   let fiber, promptFiber, writerFiber, writer;
   const raw = { dataRoot: root, bindings: [{ cwd, space: 'shared' }], autoBackup: false,
-    privateWriters: ['fixture-author'] };
+    privateWriters: ['fixture-author'], privateContributionsEnabled: true,
+    privateMainSessions: [{ space: 'shared', sessionId: 'session-a',
+      provider: 'fixture-provider', model: 'fixture-model' }] };
   try {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const priorStore = new MemorySpace(root, 'shared', {
+      config: { privateWriters: ['fixture-author'] }, clock: () => yesterday.getTime(),
+    });
+    priorStore.appendPrivate('fixture-author', 'PRIVATE_CONTEXT_CANARY');
+    priorStore.close();
     const modules = process.env.TIDAL_HOST_MODULES, entry = process.argv[1];
     try {
       delete process.env.TIDAL_HOST_MODULES;
@@ -174,8 +192,10 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     assert.equal(configOf(fiber.config).tokenBudget, 48000);
     assert.equal(configOf(fiber.config).dailyConsolidateAt, '03:00');
     assert.equal(configOf(fiber.config).workingHours, 24);
+    assert.equal(configOf(fiber.config).privateContextBudget, 8000);
     assert.equal(routes.size, 1);
-    assert.deepEqual([...tools.keys()].sort(), ['tidal_correct', 'tidal_read_evidence', 'tidal_recall', 'tidal_remember', 'tidal_timeline']);
+    assert.deepEqual([...tools.keys()].sort(), ['tidal_correct', 'tidal_private_contribute', 'tidal_private_journal_commit',
+      'tidal_read_evidence', 'tidal_recall', 'tidal_remember', 'tidal_timeline']);
     const record = await tools.get('tidal_remember').execute({ text: '候选主题', layer: 'L3' }, { agent });
     assert.equal(record.status, 'active');
     const corrected = await tools.get('tidal_correct').execute({
@@ -184,9 +204,51 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     assert.equal(corrected.kind, 'inference');
     assert.equal(corrected.status, 'active');
     await assert.rejects(() => tools.get('tidal_remember').execute({ text: 'bad', layer: 'L9' }, { agent }));
+    const memory = ctx.tidalMemory.forAgent(agent);
+    assert.equal(ctx.tidalMemory.version, 3);
+    const task = memory.proposeMemory({ layer: 'L1', text: 'synthetic worker task' });
+    assert.equal(memory.setFocus({ taskRef: task.id }).task.id, task.id);
+    const sceneInput = { title: 'Synthetic shared scene', operationId: randomUUID() };
+    const scene = memory.createScene(sceneInput);
+    assert.equal(memory.createScene(sceneInput).id, scene.id);
+    const secondSession = { id: 'session-b', header: { cwd }, snapshotEvents: () => [],
+      requestContext: () => ({ provider: 'fixture-provider', model: 'fixture-model' }) };
+    const secondAgent = { id: secondSession.id, session: secondSession, status: 'idle' };
+    agents.set(secondAgent.id, secondAgent);
+    const secondMemory = ctx.tidalMemory.forAgent(secondAgent);
+    assert.equal(secondMemory.joinScene(scene.id).memberCount, 2);
+    secondMemory.setFocus({ sceneRef: scene.id });
+    const sceneEvent = secondMemory.recordEvent({ text: 'synthetic cross-session scene result', eventType: 'result',
+      operationId: randomUUID(), sceneRef: scene.id });
+    memory.setFocus({ taskRef: task.id, sceneRef: scene.id });
+    assert.ok(memory.scenes().some(item => item.id === scene.id));
+    assert.ok(memory.recall('unrelated query').picked.some(item =>
+      item.id === sceneEvent.id && item.channel === 'association'));
+    const eventInput = { text: 'synthetic worker result', eventType: 'result',
+      operationId: randomUUID(), taskRef: task.id, sceneRef: scene.id };
+    const event = memory.recordEvent(eventInput);
+    assert.equal(event.layer, 'L2');
+    assert.equal(event.kind, 'observation');
+    assert.ok(event.parents.includes(task.id));
+    assert.equal(memory.recordEvent(eventInput).id, event.id);
+    assert.throws(() => memory.recordEvent({ ...eventInput, text: 'different result' }),
+      error => error.code === 'OPERATION_CONFLICT');
+    let page = memory.changes(null, 1);
+    const changes = [...page.items];
+    while (page.hasMore) {
+      page = memory.changes(page.cursor, 1);
+      changes.push(...page.items);
+    }
+    assert.ok(changes.some(item => item.id === event.id && item.layer === 'L2'));
+    assert.equal(memory.changes(page.cursor, 20).hasMore, false);
+    assert.equal(memory.focus().taskRef, task.id);
+    assert.equal(memory.setFocus({}).taskRef, null);
     const text = '记住：以后合成模板 {{must_stay_literal}} 是长期测试知识。';
     ctx.emit('session/event', session, { type: 'user/message', seq: 1, time: Date.now(),
       data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] } });
+    const privateAssembly = await ctx.systemPrompt.assemble({ agent });
+    const privateContext = privateAssembly.contexts.find(value => value.name === 'tidal-private-journal');
+    assert.match(privateContext.text, /PRIVATE_CONTEXT_CANARY/);
     const disposeComplete = ctx.systemPrompt.section({
       name: 'synthetic-complete', order: 1, text: 'complete section', complete: true,
     });
@@ -204,8 +266,42 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     const firstPrivate = writer.append('shared', 'PRIVATE_HOST_CANARY');
     const secondPrivate = writer.append('shared', 'PRIVATE_HOST_SECOND_CANARY');
     assert.equal(firstPrivate.saved, true);
-    assert.equal(secondPrivate.id, firstPrivate.id);
-    assert.ok(secondPrivate.revision > firstPrivate.revision);
+    assert.notEqual(secondPrivate.id, firstPrivate.id);
+    assert.equal(secondPrivate.revision, 1);
+    const contribution = ctx.tidalMemory.forAgent(agent).contributePrivate({ content: 'SESSION_CONTRIBUTION_CANARY' });
+    assert.equal(contribution.saved, true);
+    assert.match(contribution.day, /^\d{4}-\d{2}-\d{2}$/);
+    assert.equal(JSON.stringify(contribution).includes('SESSION_CONTRIBUTION_CANARY'), false);
+    const contributionDb = openDatabase(join(root, 'spaces', 'shared', 'private', 'journal.sqlite3'));
+    assert.equal(contributionDb.prepare('SELECT source_session FROM entries WHERE id=?')
+      .get(contribution.id).source_session, 'session-a');
+    contributionDb.close();
+    await assert.rejects(() => requestHook({ turn: 1, step: 1 },
+      async () => ({ provider: 'unapproved-provider', model: 'unapproved-model' })),
+    { code: 'PRIVATE_ROUTE_UNAUTHORIZED' });
+    assert.deepEqual(await requestHook({ turn: 1, step: 1 },
+      async () => ({ provider: 'fixture-provider', model: 'fixture-model' })),
+    { provider: 'fixture-provider', model: 'fixture-model' });
+    const beforeReply = openDatabase(join(root, 'spaces', 'shared', 'private', 'journal.sqlite3'));
+    assert.equal(beforeReply.prepare('SELECT count(*) AS n FROM journal_observations').get().n, 0);
+    beforeReply.close();
+    ctx.emit('session/event', session, { type: 'assistant/message', time: Date.now(),
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'synthetic response' }] },
+        stream: [] } });
+    const afterReply = openDatabase(join(root, 'spaces', 'shared', 'private', 'journal.sqlite3'));
+    assert.equal(afterReply.prepare('SELECT count(*) AS n FROM journal_observations').get().n, 1);
+    afterReply.close();
+    const childSession = { id: 'private-fork', header: { cwd, parentSession: 'session-a' }, snapshotEvents: () => [] };
+    const childAgent = { id: childSession.id, session: childSession, status: 'idle' };
+    agents.set(childAgent.id, childAgent);
+    const decision = await ctx.events.waterfall(ctx, 'agent/pre-step', {
+      agent: childAgent, signal: new AbortController().signal,
+    }, () => ({ kind: 'enter', messages: [] }));
+    assert.equal(decision.kind, 'reject');
+    const privacyCheck = openDatabase(join(root, 'system', 'private-sessions.sqlite3'));
+    assert.equal(privacyCheck.prepare('SELECT state FROM private_sessions WHERE session_id=?')
+      .get(childAgent.id).state, 'inherited');
+    privacyCheck.close();
     assert.throws(() => ctx.tidalMemory.privateWriter({}), /真实 Context/);
     assert.equal(ctx.tidalMemory.forAgent(agent).recall('PRIVATE_HOST_CANARY').text.includes('PRIVATE_HOST_CANARY'), false);
     await writerFiber.dispose();

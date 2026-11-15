@@ -188,8 +188,9 @@ test('scheduled sleep creates bounded review candidates and resumes without dupl
   assert.equal(candidate.kind, 'inference');
   assert.deepEqual(candidate.parents, [answer.id, question.id]);
   assert.equal(store.recall('pnpm', { sessionId: 'another' }).picked.length, 0);
-  assert.equal(store.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(journal.id).content,
-    'PRIVATE_SLEEP_FIRST\nSECOND');
+  const journalPath = store.privateDb.prepare('SELECT relative_path FROM entries WHERE id=?').get(journal.id).relative_path;
+  assert.match(readFileSync(join(store.privateDirectory, ...journalPath.split('/')), 'utf8'),
+    /PRIVATE_SLEEP_FIRST\r?\nSECOND/);
   assert.equal(store.privateStatus().count, 1);
   assert.equal(store.status().encoding.sleep.candidates, 1);
   await runtime.close();
@@ -367,6 +368,57 @@ test('context injection can be disabled and workspace mutations invalidate every
   runtime.invalidateSpace('shared');
   assert.equal(runtime.sessions.get(agent.id).context, null);
   assert.equal(runtime.sessions.get(other.id).context, null);
+});
+
+test('registered subagent sessions share only their explicitly bound workspace memory', async t => {
+  const { runtime, agent, agents, cwd } = fixture(t, { residentBudget: 0 });
+  const workerSession = {
+    id: 'worker-session',
+    header: { cwd, origin: 'subagent' },
+    snapshotEvents: () => [],
+  };
+  const worker = { id: workerSession.id, status: 'idle', session: workerSession };
+  agents.push(worker);
+
+  const shared = runtime.space('shared');
+  const experience = shared.create({ layer: 'L2', text: 'shared worker experience' }, { admin: true });
+  const access = runtime.forAgent(worker);
+  assert.equal(access.space, 'shared');
+  const task = shared.create({ layer: 'L1', category: 'task', text: 'worker task for cobalt build' }, { admin: true });
+  shared.setSessionFocus({ taskRef: task.id }, access.actor);
+  assert.equal(runtime.queryWindow({ query: '', recent: [] }, shared, access.actor).query, task.text);
+  await runtime.preStep({ agent: worker }, async () => ({
+    kind: 'enter',
+    messages: [{ role: 'user', source: { kind: 'user' },
+      content: [{ type: 'text', text: 'worker experience' }] }],
+  }));
+  assert.match(runtime.context({ agent: worker }), /shared worker experience/);
+  const cursor = shared.changePage(access.actor, null, 200).cursor;
+  runtime.onEvent(workerSession, {
+    type: 'user/message', seq: 1, time: Date.now(),
+    data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '记住：worker result persisted' }] },
+  });
+  assert.ok(shared.all().some(record => record.sessionId === worker.id && record.text === 'worker result persisted'));
+  shared.forget(experience.id, { admin: true });
+  assert.ok(shared.changePage(access.actor, cursor, 200).items.some(item =>
+    item.id === experience.id && item.status === 'forgotten'));
+
+  const otherWorkspaceSession = {
+    id: 'unbound-worker',
+    header: { cwd: `${cwd}-other`, origin: 'subagent' },
+    snapshotEvents: () => [],
+  };
+  const unboundWorker = { id: otherWorkspaceSession.id, status: 'idle', session: otherWorkspaceSession };
+  agents.push(unboundWorker);
+  assert.throws(() => runtime.forAgent(unboundWorker), error => error.code === 'UNBOUND_WORKSPACE');
+  assert.equal(runtime.context({ agent: unboundWorker }), '');
+  runtime.onEvent({ ...workerSession, id: 'unregistered-session' }, {
+    type: 'user/message', seq: 2, time: Date.now(),
+    data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'unregistered event' }] },
+  });
+  assert.equal(shared.all().some(record => record.text === 'unregistered event'), false);
+
+  assert.equal(agents.includes(agent), true);
 });
 
 test('cached context is not returned when a same-lineage forget arrives during the read', t => {

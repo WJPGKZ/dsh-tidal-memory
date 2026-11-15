@@ -70,7 +70,7 @@ function neighborsOnce(store, { id, cursor = '', limit = 50, mode = 'current', a
     const candidate = candidates.items[i];
     last = candidate.id;
     const other = store.rawOrdinary(candidate.id);
-    if (!other || !scope.accept(other) || center.layer !== 'L3' && other.layer !== 'L3') continue;
+    if (!other || !scope.accept(other)) continue;
     const relation = relationFor(store, center, other, candidate.reasons);
     if (!relation) continue;
     items.push({ ...graphNode(other), relation });
@@ -175,8 +175,8 @@ export function graphDecision(store, { id, otherId, decision, revision, otherRev
   requireValue((revision === undefined || revision === first.revision) &&
     (otherRevision === undefined || otherRevision === second.revision),
   'REVISION_CONFLICT', '记忆已变化，请刷新节点后重新修正关联。', 409);
-  requireValue(first.layer === 'L3' || second.layer === 'L3', 'INVALID_RELATION',
-    '图谱关联至少需要一条 L3 记忆。');
+  requireValue(first.layer !== 'L0' && second.layer !== 'L0', 'INVALID_RELATION',
+    'L0 短期缓冲不能成为图谱节点。');
   const [left, right] = graphPair(first.id, second.id);
   if (decision === 'reset') store.system.prepare('DELETE FROM graph_relations WHERE left_id=? AND right_id=?').run(left, right);
   else {
@@ -206,7 +206,7 @@ export function confirmedGraphNeighbors(store, center, scope) {
   const result = [];
   for (const row of rows) {
     const other = store.rawOrdinary(row.left_id === center.id ? row.right_id : row.left_id);
-    if (!other || !scope.accept(other) || center.layer !== 'L3' && other.layer !== 'L3') continue;
+    if (!other || !scope.accept(other)) continue;
     const left = row.left_id === center.id ? center : other;
     const right = row.right_id === center.id ? center : other;
     if (graphDecisionHash(left) !== row.left_hash || graphDecisionHash(right) !== row.right_hash) continue;

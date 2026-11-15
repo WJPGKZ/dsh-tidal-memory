@@ -91,6 +91,8 @@ for (const scenario of [
       }
       assert.equal(requests.length, 2, JSON.stringify(agent.session.snapshotEvents()));
       const request = requests.at(-1);
+      assert.equal(request.provider, 'synthetic');
+      assert.equal(request.model, 'no-network');
       assert.equal(Object.isFrozen(request.messages), true);
       assert.match(JSON.stringify(request.messages), /PROMPT_CANARY/);
       const contexts = request.messages.filter(message => message.source?.kind === 'runtime-context');
@@ -120,3 +122,31 @@ for (const scenario of [
     }
   });
 }
+
+test('real rc5 fork sessions retain the exact seeded conversation prefix', async () => {
+  const [{ Context }, { SessionStore }, { createUserMessage }] = await Promise.all([
+    hostModule('@deepseek-ai/cordis'), hostModule('@deepseek-ai/dsh-session'), hostModule('@deepseek-ai/dsh-llm'),
+  ]);
+  const ctx = new Context(), fibers = [];
+  try {
+    fibers.push(await ctx.plugin(SessionStore, {}));
+    const cwd = join(tmpdir(), 'tidal-fork-contract');
+    const parent = ctx.sessions.create('private-parent', { meta: { cwd } });
+    parent.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'PRIVATE_FORK_CANARY' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' });
+    const inherited = parent.snapshotEvents();
+    const fork = ctx.sessions.create('private-fork', {
+      seed: inherited, inheritedEventCount: inherited.length,
+      meta: { cwd, parentSession: parent.id, isSeeded: true, origin: 'subagent', delegationDepth: 1 },
+    });
+
+    assert.equal(fork.header.isSeeded, true);
+    assert.equal(fork.header.parentSession, parent.id);
+    assert.equal(fork.header.origin, 'subagent');
+    assert.equal(fork.inheritedEventCount, inherited.length);
+    assert.match(JSON.stringify(fork.snapshotEvents().slice(0, fork.inheritedEventCount)), /PRIVATE_FORK_CANARY/);
+  } finally {
+    for (const fiber of fibers.reverse()) await fiber.dispose();
+  }
+});

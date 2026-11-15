@@ -38,6 +38,7 @@ test('graph uses explicit ordinary evidence, pages and classifications without c
   const center = create(space, 'synthetic center', {
     layer: 'L3', topics: ['orchid'], tags: ['stable'], parents: [source.id],
   });
+
   const topic = create(space, 'synthetic topic', { topics: ['orchid'] });
   const tag = create(space, 'synthetic tag', { tags: ['stable'] });
   const isolated = create(space, 'synthetic isolated', { layer: 'L3' });
@@ -82,7 +83,7 @@ test('manual decisions survive rebuild and backup, become stale on content chang
   assert.equal(space.graphNeighbors({ id: center.id }, reader).items[0].relation.kind, 'excluded');
   const backup = packBackup(space);
   const envelope = JSON.parse(backup);
-  assert.equal(envelope.version, 2);
+  assert.equal(envelope.version, 3);
   assert.equal(unpackBackup(backup).graphRelations.length, 1);
   space.graphIndex.close();
   space.graphIndex = null;
@@ -129,6 +130,16 @@ test('version-one encrypted snapshots still restore ordinary and private records
   const document = unpackBackup(packBackup(space, password), password);
   document.version = 1;
   delete document.graphRelations;
+  document.privateEntries = document.privateEntries.map(entry => ({
+    id: entry.id, author: entry.author, created_at: entry.created_at,
+    source_ids: entry.source_ids, content: 'SYNTHETIC_LEGACY_PRIVATE'
+  }));
+  delete document.privateFiles;
+  delete document.privateDays;
+  delete document.privateMetadata;
+  delete document.privateAliases;
+  delete document.privatePending;
+  delete document.privateForgottenIds;
   const salt = randomBytes(16), iv = randomBytes(12), key = scryptSync(password, salt, 32);
   let envelope;
   try {
@@ -312,6 +323,53 @@ test('graph index yields when paused and invalidates on edits, expiry and restar
   const reopened = open('shared');
   await reopened.graph().sync();
   assert.equal(reopened.graphNeighbors({ id: center.id, mode: 'history' }, reader).items.length, 1);
+});
+
+test('L2 scene links support cross-session recall, confirmed relations and backup restore', async t => {
+  const { root, space, open } = fixture(t);
+  const owner = { sessionId: 'synthetic-scene-owner' }, worker = { sessionId: 'synthetic-scene-worker' };
+  const scene = space.createScene({ title: 'Synthetic deployment run', operationId: '00000000-0000-0000-0000-000000000101' }, owner);
+  space.joinScene(scene.id, worker);
+  const first = space.recordEvent({ text: 'synthetic deployment started', eventType: 'observation',
+    operationId: '00000000-0000-0000-0000-000000000102', sceneRef: scene.id }, owner);
+  const second = space.recordEvent({ text: 'synthetic deployment completed', eventType: 'result',
+    operationId: '00000000-0000-0000-0000-000000000103', sceneRef: scene.id }, worker);
+  await space.graph().sync();
+  assert.equal(space.graphNeighbors({ id: first.id }, owner).items[0].id, second.id);
+  space.graphDecision({ id: first.id, otherId: second.id, decision: 'confirmed' }, admin);
+  assert.equal(space.graphNeighbors({ id: first.id }, owner).items[0].relation.kind, 'confirmed');
+  space.setSessionFocus({ sceneRef: scene.id }, owner);
+  assert.ok(space.recall('unrelated query', owner).picked.some(item =>
+    item.id === second.id && item.channel === 'association'));
+  const backup = packBackup(space);
+  restoreBackup(root, 'scene-restored', backup, '', space.config);
+  const restored = open('scene-restored');
+  assert.equal(restored.listScenes(owner)[0].id, scene.id);
+  restored.setSessionFocus({ sceneRef: scene.id }, owner);
+  assert.ok(restored.recall('unrelated query', owner).picked.some(item =>
+    item.id === second.id && item.channel === 'association'));
+  assert.equal(restored.graphDecision({ id: first.id, otherId: second.id, decision: 'reset' }, admin).decision, 'reset');
+});
+
+test('twenty scene sessions can interleave and retry one thousand idempotent event writes', t => {
+  const { space } = fixture(t);
+  const actors = Array.from({ length: 20 }, (_, index) => ({ sessionId: `synthetic-worker-${index}` }));
+  const scene = space.createScene({ title: 'Synthetic interleaved run',
+    operationId: '00000000-0000-0000-0000-000000000201' }, actors[0]);
+  for (const actor of actors.slice(1)) space.joinScene(scene.id, actor);
+  const ids = new Set();
+  for (let index = 0; index < 1000; index++) {
+    const actor = actors[index % actors.length];
+    const input = { text: `synthetic event ${index}`, eventType: 'result',
+      operationId: `00000000-0000-0000-0000-${String(index + 202).padStart(12, '0')}`,
+      sceneRef: scene.id };
+    const first = space.recordEvent(input, actor);
+    assert.equal(space.recordEvent(input, actor).id, first.id);
+    ids.add(first.id);
+  }
+  assert.equal(ids.size, 1000);
+  assert.equal(space.db('L2').prepare('SELECT count(*) AS n FROM memories').get().n, 1000);
+  assert.equal(space.system.prepare('SELECT count(*) AS n FROM scene_records WHERE scene_id=?').get(scene.id).n, 1000);
 });
 
 test('a paused graph build resumes after its last completed batch', async t => {

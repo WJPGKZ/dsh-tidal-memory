@@ -394,6 +394,26 @@ window.__ModuleLoader__.load({
       const saveConfig = () => run(() => request(space, '/config', {
         revision: status.settingsRevision, patch: config,
       }), '设置已保存。');
+      const privateMain = config?.privateMainSessions?.find(item => item.space === space) ?? null;
+      const setPrivateMain = patch => {
+        if (!privateMain) return;
+        patchConfig('privateMainSessions', [
+          ...config.privateMainSessions.filter(item => item.space !== space),
+          { ...privateMain, ...patch },
+        ]);
+      };
+      const selectPrivateMain = sessionId => {
+        const remaining = config.privateMainSessions.filter(item => item.space !== space);
+        if (sessionId) {
+          const session = status.sessions.find(item => item.id === sessionId);
+          remaining.push({
+            space, sessionId,
+            provider: session?.provider || privateMain?.provider || '',
+            model: session?.model || privateMain?.model || '',
+          });
+        }
+        patchConfig('privateMainSessions', remaining);
+      };
       const saveDraft = () => run(async () => {
         const patch = {
           text: draft.text, category: draft.category, status: draft.status, kind: draft.kind,
@@ -599,27 +619,41 @@ window.__ModuleLoader__.load({
       else if (tab === 'private') content = h('div', { className: 'stack' },
         h('div', { className: 'private-card stack' }, h('div', { className: 'eyebrow' }, 'PRIVATE JOURNAL'),
           h('h2', null, '私人记录，不展示正文'),
-          h('p', null, `${status.private.count} 篇 · ${(status.private.bytes / 1024).toFixed(1)} KiB`),
-          h('p', { className: 'muted' }, `按日管理 ${status.private.dailyCount ?? 0} 篇 · 旧记录 ${status.private.legacyCount ?? 0} 篇 · 日期范围 ${status.private.firstDay || '暂无'} 至 ${status.private.lastDay || '暂无'}`),
+          h('p', null, `${status.private.count} 条 · ${(status.private.bytes / 1024).toFixed(1)} KiB`),
+          h('p', { className: 'muted' }, `每日 Markdown 文件 ${status.private.dailyCount ?? 0} 份 · 旧记录 ${status.private.legacyCount ?? 0} 条 · 日期范围 ${status.private.firstDay || '暂无'} 至 ${status.private.lastDay || '暂无'}`),
           h('p', { className: 'muted' }, `最近写入：${status.private.lastWritten || '尚无记录'}`),
           h('p', null, status.private.generation),
           h('p', { className: 'path' }, status.private.directory),
-          h('small', null, '不出现在普通搜索、模型召回和明文备份中。此隔离不是对本机管理员或其他任意文件工具的绝对保密。')),
+          h('small', null, '不出现在普通搜索、图谱和明文备份中。主会话回顾时，日记片段会进入该会话历史；此隔离不是对本机管理员或其他任意文件工具的绝对保密。')),
         h('div', { className: 'panel stack' },
-          h('label', null, h('span', null, '私人日记整理方式'),
-            h('select', { 'aria-label': '私人日记整理方式', value: config.privateOrganizationMode,
-              onChange: event => patchConfig('privateOrganizationMode', event.target.value) },
-            h('option', { value: 'local' }, '本地轻整理（默认）'),
-            h('option', { value: 'author', disabled: true }, '调用作者自己的模型（暂不可用）'))),
-          h('small', null, status.organizationModels?.private?.message),
+          h('h3', null, '同工作区主会话回顾'),
+          h('p', { className: 'muted' }, '仅指定会话可收到昨日及更早的私人日记片段；模型路由必须与设置一致。插件不显示日记正文，也不自动授权其他会话。'),
+          h('label', null, h('span', null, '主会话'),
+            h('select', { 'aria-label': '私人日记主会话', value: privateMain?.sessionId ?? '',
+              onChange: event => selectPrivateMain(event.target.value) },
+            h('option', { value: '' }, '未启用（默认）'),
+            ...(privateMain && !status.sessions.some(item => item.id === privateMain.sessionId) ?
+              [h('option', { key: privateMain.sessionId, value: privateMain.sessionId },
+                `${privateMain.sessionId}（当前未运行）`)] : []),
+            ...status.sessions.map(session => h('option', { key: session.id, value: session.id },
+              `${session.id} · ${session.status} · ${session.origin}`)))),
+          privateMain ? h('div', { className: 'fields' },
+            field('Provider ID', privateMain.provider, value => setPrivateMain({ provider: value })),
+            field('Model ID', privateMain.model, value => setPrivateMain({ model: value }))) : null,
+          field('主会话日记上下文预算（字节）', config.privateContextBudget,
+            value => patchConfig('privateContextBudget', value), 'number', { min: 1024, max: 32000, step: 512 }),
+          check('允许同工作区其他会话提交私人日记贡献（默认关闭）', config.privateContributionsEnabled,
+            value => patchConfig('privateContributionsEnabled', value)),
+          h('small', null, `待主会话回顾 ${status.private.reviewPendingDays ?? 0} 天 · 已完整观察 ${status.private.observedDays ?? 0} 天 · 近期日记按上下文预算分段提供。`),
+          button('保存主会话设置', saveConfig, 'primary'),
+          h('small', null, '主会话历史会保留已注入的私人片段。若会话被 fork、路由不符或继承了私人历史，插件会拒绝其继续运行；清空日记不会自动解除已污染会话的限制。'),
           status.private.failure ? h('p', { className: 'message error' },
-            `私人轻整理在 ${status.private.failure.at} 未完成，已完成条目保留；可单独重试。`) : null,
+            `私人日记文件整理在 ${status.private.failure.at} 未完成，已完成条目保留；可单独重试。`) : null,
           h('small', null, status.private.organization ?
             `上次覆盖 ${status.private.organization.from} 至 ${status.private.organization.until} · ${status.private.organization.state === 'completed' ? '已完成' : '部分完成，可重试'} · 检查 ${status.private.organization.inspected} 篇` :
             '尚未整理；首次仅处理最近睡眠窗口内可确认日期的记录，不批量改写历史导入。'),
-          button('保存私人整理设置', saveConfig, 'primary'),
-          button('重试私人轻整理', () => run(() => request(space, '/private/organize', {}),
-            value => value.state === 'completed' ? '私人轻整理完成，未展示正文。' : '私人轻整理部分完成，请稍后重试。')),
+          button('规范日记文件格式', () => run(() => request(space, '/private/organize', {}),
+            value => value.state === 'completed' ? '日记文件格式整理完成，未展示正文。' : '日记文件格式整理部分完成，请稍后重试。')),
           field('允许的作者插件名称（逗号分隔）', privateWritersInput, value => {
             setPrivateWritersInput(value);
             patchConfig('privateWriters', value.split(',').map(x => x.trim()).filter(Boolean));
@@ -634,6 +668,7 @@ window.__ModuleLoader__.load({
           ...[['plugin', '插件代码'], ['models', '共享模型目录'], ['semanticIndex', '当前空间的派生语义索引'],
             ['topicIndex', '当前空间的派生主题索引'], ['graphIndex', '当前空间的派生图谱索引'],
             ['backups', '当前空间的恢复点'], ['backupKey', '自动备份受保护口令'],
+            ['privateSessionRegistry', '私人历史会话隔离登记（不含正文）'],
             ['forgetLedger', '同谱系恢复的遗忘标记（无正文）']]
             .map(([key, label]) => h('div', { key }, h('strong', null, label),
               h('p', { className: 'path' }, status.paths?.[key]))),

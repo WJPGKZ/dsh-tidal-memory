@@ -109,7 +109,9 @@ test('Windows DPAPI automatic backups preserve old plaintext and restore offline
   assert.equal(result.privateCount, 1);
   const restored = open(offline, 'recovered');
   assert.equal(restored.get(saved.id, admin).text, 'BACKUP_NORMAL_CANARY');
-  assert.equal(restored.privateDb.prepare('SELECT content FROM entries').get().content, 'BACKUP_PRIVATE_CANARY');
+  const privateEntry = restored.privateDb.prepare('SELECT relative_path FROM entries').get();
+  assert.equal(readFileSync(join(restored.privateDirectory, ...privateEntry.relative_path.split('/')), 'utf8')
+    .includes('BACKUP_PRIVATE_CANARY'), true);
   assert.deepEqual(restored.get(saved.id, admin).topics, ['orchid']);
   const second = automaticBackup(space, root, { force: true });
   assert.ok(existsSync(join(directory, plaintext)));

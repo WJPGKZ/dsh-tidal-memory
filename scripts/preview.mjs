@@ -18,8 +18,10 @@ export async function startPreview(port = 0, { embedding } = {}) {
   });
   let revision = 0;
   const agents = [
-    { id: 'demo-a', status: 'idle', session: { header: { cwd }, snapshotEvents: () => [] } },
-    { id: 'demo-b', status: 'idle', session: { header: { cwd }, snapshotEvents: () => [] } },
+    { id: 'demo-a', status: 'idle', session: { header: { cwd }, requestContext: () =>
+      ({ provider: 'synthetic-provider', model: 'synthetic-model' }), snapshotEvents: () => [] } },
+    { id: 'demo-b', status: 'idle', session: { header: { cwd }, requestContext: () =>
+      ({ provider: 'synthetic-provider', model: 'synthetic-model' }), snapshotEvents: () => [] } },
   ];
   const ctx = {
     agents: { list: () => agents, get: id => agents.find(a => a.id === id) },

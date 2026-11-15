@@ -103,10 +103,17 @@ try {
   await page.getByRole('status').filter({ hasText: '已保存' }).waitFor();
   await page.getByRole('tab', { name: '私人日记' }).click();
   await page.getByText('私人记录，不展示正文', { exact: true }).waitFor();
-  assert.equal(await page.getByLabel('私人日记整理方式').inputValue(), 'local');
-  assert.equal(await page.getByRole('option', { name: /调用作者自己的模型/ }).evaluate(option => option.disabled), true);
-  await page.getByRole('button', { name: '重试私人轻整理', exact: true }).click();
-  await page.getByRole('status').filter({ hasText: '私人轻整理完成' }).waitFor();
+  const mainSession = page.getByLabel('私人日记主会话');
+  await mainSession.selectOption('demo-a');
+  assert.equal(await page.getByLabel('Provider ID').inputValue(), 'synthetic-provider');
+  assert.equal(await page.getByLabel('Model ID').inputValue(), 'synthetic-model');
+  await page.getByRole('button', { name: '保存主会话设置', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
+  assert.deepEqual(preview.runtime.config.privateMainSessions, [{
+    space: 'default', sessionId: 'demo-a', provider: 'synthetic-provider', model: 'synthetic-model',
+  }]);
+  await page.getByRole('button', { name: '规范日记文件格式', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '日记文件格式整理完成' }).waitFor();
   const writers = page.getByLabel('允许的作者插件名称（逗号分隔）');
   await writers.fill('');
   await writers.pressSequentially('demo-author,second-author');
@@ -262,6 +269,7 @@ try {
   await page.getByRole('button', { name: '重试打开空间', exact: true }).click();
   await page.getByText('当前空间不可用，未保存或召回记忆', { exact: true }).waitFor({ state: 'hidden' });
   preview.runtime.rawConfig.bindings = preview.runtime.rawConfig.bindings.filter(binding => binding.space === 'workspace-b');
+  preview.runtime.rawConfig.privateMainSessions = [];
   preview.runtime.space('workspace-b').appendPrivate('demo-author', 'PRIVATE_SINGLE_SPACE_CANARY');
   const singleSpacePage = await browser.newPage();
   singleSpacePage.on('pageerror', error => errors.push(error.message));
@@ -271,7 +279,7 @@ try {
   await singleSpacePage.waitForFunction(() =>
     document.querySelector('select[aria-label="记忆空间"]')?.value === 'workspace-b');
   await singleSpacePage.getByRole('tab', { name: '私人日记' }).click();
-  await singleSpacePage.getByText(/^1 篇 ·/).waitFor();
+  await singleSpacePage.getByText(/^1 条 ·/).waitFor();
   assert.equal((await singleSpacePage.locator('body').innerText()).includes('PRIVATE_SINGLE_SPACE_CANARY'), false);
   await singleSpacePage.getByRole('combobox', { name: '记忆空间' }).selectOption('default');
   await singleSpacePage.getByRole('button', { name: '刷新', exact: true }).click();

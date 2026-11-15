@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { MemorySpace } from './store.js';
 import { LocalEmbedding, modelInventory } from './embedding.js';
+import { PrivateSessionRegistry } from './private-session-registry.js';
 import { SemanticIndex, semanticChunks, clearSemanticFiles } from './semantic-index.js';
 import { clearTopicFiles } from './topic-index.js';
 import { clearGraphFiles } from './graph-index.js';
@@ -68,6 +69,7 @@ export class TidalRuntime {
     this.root = resolve(this.config.dataRoot || join(home, 'tidal-memory'));
     this.embedding = embedding ?? new LocalEmbedding(this.root);
     this.embedding.configure(this.config);
+    this.privateSessions = null;
     this.semanticQueries = new Map();
     this.semanticResults = new Map();
     this.semanticTasks = new Set();
@@ -79,6 +81,9 @@ export class TidalRuntime {
     this.spaceErrors = new Map();
     this.plans = new Map();
     this.sessions = new Map();
+    this.privateCandidates = new Map();
+    this.pendingPrivateObservations = new Map();
+    this.privateAgentDisposers = new Map();
     this.jobs = new Set();
     this.lastActivity = this.clock().getTime();
     this.workspaceActivity = new Map();
@@ -139,7 +144,6 @@ export class TidalRuntime {
     this.syncConfig();
     requireValue(this.config.enabled, 'DISABLED', '记忆插件已关闭。', 403);
     requireValue(agent?.session && this.ctx.agents.get(agent.id) === agent, 'NO_AGENT', '缺少宿主登记的会话身份。', 403);
-    requireValue(agent.session.header.origin !== 'subagent', 'SUBAGENT_SCOPE', '第一版不向子代理开放跨会话记忆。', 403);
     const binding = bindingFor(this.config, agent.session.header.cwd);
     requireValue(binding, 'UNBOUND_WORKSPACE', '当前工作区未绑定记忆空间，请在设置中绑定。', 403);
     const store = this.space(binding.space);
@@ -179,12 +183,15 @@ export class TidalRuntime {
     return store.recall(query, actor, { ...options, ...cached,
       evidenceId: state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
   }
-  queryWindow(state) {
+  queryWindow(state, store, actor) {
     const pending = state.pendingQueries ?? [];
-    const queries = pending.length ? [...(state.recent ?? []).map(item => item.text), ...pending]
-      .slice(-this.config.contextMessages) : (state.recent ?? []).map(item => item.text);
-    return { query: pending.length ? pending.at(-1) : recallQuery(state.query),
-      contextQueries: queries.slice(-this.config.contextMessages, -1).reverse(), pending: pending.length > 0 };
+    const focus = store.sessionFocus(actor);
+    const focusText = [focus.task?.text, focus.scene?.title].filter(Boolean).join(' ');
+    const recent = (state.recent ?? []).map(item => item.text);
+    const queries = [...(focusText ? [focusText] : []), ...recent, ...pending]
+      .filter(Boolean).slice(-this.config.contextMessages);
+    const query = pending.at(-1) ?? (state.query ? recallQuery(state.query) : focusText);
+    return { query, contextQueries: queries.filter(text => text !== query).reverse(), pending: pending.length > 0 };
   }
   semanticKey(store, query, contextQueries) {
     return JSON.stringify([this.embedding.key, store.name, query, contextQueries]);
@@ -403,12 +410,135 @@ export class TidalRuntime {
         { mode: this.config.embeddingMode, state: 'partial', code: 'SEMANTIC_OBSOLETE',
           message: '语义准备期间记忆或有效时间发生变化，本次只使用词面检索。' } });
   }
+  privateSessionRegistry() {
+    this.privateSessions ??= new PrivateSessionRegistry(this.root);
+    return this.privateSessions;
+  }
+  privateMainFor(agent) {
+    if (!agent?.session || this.ctx.agents.get(agent.id) !== agent) return null;
+    const binding = bindingFor(this.config, agent.session.header.cwd);
+    if (!binding) return null;
+    const main = this.config.privateMainSessions.find(item =>
+      item.space === binding.space && item.sessionId === agent.session.id);
+    return main ? { ...main, binding } : null;
+  }
+  hasPrivateHistory(session) {
+    const events = session.snapshotEvents?.() ?? [];
+    return events.some(event => {
+      const source = event.type === 'user/message' ? event.data?.source : null;
+      return source?.kind === 'runtime-context' &&
+        source.sections?.some(section => section.name === 'tidal-private-journal');
+    });
+  }
+  privateSessionBlock(agent) {
+    const session = agent?.session;
+    if (!session || this.ctx.agents.get(agent.id) !== agent) return null;
+    const binding = bindingFor(this.config, session.header.cwd);
+    const registry = this.privateSessionRegistry();
+    const row = registry.get(session.id);
+    const parent = session.header.parentSession ? registry.get(session.header.parentSession) : null;
+    if (parent || (this.hasPrivateHistory(session) && row?.state !== 'exposed')) {
+      registry.markInherited({
+        sessionId: session.id, space: binding?.space ?? parent?.space ?? 'unbound',
+        lineageId: parent?.lineage_id ?? (binding ? this.space(binding.space).lineageId : 'unknown'),
+        now: this.clock().toISOString(),
+      });
+    }
+    const state = registry.get(session.id);
+    if (state?.state === 'inherited') return '该会话继承了私人日记历史，已在模型请求前阻止；请使用干净会话。';
+    if (state?.state === 'exposed') {
+      const main = this.privateMainFor(agent);
+      if (!main || !this.privateAgentDisposers.has(agent.id))
+        return '此会话曾接收私人日记上下文，当前不再满足主会话授权；模型请求已阻止。';
+    }
+    return null;
+  }
+  privateContext({ agent }) {
+    this.privateCandidates.delete(agent?.id);
+    try {
+      this.syncConfig();
+      if (!this.config.enabled || !this.config.injectContext || !this.privateAgentDisposers.has(agent?.id)) return '';
+      const main = this.privateMainFor(agent);
+      if (!main) return '';
+      if (this.privateSessionBlock(agent)) return '';
+      if (!main || this.privateSessionRegistry().get(agent.id)?.state === 'inherited') return '';
+      const store = this.space(main.space);
+      const candidate = store.privateJournalContext({
+        sessionId: agent.id, provider: main.provider, model: main.model,
+        now: this.clock(), maxBytes: this.config.privateContextBudget,
+      });
+      if (!candidate) return '';
+      this.privateCandidates.set(agent.id, { space: main.space, receipt: candidate.receipt });
+      return candidate.text;
+    } catch (error) {
+      this.noteError(error.code ?? 'PRIVATE_CONTEXT_FAILED',
+        '私人日记回顾上下文未能安全准备；未向模型发送。');
+      return '';
+    }
+  }
+  attachPrivateAgent(agent) {
+    if (!agent?.ctx?.on || this.privateAgentDisposers.has(agent.id)) return;
+    const dispose = agent.ctx.on('agent/request', async (payload, next) => {
+      const config = await next();
+      const candidate = this.privateCandidates.get(agent.id);
+      const state = this.privateSessionRegistry().get(agent.id);
+      if (!candidate && state?.state !== 'exposed') return config;
+      const main = this.privateMainFor(agent);
+      requireValue(state?.state !== 'inherited' && main &&
+        config.provider === main.provider && config.model === main.model,
+      'PRIVATE_ROUTE_UNAUTHORIZED', '私人日记主会话或模型路由未获授权，已在模型请求前阻止。', 403);
+      this.privateSessionRegistry().markExposed({
+        sessionId: agent.id, space: main.space, lineageId: this.space(main.space).lineageId,
+        provider: main.provider, model: main.model, now: this.clock().toISOString(),
+      });
+      this.privateCandidates.delete(agent.id);
+      if (candidate) this.pendingPrivateObservations.set(agent.id, {
+        ...candidate.receipt, turn: payload.turn, step: payload.step,
+      });
+      return config;
+    });
+    this.privateAgentDisposers.set(agent.id, dispose);
+  }
+  privateContribution(agent, content, operationId) {
+    this.syncConfig();
+    requireValue(this.config.privateContributionsEnabled, 'PRIVATE_CONTRIBUTIONS_DISABLED',
+      '用户尚未启用同工作区会话私人贡献。', 403);
+    requireValue(this.ctx.agents.get(agent?.id) === agent && !this.privateSessionBlock(agent),
+      'PRIVATE_SESSION_UNAUTHORIZED', '当前会话不能提交私人日记贡献。', 403);
+    const binding = bindingFor(this.config, agent.session.header.cwd);
+    requireValue(binding, 'UNBOUND_WORKSPACE', '私人贡献仅限已绑定工作区。', 403);
+    const store = this.space(binding.space);
+    const result = store.appendPrivateFromSession(agent.id, content, operationId);
+    return { saved: true, id: result.id, day: result.day_key, revision: result.revision };
+  }
+  organizePrivateForAgent(agent, input) {
+    this.syncConfig();
+    const main = this.privateMainFor(agent);
+    requireValue(main && this.privateAgentDisposers.has(agent.id) &&
+      this.privateSessionRegistry().get(agent.id)?.state === 'exposed',
+    'PRIVATE_SESSION_UNAUTHORIZED', '仅当前获授权的私人日记主会话可以整理日记。', 403);
+    const route = agent.session.requestContext?.();
+    requireValue(route?.provider === main.provider && route?.model === main.model,
+      'PRIVATE_ROUTE_UNAUTHORIZED', '当前模型路由未获授权，不能整理私人日记。', 403);
+    const store = this.space(main.space);
+    const result = store.organizePrivateDay({ ...input, sessionId: agent.id,
+      provider: main.provider, model: main.model, maxBytes: this.config.privateContextBudget });
+    return { saved: result.saved, day: result.day, revision: result.revision, contentHash: result.contentHash };
+  }
   async preStep({ agent, signal }, next) {
+    try {
+      this.syncConfig();
+      if (this.privateSessionBlock(agent)) return { kind: 'reject' };
+    } catch (error) {
+      this.noteError(error.code ?? 'PRIVATE_GUARD_FAILED',
+        '私人日记会话安全校验未能完成；模型请求已阻止。');
+      return { kind: 'reject' };
+    }
     const decision = await next();
     if (decision.kind === 'reject' || signal?.aborted || this.disposed) return decision;
     try {
       this.syncConfig();
-      if (!this.config.enabled || agent.session?.header.origin === 'subagent') return decision;
+      if (!this.config.enabled) return decision;
       this.cancelPrewarm();
       const binding = bindingFor(this.config, agent.session?.header.cwd);
       if (!binding) return decision;
@@ -416,14 +546,15 @@ export class TidalRuntime {
       this.forAgent(agent);
       const state = this.sessionState(agent.session, binding.space);
       // rc5 appends admitted user events after its final runtime-context refresh.
-      state.pendingQueries = decision.messages.filter(message => message.source?.kind === 'user')
+      state.pendingQueries = decision.messages.filter(message =>
+        message.role === 'user' && message.source?.kind !== 'runtime-context')
         .map(textOf).filter(text => text.trim()).map(recallQuery);
       state.context = null;
       if (this.config.injectContext && this.config.embeddingMode !== 'off') {
         const token = Symbol('semantic-request');
         state.semanticRequest = token;
-        const { query, contextQueries } = this.queryWindow(state);
         const { store, actor } = this.forAgent(agent);
+        const { query, contextQueries } = this.queryWindow(state, store, actor);
         const result = await this.prepareSemantic(store, actor, query, { contextQueries }, signal);
         if (!signal?.aborted && !this.disposed && this.sessions.get(agent.id) === state &&
           state.semanticRequest === token && result.key === this.semanticKey(store, query, contextQueries) &&
@@ -442,7 +573,7 @@ export class TidalRuntime {
     if (this.disposed) return;
     try {
       this.syncConfig();
-      if (!this.config.enabled || session.header.origin === 'subagent') return;
+      if (!this.config.enabled || this.ctx.agents.get(session.id)?.session !== session) return;
       this.cancelPrewarm();
       const binding = bindingFor(this.config, session.header.cwd);
       if (!binding) return;
@@ -452,8 +583,23 @@ export class TidalRuntime {
       state.lastSeen = this.clock().getTime();
       this.lastActivity = state.lastSeen;
       this.workspaceActivity.set(binding.space, state.lastSeen);
+      if (event.type === 'assistant/message') {
+        const pending = this.pendingPrivateObservations.get(session.id);
+        if (pending && pending.turn === event.data.turn && pending.step === event.data.step) {
+          this.pendingPrivateObservations.delete(session.id);
+          if (!event.data.interrupted) {
+            const store = this.space(binding.space);
+            if (!store.recordPrivateObservation(pending, new Date(event.time).toISOString()))
+              this.noteError('PRIVATE_OBSERVATION_STALE', '私人日记回顾期间文件版本变化；本次回顾未登记。');
+          }
+        }
+      }
       if (event.type === 'turn/start') { state.context = null; state.turn = event.data.turn; }
-      if (event.type === 'turn/end') { state.pendingQueries = []; state.pendingRecall = null; state.context = null; }
+      if (event.type === 'turn/end') {
+        state.pendingQueries = []; state.pendingRecall = null; state.context = null;
+        this.privateCandidates.delete(session.id);
+        this.pendingPrivateObservations.delete(session.id);
+      }
       const message = event.type === 'user/message' ? event.data :
         event.type === 'assistant/message' ? event.data.message : null;
       if (!message) return;
@@ -496,7 +642,7 @@ export class TidalRuntime {
     let selectedSpace;
     try {
       this.syncConfig();
-      if (!this.config.enabled || !agent?.session || agent.session.header.origin === 'subagent') return '';
+      if (!this.config.enabled || !agent?.session) return '';
       if (!this.config.injectContext) return '';
       const binding = bindingFor(this.config, agent.session.header.cwd);
       if (!binding) return '';
@@ -510,7 +656,7 @@ export class TidalRuntime {
         if (state.context === null || state.generation !== store.generation ||
             (state.contextAt !== undefined && observedAt < state.contextAt) ||
             (state.contextExpiresAt !== null && state.contextExpiresAt !== undefined && observedAt >= state.contextExpiresAt)) {
-          const { query, contextQueries, pending } = this.queryWindow(state);
+          const { query, contextQueries, pending } = this.queryWindow(state, store, actor);
           const recalled = store.recall(query, actor, { contextQueries,
             ...this.cachedSemantic(store, actor, query, contextQueries, state),
             evidenceId: pending || state.evidenceId === undefined ? undefined : `user-event:${state.evidenceId}` });
@@ -547,7 +693,7 @@ export class TidalRuntime {
       const names = selectedSpace ? [slug(selectedSpace)] : this.names();
       for (const name of names) {
         const agents = [...this.ctx.agents.list()].filter(agent =>
-          agent.session.header.origin !== 'subagent' && bindingFor(this.config, agent.session.header.cwd)?.space === name);
+          bindingFor(this.config, agent.session.header.cwd)?.space === name);
         if (agents.some(agent => agent.status === 'running')) {
           results.push({ space: name, waitingForConversation: true }); continue;
         }
@@ -636,12 +782,13 @@ export class TidalRuntime {
       for (const row of encoded) reasons[row.reason] = (reasons[row.reason] ?? 0) + 1;
       const privateFile = join(directory, 'private', 'journal.sqlite3');
       const privateDb = open(privateFile);
-      const count = privateDb ? privateJournalStatus(privateDb) :
+      const count = privateDb ? privateJournalStatus(privateDb, join(directory, 'private')) :
         { count: 0, lastWritten: null, dailyCount: 0, legacyCount: 0, firstDay: null, lastDay: null, organization: null, failure: null };
       let bytes = 0;
       for (const file of [privateFile, `${privateFile}-wal`]) {
         try { bytes += statSync(file).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
       }
+      bytes += count.bytes ?? 0;
       return {
         space: name, directory, layers, errors: [], searchIndex,
         private: { ...count, bytes, directory: join(directory, 'private'), authors: this.config.privateWriters,
@@ -688,7 +835,6 @@ export class TidalRuntime {
           continue;
         }
         const agents = [...this.ctx.agents.list()].filter(agent =>
-          agent.session.header.origin !== 'subagent' &&
           bindingFor(this.config, agent.session.header.cwd)?.space === name);
         if (agents.some(agent => agent.status === 'running')) {
           results.push({ space: name, waitingForConversation: true, day });
@@ -779,6 +925,7 @@ export class TidalRuntime {
           graphIndex: join(this.root, 'spaces', spaceName, 'indexes', 'graph.sqlite3'),
           backups: join(this.root, 'backups', spaceName),
           backupKey: automaticKeyStatus(this.root).path,
+          privateSessionRegistry: join(this.root, 'system', 'private-sessions.sqlite3'),
           forgetLedger: join(this.root, 'system', 'forget-ledger.sqlite3') },
         backupProtection: { mode: this.config.autoBackupMode, ...automaticKeyStatus(this.root) },
         modelPacks: modelInventory(this.root).map(item => ({ ...item,
@@ -800,8 +947,15 @@ export class TidalRuntime {
         settingsRevision: this.descriptor()?.revision ?? null, busy: this.busy,
         error: this.lastError?.space && this.lastError.space !== spaceName ? null : this.lastError,
         spaceErrors: Object.fromEntries(this.spaceErrors),
-        sessions: [...this.ctx.agents.list()].filter(a => a.session.header.origin !== 'subagent')
-          .map(a => ({ id: a.id, cwd: a.session.header.cwd ?? '', status: a.status })) };
+        sessions: [...this.ctx.agents.list()]
+          .filter(a => bindingFor(this.config, a.session.header.cwd)?.space === spaceName)
+          .map(a => {
+            const route = a.session.requestContext?.();
+            return { id: a.id, cwd: a.session.header.cwd ?? '', status: a.status,
+              origin: a.session.header.origin ?? 'primary',
+              provider: typeof route?.provider === 'string' ? route.provider : '',
+              model: typeof route?.model === 'string' ? route.model : '' };
+          }) };
     }
     if (method === 'POST' && path === '/config') {
       const descriptor = this.descriptor();
@@ -1037,6 +1191,10 @@ export class TidalRuntime {
   async close() {
     this.disposed = true;
     const errors = [];
+    for (const dispose of this.privateAgentDisposers.values()) {
+      try { dispose(); } catch (error) { errors.push(error); }
+    }
+    this.privateAgentDisposers.clear();
     for (const task of this.semanticTasks) task.controller.abort();
     for (const task of this.graphTasks.values()) task.controller.abort();
     for (const task of this.graphSuggestionTasks.values()) task.controller.abort();
@@ -1047,6 +1205,9 @@ export class TidalRuntime {
     }
     this.spaces.clear();
     this.plans.clear();
+    this.privateCandidates.clear();
+    this.pendingPrivateObservations.clear();
+    try { this.privateSessions?.close(); } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, '部分潮汐记忆资源未能关闭。');
   }
 }

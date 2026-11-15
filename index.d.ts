@@ -64,6 +64,52 @@ export interface RecallOptions {
   asOf?: string;
   includeArchived?: boolean;
 }
+export interface MemoryEventInput {
+  text: string;
+  eventType: 'result' | 'check' | 'correction' | 'observation';
+  operationId: string;
+  taskRef?: string | null;
+  sceneRef?: string | null;
+  sourceIds?: string[];
+}
+export interface MemoryFocus {
+  taskRef?: string | null;
+  sceneRef?: string | null;
+}
+export interface MemoryScene {
+  id: string;
+  title: string;
+  createdAt: string;
+  memberCount: number;
+}
+export interface MemoryChange {
+  id: string;
+  layer: Exclude<Layer, 'L0'>;
+  revision: number;
+  status: string;
+  changedAt: string;
+}
+export interface MemoryChangePage {
+  items: MemoryChange[];
+  cursor: string;
+  hasMore: boolean;
+}
+export interface PrivateJournalContribution {
+  content: string;
+  operationId?: string;
+}
+export interface PrivateJournalOrganization {
+  day: string;
+  expectedHash: string;
+  markdown: string;
+}
+export interface PrivateJournalWriteResult {
+  saved: true;
+  id?: string;
+  day: string;
+  revision: number;
+  contentHash?: string;
+}
 export interface EvidenceOptions extends RecallOptions {
   id?: string;
   topic?: string;
@@ -95,12 +141,23 @@ export interface EvidencePage {
   nextCursor: string | null;
 }
 export interface TidalMemoryService {
-  readonly version: 1;
+  readonly version: 3;
   forAgent(agent: object): {
     proposeMemory(input: MemoryProposal): MemoryRecord;
     recall(query: string): RecallResult;
     recallAsync(query: string, options?: RecallOptions): Promise<RecallResult>;
     readEvidence(options: EvidenceOptions): EvidenceRecord | EvidencePage;
+    recordEvent(input: MemoryEventInput): MemoryRecord;
+    createScene(input: { title: string; operationId: string }): MemoryScene;
+    joinScene(sceneRef: string): MemoryScene;
+    scenes(): MemoryScene[];
+    setFocus(input: MemoryFocus): { taskRef: string | null; sceneRef: string | null; updatedAt: string | null;
+      task: MemoryRecord | null; scene: Pick<MemoryScene, 'id' | 'title' | 'createdAt'> | null };
+    focus(): { taskRef: string | null; sceneRef: string | null; updatedAt: string | null;
+      task: MemoryRecord | null; scene: Pick<MemoryScene, 'id' | 'title' | 'createdAt'> | null };
+    changes(cursor?: string | null, limit?: number): MemoryChangePage;
+    contributePrivate(input: PrivateJournalContribution): PrivateJournalWriteResult;
+    organizePrivateDay(input: PrivateJournalOrganization): Omit<PrivateJournalWriteResult, 'id'>;
   };
   privateWriter(ownerContext: object): {
     append(space: string, content: string, sourceIds?: string[]): { id: string; saved: true; day: string; revision: number };

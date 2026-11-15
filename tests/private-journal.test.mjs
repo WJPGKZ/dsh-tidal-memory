@@ -1,221 +1,227 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { MemorySpace } from '../src/store.js';
-import { openDatabase } from '../src/database.js';
+import { openDatabase, transaction } from '../src/database.js';
 import { packBackup, restoreBackup, unpackBackup } from '../src/transfer.js';
+import { journalFileHash, stageJournalFile } from '../src/journal-files.js';
+import { appendPrivateEntry } from '../src/private-journal.js';
 
 const admin = { admin: true };
+const password = 'synthetic-password-123';
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'tidal-private-test-'));
   let now = new Date(2026, 2, 4, 12, 0).getTime();
   const options = { clock: () => now, config: { privateWriters: ['author-a', 'author-b'] } };
   const spaces = [];
   t.after(() => { for (const space of spaces) space.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, options, open(name = 'shared') { const space = new MemorySpace(root, name, options); spaces.push(space); return space; },
-    get now() { return now; }, set now(value) { now = value; } };
+  return {
+    root, options,
+    open(name = 'shared') { const space = new MemorySpace(root, name, options); spaces.push(space); return space; },
+    get now() { return now; },
+    set now(value) { now = value; }
+  };
 }
 const legacyInsert = (db, id, author, content, created) => db.prepare(
   'INSERT INTO entries(id,author,content,created_at,source_ids) VALUES(?,?,?,?,?)',
 ).run(id, author, content, created, '[]');
 
-test('one authoritative entry per author and local day preserves append order and stable ID', t => {
+test('daily Markdown is authoritative and SQLite stores metadata only', t => {
   const f = fixture(t), space = f.open();
   const first = space.appendPrivate('author-a', 'SYNTHETIC_PRIVATE_FIRST');
   f.now += 1000;
-  const next = space.appendPrivate('author-a', 'SYNTHETIC_PRIVATE_SECOND');
-  assert.equal(next.id, first.id);
-  assert.equal(next.revision, first.revision + 1);
-  assert.equal(space.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(first.id).content,
-    'SYNTHETIC_PRIVATE_FIRST\n\nSYNTHETIC_PRIVATE_SECOND');
+  const second = space.appendPrivate('author-a', 'SYNTHETIC_PRIVATE_SECOND');
+  assert.notEqual(first.id, second.id);
+  const status = space.privateStatus();
+  assert.equal(status.format, 'markdown');
+  assert.equal(status.count, 2);
+  assert.equal(status.dailyCount, 1);
+  assert.equal(status.contentVisible, false);
+  const file = join(space.privateDirectory, '2026', '2026-03-04.md');
+  const markdown = readFileSync(file, 'utf8');
+  assert.match(markdown, /SYNTHETIC_PRIVATE_FIRST/);
+  assert.match(markdown, /SYNTHETIC_PRIVATE_SECOND/);
+  assert.equal(space.privateDb.prepare('PRAGMA table_info(entries)').all().some(column => column.name === 'content'), false);
+  assert.equal(JSON.stringify(status).includes('SYNTHETIC_PRIVATE'), false);
+  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 2);
   assert.notEqual(space.appendPrivate('author-b', 'another author').id, first.id);
   f.now = new Date(2026, 2, 5, 0, 1).getTime();
   assert.notEqual(space.appendPrivate('author-a', 'another day').id, first.id);
-  assert.deepEqual(space.privateStatus().dailyCount, 3);
-  assert.equal(space.privateStatus().legacyCount, 0);
+  assert.equal(space.privateStatus().dailyCount, 2);
   assert.throws(() => space.appendPrivate('not-authorized', 'not saved'), { code: 'PRIVATE_WRITER_DISABLED' });
-  assert.throws(() => space.appendPrivate('author-a', ' '.repeat(50000) + 'x'), { code: 'INVALID_INPUT' });
 });
 
-test('a legacy five-column insert remains readable without implying full package rollback support', t => {
+test('legacy SQLite bodies migrate losslessly, preserve metadata, and unknown imports go to undated', t => {
+  const f = fixture(t);
+  const privateDirectory = join(f.root, 'spaces', 'shared', 'private');
+  const db = openDatabase(join(privateDirectory, 'journal.sqlite3'));
+  db.exec(`CREATE TABLE entries (id TEXT PRIMARY KEY,author TEXT NOT NULL,content TEXT NOT NULL,
+    created_at TEXT NOT NULL,source_ids TEXT NOT NULL);
+    CREATE TABLE entry_state (entry_id TEXT PRIMARY KEY,author TEXT NOT NULL,day_key TEXT,
+      revision INTEGER NOT NULL,updated_at TEXT NOT NULL,content_hash TEXT);
+    CREATE TABLE entry_aliases (alias_id TEXT PRIMARY KEY,entry_id TEXT NOT NULL);
+    CREATE TABLE journal_pending (entry_id TEXT PRIMARY KEY);
+    CREATE TABLE journal_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE private_tombstones (id TEXT PRIMARY KEY);
+    PRAGMA user_version=1;`);
+  const known = '2026-03-02T10:00:00.000Z';
+  legacyInsert(db, 'known-id', 'author-a', 'LEGACY\nBODY', known);
+  legacyInsert(db, 'unknown-id', 'legacy-import', 'UNDATED_BODY', '2020-01-01T00:00:00.000Z');
+  db.prepare('INSERT INTO entry_state VALUES(?,?,?,?,?,?)')
+    .run('known-id', 'author-a', '2026-03-02', 3, known, journalFileHash('LEGACY\nBODY'));
+  db.prepare('INSERT INTO entry_aliases VALUES(?,?)').run('legacy-alias', 'known-id');
+  db.prepare('INSERT INTO journal_pending VALUES(?)').run('known-id');
+  db.prepare('INSERT INTO journal_metadata VALUES(?,?)').run('migration-note', 'kept');
+  db.prepare('INSERT INTO private_tombstones VALUES(?)').run('forgotten-id');
+  db.close();
+
+  const space = f.open();
+  const dated = readFileSync(join(privateDirectory, '2026', '2026-03-02.md'), 'utf8');
+  const undatedFile = space.privateDb.prepare("SELECT relative_path FROM entries WHERE id='unknown-id'").get().relative_path;
+  assert.equal(undatedFile.startsWith('undated/'), true);
+  assert.match(dated, /LEGACY\nBODY/);
+  assert.match(readFileSync(join(privateDirectory, ...undatedFile.split('/')), 'utf8'), /UNDATED_BODY/);
+  assert.equal(space.privateDb.prepare('SELECT entry_id FROM entry_aliases WHERE alias_id=?').get('legacy-alias').entry_id,
+    'known-id');
+  assert.equal(space.privateDb.prepare('SELECT state FROM journal_pending WHERE entry_id=?').get('known-id').state, 'pending');
+  assert.equal(space.privateDb.prepare('SELECT value FROM journal_metadata WHERE key=?').get('migration-note').value, 'kept');
+  assert.ok(space.privateDb.prepare('SELECT 1 FROM private_tombstones WHERE id=?').get('forgotten-id'));
+  assert.equal(space.privateDb.prepare('PRAGMA table_info(entries)').all().some(column => column.name === 'content'), false);
+  assert.equal(space.privateStatus().count, 2);
+});
+
+test('pending Markdown publication recovers from its fsynced staging file after restart', t => {
   const f = fixture(t), space = f.open();
-  const entry = space.appendPrivate('author-a', 'NEW_WRITER_FIRST');
-  space.privateDb.prepare('INSERT INTO entries VALUES(?,?,?,?,?)')
-    .run('rollback-fragment', 'author-a', 'OLD_WRITER_FRAGMENT', new Date(f.now).toISOString(), '[]');
+  const day = '2026-03-04', path = `${day.slice(0, 4)}/${day}.md`;
+  const id = 'a06ddcde-a301-4c44-85a0-8870e316c421';
+  const created = new Date(f.now).toISOString();
+  const content = `# ${day}\n\n## 待整理贡献\n\n<!-- tidal-entry:${id} -->\n### ${created} · author-a\n\nRECOVERY_CANARY\n<!-- /tidal-entry:${id} -->\n\n`;
+  const staged = stageJournalFile(space.privateDirectory, path, content);
+  transaction(space.privateDb, () => {
+    space.privateDb.prepare(`INSERT INTO entries
+      (id,author,created_at,source_ids,day_key,relative_path,revision,content_hash) VALUES(?,?,?,?,?,?,1,?)`)
+      .run(id, 'author-a', created, '[]', day, path, journalFileHash('RECOVERY_CANARY'));
+    space.privateDb.prepare('INSERT INTO journal_pending(entry_id,state,updated_at) VALUES(?,?,?)')
+      .run(id, 'pending', created);
+    space.privateDb.prepare(`INSERT INTO journal_transactions
+      (operation_id,entry_id,day_key,relative_path,temporary_path,old_hash,new_hash,revision,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(staged.temporary.slice('.transactions/'.length, -'.tmp'.length), id, day, path,
+        staged.temporary, null, staged.hash, 1, created);
+  });
   space.close();
   const reopened = f.open();
-  assert.equal(reopened.appendPrivate('author-a', 'NEW_WRITER_LAST').id, entry.id);
-  assert.equal(reopened.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(entry.id).content,
-    'NEW_WRITER_FIRST\n\nOLD_WRITER_FRAGMENT\n\nNEW_WRITER_LAST');
-  assert.equal(reopened.privateDb.prepare('SELECT entry_id FROM entry_aliases WHERE alias_id=?')
-    .get('rollback-fragment').entry_id, entry.id);
+  assert.match(readFileSync(join(reopened.privateDirectory, '2026', '2026-03-04.md'), 'utf8'), /RECOVERY_CANARY/);
+  assert.equal(reopened.privateDb.prepare('SELECT count(*) AS n FROM journal_transactions').get().n, 0);
+  assert.equal(reopened.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 1);
 });
 
-test('legacy migration is additive until a bounded recent sleep window merges reliable fragments', t => {
-  const f = fixture(t);
-  const file = join(f.root, 'spaces', 'shared', 'private', 'journal.sqlite3');
-  const db = openDatabase(file);
-  db.exec(`CREATE TABLE entries (id TEXT PRIMARY KEY,author TEXT NOT NULL,content TEXT NOT NULL,
-    created_at TEXT NOT NULL,source_ids TEXT NOT NULL); PRAGMA user_version=1;`);
-  const old = new Date(2026, 2, 2, 10, 0).toISOString();
-  const todayA = new Date(2026, 2, 4, 1, 0).toISOString();
-  const todayB = new Date(2026, 2, 4, 2, 0).toISOString();
-  legacyInsert(db, 'old-fragment', 'author-a', 'OLD_SYNTHETIC', old);
-  legacyInsert(db, 'first-fragment', 'author-a', 'FIRST_SYNTHETIC', todayA);
-  legacyInsert(db, 'second-fragment', 'author-a', 'SECOND_SYNTHETIC', todayB);
-  legacyInsert(db, 'old-import', 'legacy-import', 'IMPORT_SYNTHETIC', todayB);
-  legacyInsert(db, 'boundary-before', 'author-b', 'BEFORE_WINDOW', new Date(2026, 2, 3, 2, 30).toISOString());
-  legacyInsert(db, 'boundary-after', 'author-b', 'AFTER_WINDOW', new Date(2026, 2, 3, 4, 30).toISOString());
-  db.close();
-  const space = f.open();
-  assert.equal(space.privateStatus().count, 6);
-  assert.equal(space.privateStatus().legacyCount, 6);
-  const result = space.organizePrivateWindow({ from: new Date(2026, 2, 3, 3, 0).toISOString(),
-    until: new Date(f.now).toISOString() });
-  assert.equal(result.merged, 1);
-  assert.equal(space.privateDb.prepare('SELECT content FROM entries WHERE id=?').get('first-fragment').content,
-    'FIRST_SYNTHETIC\n\nSECOND_SYNTHETIC');
-  assert.equal(space.privateDb.prepare('SELECT entry_id FROM entry_aliases WHERE alias_id=?').get('second-fragment').entry_id,
-    'first-fragment');
-  assert.ok(space.privateDb.prepare('SELECT 1 FROM entries WHERE id=? AND id NOT IN (SELECT entry_id FROM entry_state)').get('old-fragment'));
-  assert.ok(space.privateDb.prepare('SELECT 1 FROM entries WHERE id=? AND id NOT IN (SELECT entry_id FROM entry_state)').get('old-import'));
-  assert.ok(space.privateDb.prepare('SELECT 1 FROM entries WHERE id=? AND id NOT IN (SELECT entry_id FROM entry_state)').get('boundary-before'));
-  assert.ok(space.privateDb.prepare('SELECT 1 FROM entry_state WHERE entry_id=?').get('boundary-after'));
-  assert.equal(space.privateDb.prepare('SELECT content FROM entries WHERE id=?').get('boundary-after').content, 'AFTER_WINDOW');
-  assert.equal(space.privateStatus().count, 5);
-  const plain = packBackup(space);
-  for (const text of ['FIRST_SYNTHETIC', 'SECOND_SYNTHETIC', 'OLD_SYNTHETIC', 'IMPORT_SYNTHETIC']) {
-    assert.equal(plain.includes(text), false);
-    assert.equal(JSON.stringify(space.privateStatus()).includes(text), false);
+test('private review is route-bound, segmented, observed after replies, and version-checked before organization', t => {
+  const f = fixture(t), space = f.open();
+  const day = '2026-03-04';
+  space.appendPrivate('author-a', 'REVIEW_CANARY\n' + 'x'.repeat(2200));
+  f.now = new Date(2026, 2, 5, 12, 0).getTime();
+  const read = (provider = 'approved-provider') => space.privateJournalContext({
+    sessionId: 'approved-main', provider, model: 'approved-model', now: new Date(f.now), maxBytes: 1024,
+  });
+  const wrongRoute = read('other-provider');
+  assert.ok(wrongRoute);
+  assert.equal(space.recordPrivateObservation(wrongRoute.receipt), true);
+  let candidate = read();
+  assert.equal(candidate.receipt.segmentIndex, 0);
+  assert.ok(Buffer.byteLength(candidate.text) <= 1024);
+  assert.throws(() => space.organizePrivateDay({
+    day, expectedHash: candidate.receipt.contentHash, markdown: '整理摘要',
+    sessionId: 'approved-main', provider: 'approved-provider', model: 'approved-model',
+    maxBytes: 1024,
+  }), { code: 'JOURNAL_NOT_FULLY_OBSERVED' });
+  let segmentCount = candidate.receipt.segmentCount;
+  for (let index = 0; index < segmentCount; index++) {
+    candidate = read();
+    assert.equal(candidate.receipt.segmentIndex, index);
+    assert.equal(space.recordPrivateObservation(candidate.receipt), true);
   }
+  assert.equal(read(), null);
+  const result = space.organizePrivateDay({
+    day, expectedHash: candidate.receipt.contentHash, markdown: '## 合成回顾\n\n保留原始贡献。',
+    sessionId: 'approved-main', provider: 'approved-provider', model: 'approved-model',
+    maxBytes: 1024,
+  });
+  assert.equal(result.saved, true);
+  assert.equal(read(), null);
+  const file = join(space.privateDirectory, '2026', `${day}.md`);
+  const organized = readFileSync(file, 'utf8');
+  assert.match(organized, /REVIEW_CANARY/);
+  assert.match(organized, /保留原始贡献/);
+  appendPrivateEntry(space.privateDb, space.privateDirectory, {
+    author: 'author-b', content: 'LATE_CONTRIBUTION', now: '2026-03-04T13:00:00.000Z',
+  });
+  const updated = readFileSync(file, 'utf8');
+  assert.ok(updated.indexOf('LATE_CONTRIBUTION') < updated.indexOf('<!-- tidal-organized:start -->'));
+  assert.notEqual(read()?.receipt.contentHash, result.contentHash);
 });
 
-test('a concurrent append defeats stale light-organization CAS and is retried without losing text', t => {
+test('private Markdown is encrypted in v3 backups and restored as files, never SQLite bodies', t => {
   const f = fixture(t), space = f.open();
-  const entry = space.appendPrivate('author-a', 'FIRST\r\nSECOND');
-  const cutoff = new Date(f.now).toISOString();
-  const first = space.organizePrivateWindow({ from: new Date(f.now - 1000).toISOString(), until: cutoff,
-    beforeCommit: () => { f.now += 1000; space.appendPrivate('author-a', 'LATE_APPEND'); } });
-  assert.equal(first.conflicts, 1);
-  assert.equal(first.state, 'partial');
-  assert.equal(space.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(entry.id).content,
-    'FIRST\r\nSECOND\n\nLATE_APPEND');
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 1);
-  const retry = space.organizePrivateWindow({ from: cutoff, until: new Date(f.now).toISOString() });
-  assert.equal(retry.state, 'completed');
-  assert.equal(space.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(entry.id).content,
-    'FIRST\nSECOND\n\nLATE_APPEND');
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 0);
-});
-
-test('a late append at the same clock tick remains queued for the next window', t => {
-  const f = fixture(t), space = f.open(), cutoff = new Date(f.now).toISOString();
-  const entry = space.appendPrivate('author-a', 'INITIAL');
-  space.organizePrivateWindow({ from: new Date(f.now - 1000).toISOString(), until: cutoff });
-  space.appendPrivate('author-a', 'LATE\r\nLINE');
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 1);
-  const next = space.organizePrivateWindow({ from: cutoff, until: cutoff });
-  assert.equal(next.state, 'completed');
-  assert.equal(space.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(entry.id).content,
-    'INITIAL\n\nLATE\nLINE');
-});
-
-test('deleting a journal during organization never resurrects it or leaves a stale pending reference', t => {
-  const f = fixture(t), space = f.open(), cutoff = new Date(f.now).toISOString();
-  space.appendPrivate('author-a', 'DELETED\r\nCONTENT');
-  const result = space.organizePrivateWindow({ from: new Date(f.now - 1000).toISOString(), until: cutoff,
-    beforeCommit: () => space.clearPrivate(admin, 'DELETE PRIVATE JOURNAL') });
-  assert.equal(result.state, 'partial');
-  assert.equal(space.privateStatus().count, 0);
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 0);
-});
-
-test('local daily identity survives spring-forward and repeated fall-back hours', t => {
-  const oldTz = process.env.TZ;
-  process.env.TZ = 'America/New_York';
-  t.after(() => { if (oldTz === undefined) delete process.env.TZ; else process.env.TZ = oldTz; });
-  const f = fixture(t), space = f.open();
-  f.now = new Date('2026-03-08T06:55:00Z').getTime();
-  const spring = space.appendPrivate('author-a', 'BEFORE_SPRING');
-  f.now += 10 * 60000;
-  assert.equal(space.appendPrivate('author-a', 'AFTER_SPRING').id, spring.id);
-  f.now = new Date('2026-11-01T05:15:00Z').getTime();
-  const fall = space.appendPrivate('author-a', 'FIRST_FALL_HOUR');
-  f.now += 60 * 60000;
-  assert.equal(space.appendPrivate('author-a', 'SECOND_FALL_HOUR').id, fall.id);
-  assert.notEqual(fall.id, spring.id);
-});
-
-test('private status never reflects unvalidated metadata strings', t => {
-  const f = fixture(t), space = f.open();
-  const entry = space.appendPrivate('author-a', 'PRIVATE_BODY_CANARY');
-  space.privateDb.prepare('UPDATE entries SET created_at=? WHERE id=?').run('PRIVATE_TIMESTAMP_CANARY', entry.id);
-  space.privateDb.prepare('UPDATE entry_state SET day_key=?,updated_at=? WHERE entry_id=?')
-    .run('PRIVATE_DAY_CANARY', 'PRIVATE_UPDATED_CANARY', entry.id);
-  space.privateDb.prepare("INSERT OR REPLACE INTO journal_metadata VALUES('last-organization',?)")
-    .run(JSON.stringify({ state: 'completed', from: 'PRIVATE_FROM_CANARY', until: '2026-03-04T12:00:00.000Z',
-      inspected: 1, updated: 1, merged: 0, migrated: 0, deferred: 0, conflicts: 0 }));
-  const status = JSON.stringify(space.privateStatus());
-  assert.equal(status.includes('PRIVATE_'), false);
-  assert.equal(space.privateStatus().organization, null);
-});
-
-test('private alias and daily identity survive encrypted restore without appearing in plaintext backups', t => {
-  const f = fixture(t), space = f.open();
-  const created = new Date(f.now - 5000).toISOString();
-  legacyInsert(space.privateDb, 'legacy-a', 'author-a', 'ALIAS_PRIVATE_A', created);
-  legacyInsert(space.privateDb, 'legacy-b', 'author-a', 'ALIAS_PRIVATE_B', created);
-  const daily = space.appendPrivate('author-a', 'ALIAS_PRIVATE_C');
+  const entry = space.appendPrivate('author-a', 'BACKUP_PRIVATE_CANARY');
+  f.now = new Date(2026, 2, 5, 12, 0).getTime();
+  const review = space.privateJournalContext({
+    sessionId: 'backup-main', provider: 'backup-provider', model: 'backup-model', now: new Date(f.now),
+  });
+  assert.ok(review);
+  assert.equal(space.recordPrivateObservation(review.receipt), true);
+  space.organizePrivateDay({
+    day: review.receipt.day, expectedHash: review.receipt.contentHash,
+    markdown: '备份中的合成整理结果。', sessionId: 'backup-main',
+    provider: 'backup-provider', model: 'backup-model',
+  });
   const plain = packBackup(space);
-  assert.equal(plain.includes('ALIAS_PRIVATE'), false);
-  assert.equal(plain.includes('legacy-b'), false);
-  const encrypted = packBackup(space, 'synthetic-password-123');
-  assert.equal(encrypted.includes('ALIAS_PRIVATE'), false);
-  const document = unpackBackup(encrypted, 'synthetic-password-123');
+  assert.equal(plain.includes('BACKUP_PRIVATE_CANARY'), false);
+  assert.equal(unpackBackup(plain).privateFiles, undefined);
+  assert.equal(unpackBackup(plain).privateObservations, undefined);
+  const encrypted = packBackup(space, password);
+  assert.equal(encrypted.includes('BACKUP_PRIVATE_CANARY'), false);
+  const document = unpackBackup(encrypted, password);
+  assert.equal(document.version, 3);
   assert.equal(document.privateEntries.length, 1);
-  assert.equal(document.privateAliases.length, 1);
-  restoreBackup(f.root, 'restored', encrypted, 'synthetic-password-123', f.options.config);
+  assert.equal(document.privateObservations.length, 1);
+  assert.equal(document.privateOrganized.length, 1);
+  assert.equal(Object.hasOwn(document.privateEntries[0], 'content'), false);
+  assert.equal(document.privateFiles.length, 1);
+  assert.match(document.privateFiles[0].content, /BACKUP_PRIVATE_CANARY/);
+  restoreBackup(f.root, 'restored', encrypted, password, f.options.config);
   const restored = f.open('restored');
-  assert.equal(restored.privateDb.prepare('SELECT entry_id FROM entry_aliases WHERE alias_id=?').get('legacy-b').entry_id, daily.id);
-  assert.equal(restored.appendPrivate('author-a', 'ALIAS_PRIVATE_D').id, daily.id);
-  assert.match(restored.privateDb.prepare('SELECT content FROM entries WHERE id=?').get(daily.id).content, /ALIAS_PRIVATE_D/);
-  assert.throws(() => restoreBackup(f.root, 'restored', encrypted, 'synthetic-password-123', {}), /新空间/);
+  const row = restored.privateDb.prepare('SELECT * FROM entries WHERE id=?').get(entry.id);
+  assert.equal(Object.hasOwn(row, 'content'), false);
+  assert.match(readFileSync(join(restored.privateDirectory, ...row.relative_path.split('/')), 'utf8'),
+    /BACKUP_PRIVATE_CANARY/);
+  assert.equal(restored.privateDb.prepare('SELECT count(*) AS n FROM journal_observations').get().n, 1);
+  assert.equal(restored.privateDb.prepare('SELECT count(*) AS n FROM journal_organized').get().n, 1);
+  f.now = new Date(2026, 2, 4, 12, 0).getTime();
+  assert.equal(restored.appendPrivate('author-a', 'AFTER_RESTORE').day_key, '2026-03-04');
+  const changed = structuredClone(document);
+  changed.privateFiles[0].sha256 = '0'.repeat(64);
+  const envelope = JSON.stringify({ format: 'tidal-backup', version: 3, sha256: '0'.repeat(64), payload: JSON.stringify(changed) });
+  assert.throws(() => restoreBackup(f.root, 'invalid-restore', envelope, '', {}));
+  assert.equal(existsSync(join(f.root, 'spaces', 'invalid-restore')), false);
 });
 
-test('failed oversized legacy merge leaves all original fragments and IDs intact', t => {
-  const f = fixture(t), space = f.open(), at = new Date(f.now).toISOString();
-  legacyInsert(space.privateDb, 'large-a', 'author-a', 'A'.repeat(1100000), at);
-  legacyInsert(space.privateDb, 'large-b', 'author-a', 'B'.repeat(1100000), at);
-  assert.throws(() => space.appendPrivate('author-a', 'extra'), { code: 'INVALID_INPUT' });
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM entries').get().n, 2);
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM entry_aliases').get().n, 0);
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM entry_state').get().n, 0);
-});
-
-test('encrypted restore rejects raw oversized private text even when trimming would hide its size', t => {
+test('private forget and clear remove Markdown bodies but preserve metadata tombstones', t => {
   const f = fixture(t), space = f.open();
-  legacyInsert(space.privateDb, 'oversized', 'author-a', ' '.repeat(2 * 1024 * 1024) + 'x', new Date(f.now).toISOString());
-  const backup = packBackup(space, 'synthetic-password-123');
-  assert.throws(() => restoreBackup(f.root, 'oversized-restore', backup, 'synthetic-password-123', {}), { code: 'INVALID_BACKUP' });
-  assert.equal(existsSync(join(f.root, 'spaces', 'oversized-restore')), false);
-});
-
-test('private deletion removes aliases and pending state without touching old backups', t => {
-  const f = fixture(t), space = f.open(), at = new Date(f.now).toISOString();
-  legacyInsert(space.privateDb, 'delete-a', 'author-a', 'DELETE_PRIVATE_A', at);
-  legacyInsert(space.privateDb, 'delete-b', 'author-a', 'DELETE_PRIVATE_B', at);
-  const entry = space.appendPrivate('author-a', 'DELETE_PRIVATE_C');
-  space.privateDb.prepare('INSERT OR IGNORE INTO journal_pending VALUES(?)').run(entry.id);
-  const backup = packBackup(space, 'synthetic-password-123');
+  const first = space.appendPrivate('author-a', 'FORGET_CANARY');
+  const second = space.appendPrivate('author-a', 'KEEP_CANARY');
+  const path = join(space.privateDirectory, '2026', '2026-03-04.md');
+  space.privateDb.prepare('INSERT INTO entry_aliases(alias_id,entry_id) VALUES(?,?)').run('legacy-alias', first.id);
+  space.forgetLedger.addPrivate(space.lineageId, [first.id, 'legacy-alias']);
+  space.reconcileForgetLedger();
+  assert.equal(readFileSync(path, 'utf8').includes('FORGET_CANARY'), false);
+  assert.equal(readFileSync(path, 'utf8').includes('KEEP_CANARY'), true);
+  assert.equal(space.privateStatus().count, 1);
   assert.throws(() => space.clearPrivate(admin, 'wrong'), { code: 'CONFIRMATION_REQUIRED' });
   space.clearPrivate(admin, 'DELETE PRIVATE JOURNAL');
   assert.equal(space.privateStatus().count, 0);
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM entry_aliases').get().n, 0);
-  assert.equal(space.privateDb.prepare('SELECT count(*) AS n FROM journal_pending').get().n, 0);
-  const restored = restoreBackup(f.root, 'backup-still-exists', backup, 'synthetic-password-123', {});
-  assert.equal(restored.privateCount, 0);
-  assert.equal(restored.skippedPrivate, 1);
-  assert.ok(existsSync(join(f.root, 'spaces', 'backup-still-exists')));
+  assert.equal(existsSync(path), false);
+  assert.ok(space.privateDb.prepare('SELECT 1 FROM private_tombstones WHERE id=?').get(second.id));
 });
