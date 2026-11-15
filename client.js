@@ -624,6 +624,8 @@ window.__ModuleLoader__.load({
           h('p', { className: 'muted' }, `最近写入：${status.private.lastWritten || '尚无记录'}`),
           h('p', null, status.private.generation),
           h('p', { className: 'path' }, status.private.directory),
+          h('p', { className: 'muted' }, '正文目录只保留 YYYY-MM-DD.md；同一天的贡献合并写入。索引和写入暂存保存在 system/private，不在正文目录。'),
+          status.private.indexFile && h('p', { className: 'path' }, `内部索引：${status.private.indexFile}`),
           h('small', null, '不出现在普通搜索、图谱和明文备份中。主会话回顾时，日记片段会进入该会话历史；此隔离不是对本机管理员或其他任意文件工具的绝对保密。')),
         h('div', { className: 'panel stack' },
           h('h3', null, '同工作区主会话回顾'),

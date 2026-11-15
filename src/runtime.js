@@ -11,6 +11,7 @@ import { clearTopicFiles } from './topic-index.js';
 import { clearGraphFiles } from './graph-index.js';
 import { graphSemanticSuggestions } from './graph-semantic.js';
 import { privateJournalStatus } from './private-journal.js';
+import { privateJournalDatabasePath } from './journal-files.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup, MAX_RESTORE_BODY_BYTES } from './transfer.js';
 import { automaticKeyStatus, readAutomaticKey, saveAutomaticKey } from './backup-key.js';
 import { bindingFor, classifyRememberDirective, configOf, ENCODING_VERSION, LAYERS, MAX_RECALL_QUERY_LENGTH,
@@ -742,6 +743,7 @@ export class TidalRuntime {
       ...Object.values(LAYERS).map(info => join(directory, info.directory, info.file)),
       join(directory, 'system', 'operations.sqlite3'),
       join(directory, 'private', 'journal.sqlite3'),
+      privateJournalDatabasePath(directory),
     ];
     if (databaseFiles.some(file => existsSync(`${file}-wal`))) {
       return { space: name, directory, unavailable: true,
@@ -780,7 +782,8 @@ export class TidalRuntime {
       const encoded = (system?.prepare('SELECT result FROM encodings').all() ?? []).map(row => JSON.parse(row.result));
       const reasons = {};
       for (const row of encoded) reasons[row.reason] = (reasons[row.reason] ?? 0) + 1;
-      const privateFile = join(directory, 'private', 'journal.sqlite3');
+      const privateFile = existsSync(privateJournalDatabasePath(directory)) ? privateJournalDatabasePath(directory) :
+        join(directory, 'private', 'journal.sqlite3');
       const privateDb = open(privateFile);
       const count = privateDb ? privateJournalStatus(privateDb, join(directory, 'private')) :
         { count: 0, lastWritten: null, dailyCount: 0, legacyCount: 0, firstDay: null, lastDay: null, organization: null, failure: null };
@@ -791,7 +794,7 @@ export class TidalRuntime {
       bytes += count.bytes ?? 0;
       return {
         space: name, directory, layers, errors: [], searchIndex,
-        private: { ...count, bytes, directory: join(directory, 'private'), authors: this.config.privateWriters,
+        private: { ...count, bytes, directory: join(directory, 'private'), indexFile: privateFile, authors: this.config.privateWriters,
           contentVisible: false, generation: '由获准的外部作者插件提供，本插件不生成拟人人格日记。' },
         encoding: { version: ENCODING_VERSION, inspected: encoded.length,
           saved: encoded.reduce((total, row) => total + row.saved, 0), reasons,

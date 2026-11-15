@@ -4,7 +4,7 @@ import { join, basename } from 'node:path';
 import { atomicFile } from './database.js';
 import { MemorySpace, openSpaceFor } from './store.js';
 import { expandForgotten, ForgetLedger } from './forget-ledger.js';
-import { importPrivateEntry, MAX_PRIVATE_CONTENT_LENGTH } from './private-journal.js';
+import { importPrivateEntry, migratePrivateJournalLayout, MAX_PRIVATE_CONTENT_LENGTH } from './private-journal.js';
 import { dailyJournalPath, journalFileHash, undatedJournalPath, writeJournalFile } from './journal-files.js';
 import { readAutomaticKey } from './backup-key.js';
 import { hash, localDateKey, MemoryError, normalizeRecord, requireValue, slug, string, timestamp } from './model.js';
@@ -166,6 +166,7 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
   const validDay = day => typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) &&
     Number.isFinite(Date.parse(`${day}T00:00:00Z`)) &&
     new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day;
+  const matchesDayPath = (path, day) => path === dailyJournalPath(day) || path === `${day.slice(0, 4)}/${day}.md`;
   const normalizedSources = entry => {
     let sources;
     try { sources = typeof entry.source_ids === 'string' ? JSON.parse(entry.source_ids) : entry.source_ids; }
@@ -196,9 +197,9 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
       requireValue(file && typeof file.path === 'string' && typeof file.content === 'string' &&
         typeof file.sha256 === 'string' && /^[a-f0-9]{64}$/.test(file.sha256) &&
         journalFileHash(file.content) === file.sha256, 'INVALID_BACKUP', '私人 Markdown 文件校验失败。');
-      const daily = /^(\d{4})\/(\d{4}-\d{2}-\d{2})\.md$/.exec(file.path);
+      const daily = /^(?:(\d{4})\/)?(\d{4}-\d{2}-\d{2})\.md$/.exec(file.path);
       const undated = /^undated\/[a-f0-9]{64}\.md$/.test(file.path);
-      requireValue((daily && daily[1] === daily[2].slice(0, 4) && validDay(daily[2])) || undated,
+      requireValue((daily && (!daily[1] || daily[1] === daily[2].slice(0, 4)) && validDay(daily[2])) || undated,
         'INVALID_BACKUP', '私人 Markdown 文件路径无效。');
       requireValue(!fileMap.has(file.path), 'INVALID_BACKUP', '私人 Markdown 文件路径重复。');
       fileMap.set(file.path, file.content);
@@ -207,7 +208,7 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
       const day = entry.day_key ?? null;
       const path = entry.relative_path;
       requireValue(typeof path === 'string' && fileMap.has(path) &&
-        (day === null ? /^undated\/[a-f0-9]{64}\.md$/.test(path) : path === dailyJournalPath(day)),
+        (day === null ? /^undated\/[a-f0-9]{64}\.md$/.test(path) : validDay(day) && matchesDayPath(path, day)),
       'INVALID_BACKUP', '私人记录与 Markdown 文件路径不匹配。');
       requireValue(typeof entry.content_hash === 'string' && /^[a-f0-9]{64}$/.test(entry.content_hash),
         'INVALID_BACKUP', '私人记录正文校验元数据无效。');
@@ -226,7 +227,7 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
     }
     const rowByPath = new Map(rows.map(row => [row.relative_path, row]));
     for (const day of days) {
-      requireValue(day && validDay(day.day_key) && day.relative_path === dailyJournalPath(day.day_key) &&
+      requireValue(day && validDay(day.day_key) && matchesDayPath(day.relative_path, day.day_key) &&
         Number.isSafeInteger(day.revision) && day.revision > 0 && typeof day.content_hash === 'string' &&
         /^[a-f0-9]{64}$/.test(day.content_hash), 'INVALID_BACKUP', '私人日记日期元数据无效。');
       const original = fileMap.get(day.relative_path);
@@ -280,7 +281,7 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
   for (const item of metadata) {
     requireValue(item && typeof item.key === 'string' && typeof item.value === 'string',
       'INVALID_BACKUP', '私人日记设置元数据无效。');
-    if (item.key !== 'last-failure') store.privateDb.prepare('INSERT OR REPLACE INTO journal_metadata(key,value) VALUES(?,?)')
+    if (!['last-failure', 'layout-migration'].includes(item.key)) store.privateDb.prepare('INSERT OR REPLACE INTO journal_metadata(key,value) VALUES(?,?)')
       .run(item.key, item.value);
   }
   for (const id of tombstones) {
@@ -327,6 +328,7 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
           VALUES(?,?,?,?,?,?,?)`).run(item.day_key, item.source_hash, item.output_hash,
           item.session_id, item.provider, item.model, item.updated_at);
   }
+  migratePrivateJournalLayout(store.privateDb, store.privateDirectory);
   return { restored: rows.length, skipped: entries.length - rows.length };
 }
 
@@ -598,7 +600,7 @@ export function importPreview(files) {
     requireValue(total <= 10 * 1024 * 1024, 'IMPORT_TOO_LARGE', '每批最多 10 MiB。');
     const fingerprint = hash(content);
     if (file.private === true || PRIVATE_NAME.test(name)) {
-      privateFiles.push({ fingerprint, content });
+      privateFiles.push({ fingerprint, content, filename: name });
       continue;
     }
     requireValue(/\.(md|markdown|txt|json)$/i.test(name), 'IMPORT_FORMAT', '支持 Markdown、文本和 fish-memory JSON。');
@@ -645,7 +647,7 @@ export function applyImport(space, plan, selected) {
       const h = file.fingerprint;
       const id = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
       importPrivateEntry(space.privateDb, space.privateDirectory, {
-        id, content: file.content, createdAt: space.now(), sourceIds: []
+        id, content: file.content, createdAt: space.now(), sourceIds: [], filename: file.filename
       });
       privateCount++;
     }

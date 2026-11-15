@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { localDateKey, requireValue, slug, timestamp } from './model.js';
-import { transaction } from './database.js';
+import { openDatabase, transaction } from './database.js';
 import {
   dailyJournalPath, journalFileHash, listJournalFiles, publishJournalFile,
-  readJournalFile, removeJournalFile, stageJournalFile, undatedJournalPath
+  readJournalFile, removeJournalFile, stageJournalFile, migrateJournalStaging,
+  privateJournalDatabasePath, removeEmptyJournalDirectories
 } from './journal-files.js';
 
 export const MAX_PRIVATE_CONTENT_LENGTH = 50_000;
@@ -29,6 +32,25 @@ function safeDay(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value ? value : null;
 }
 
+export function originalJournalDay(content, filename = '') {
+  const filenameDay = /(?:^|[\\/])[^\\/]*?(\d{4}-\d{2}-\d{2})(?!\d)[^\\/]*\.(?:md|markdown|txt)$/i.exec(filename)?.[1];
+  if (safeDay(filenameDay)) return filenameDay;
+  const firstLine = content.trimStart().split(/\r?\n/, 1)[0];
+  const provenance = /^【旧日记原件[:：].*?(\d{4}-\d{2}-\d{2})(?!\d)[^\\/]*\.md(?:.*)】$/.exec(firstLine)?.[1];
+  if (safeDay(provenance)) return provenance;
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content.trimStart())?.[1];
+  const field = frontmatter && /^(?:date|day):\s*["']?(\d{4}-\d{2}-\d{2})(?:["']?\s*)$/m.exec(frontmatter)?.[1];
+  if (safeDay(field)) return field;
+  const heading = /^#{1,6}\s+[^\r\n]*?(\d{4}-\d{2}-\d{2})(?!\d)/.exec(content.trimStart())?.[1];
+  return safeDay(heading);
+}
+
+function archiveDay(createdAt) {
+  const created = safeTime(createdAt);
+  requireValue(created, 'JOURNAL_DATE_REQUIRED', '旧日记缺少可用的原日期和归档时间，原件已保留，请补充日期。', 409);
+  return localDateKey(new Date(created));
+}
+
 function authorLabel(value) {
   return String(value || 'unknown').replace(/[\r\n]/g, ' ').slice(0, 128);
 }
@@ -37,7 +59,8 @@ function contributionBlock(entry) {
   const id = String(entry.id);
   const timestamp = safeTime(entry.created_at) || 'unknown time';
   const contentHash = journalFileHash(String(entry.content ?? ''));
-  return `<!-- tidal-entry:${id} sha256:${contentHash} -->\n### ${timestamp} · ${authorLabel(entry.author)}\n\n${entry.content}\n<!-- /tidal-entry:${id} -->`;
+  const dateNote = entry.archiveDateOnly ? ' · 原日期未知，按导入日期归档' : '';
+  return `<!-- tidal-entry:${id} sha256:${contentHash} -->\n### ${timestamp} · ${authorLabel(entry.author)}${dateNote}\n\n${entry.content}\n<!-- /tidal-entry:${id} -->`;
 }
 
 function newDayDocument(day) {
@@ -177,11 +200,12 @@ function migrateLegacyJournal(db, root) {
   const groups = new Map();
   const migrated = rows.map(row => {
     const state = states.get(row.id);
-    const day = safeDay(state?.day_key) ||
-      (row.author === 'legacy-import' ? null : safeDay(row.created_at?.slice(0, 10)));
-    const path = day ? dailyJournalPath(day) : undatedJournalPath(row.id);
+    const originalDay = safeDay(state?.day_key) || (row.author === 'legacy-import' ? originalJournalDay(row.content) : null);
+    const day = originalDay || archiveDay(row.created_at);
+    const path = dailyJournalPath(day);
     const entry = {
       ...row,
+      archiveDateOnly: row.author === 'legacy-import' && !originalDay,
       day_key: day,
       relative_path: path,
       revision: Math.max(1, Number(state?.revision) || 1),
@@ -302,6 +326,7 @@ export function recoverJournalTransactions(db, root) {
 }
 
 export function initializePrivateJournal(db, root) {
+  migrateJournalStaging(root);
   const version = Number(db.prepare('PRAGMA user_version').get().user_version || 0);
   requireValue(version <= FORMAT_VERSION, 'JOURNAL_VERSION_UNSUPPORTED', '私人日记数据库版本较新，当前版本不能安全打开。', 409);
   if (tableExists(db, 'entries') && tableColumns(db, 'entries').includes('content')) {
@@ -313,6 +338,161 @@ export function initializePrivateJournal(db, root) {
   }
   assertJournalSchema(db);
   recoverJournalTransactions(db, root);
+  migratePrivateJournalLayout(db, root);
+}
+
+export function openPrivateJournal(directory) {
+  mkdirSync(join(directory, 'private'), { recursive: true });
+  const legacy = join(directory, 'private', 'journal.sqlite3');
+  const target = privateJournalDatabasePath(directory);
+  if (existsSync(legacy)) {
+    requireValue(!existsSync(target), 'JOURNAL_INDEX_CONFLICT', '新旧私人日记索引同时存在，未覆盖；请先核对数据。', 409);
+    const previous = openDatabase(legacy);
+    try {
+      const checkpoint = previous.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+      requireValue(checkpoint.busy === 0, 'JOURNAL_INDEX_BUSY', '旧私人日记索引仍被占用，未移动。', 409);
+    } finally { previous.close(); }
+    mkdirSync(dirname(target), { recursive: true });
+    renameSync(legacy, target);
+  }
+  for (const suffix of ['-wal', '-shm']) {
+    const file = `${legacy}${suffix}`;
+    if (!existsSync(file)) continue;
+    requireValue(existsSync(target) && (suffix !== '-wal' || statSync(file).size === 0),
+      'JOURNAL_INDEX_CONFLICT', '旧日记辅助文件仍含未归并的数据，未删除。', 409);
+    rmSync(file);
+  }
+  const db = openDatabase(target);
+  try {
+    const hadBodies = tableColumns(db, 'entries').includes('content');
+    db.exec('PRAGMA secure_delete=ON');
+    initializePrivateJournal(db, join(directory, 'private'));
+    if (hadBodies) db.exec('VACUUM; PRAGMA wal_checkpoint(TRUNCATE)');
+    return db;
+  } catch (error) { db.close(); throw error; }
+}
+
+function originalEntryContent(document, entry) {
+  const start = `<!-- tidal-entry:${entry.id} sha256:${entry.content_hash} -->`;
+  const end = `\n<!-- /tidal-entry:${entry.id} -->`;
+  const position = document.indexOf(start);
+  const bodyStart = position < 0 ? -1 : document.indexOf('\n\n', position + start.length);
+  const bodyEnd = bodyStart < 0 ? -1 : document.indexOf(end, bodyStart + 2);
+  requireValue(position >= 0 && bodyStart >= 0 && bodyEnd >= 0 && document.indexOf(start, position + start.length) < 0,
+    'JOURNAL_MIGRATION_CONFLICT', '旧日记原件标记不完整或重复，未删除原件。', 409);
+  const content = document.slice(bodyStart + 2, bodyEnd);
+  requireValue(journalFileHash(content) === entry.content_hash, 'JOURNAL_MIGRATION_CONFLICT', '旧日记正文校验失败，未删除原件。', 409);
+  return content;
+}
+
+function resumeJournalLayout(db, root, plan) {
+  requireValue(['pending', 'cleanup'].includes(plan.phase), 'JOURNAL_MIGRATION_CONFLICT', '日记迁移状态无效，原件已保留。', 409);
+  if (plan.phase === 'pending') {
+    for (const source of plan.sources) {
+      const text = readJournalFile(root, source.path);
+      const published = plan.documents.find(item => item.relative === source.path);
+      requireValue(text !== null && (journalFileHash(text) === source.hash ||
+        (published && journalFileHash(text) === published.hash)),
+      'JOURNAL_MIGRATION_CONFLICT', '旧日记在迁移期间被修改，未覆盖或删除。', 409);
+    }
+    for (const document of plan.documents) {
+      const text = readJournalFile(root, document.relative);
+      const current = text === null ? null : journalFileHash(text);
+      if (current === document.hash) {
+        removeJournalFile(root, document.temporary);
+      } else {
+        requireValue(current === document.oldHash, 'JOURNAL_MIGRATION_CONFLICT', '日期日记文件发生冲突，原件已保留。', 409);
+        const staged = readJournalFile(root, document.temporary);
+        requireValue(staged !== null && journalFileHash(staged) === document.hash,
+          'JOURNAL_RECOVERY_STAGE_INVALID', '日期整理暂存文件缺失或损坏，原件已保留。', 409);
+        publishJournalFile(root, document);
+      }
+    }
+    transaction(db, () => {
+      for (const entry of plan.entries)
+        db.prepare('UPDATE entries SET day_key=?, relative_path=? WHERE id=?').run(entry.day, dailyJournalPath(entry.day), entry.id);
+      for (const document of plan.documents) {
+        db.prepare(`INSERT INTO journal_days(day_key,relative_path,revision,updated_at,content_hash) VALUES(?,?,?,?,?)
+          ON CONFLICT(day_key) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,
+          updated_at=excluded.updated_at,content_hash=excluded.content_hash`)
+          .run(document.day, document.relative, document.revision, document.updatedAt, document.hash);
+        db.prepare('DELETE FROM journal_observations WHERE day_key=? AND content_hash<>?').run(document.day, document.hash);
+        db.prepare('DELETE FROM journal_organized WHERE day_key=? AND output_hash<>?').run(document.day, document.hash);
+      }
+      plan.phase = 'cleanup';
+      db.prepare("INSERT OR REPLACE INTO journal_metadata VALUES('layout-migration',?)").run(JSON.stringify(plan));
+    });
+  }
+  for (const document of plan.documents) {
+    const text = readJournalFile(root, document.relative);
+    requireValue(text !== null && journalFileHash(text) === document.hash,
+      'JOURNAL_MIGRATION_CONFLICT', '已迁移的日记被修改或丢失，旧原件未删除。', 409);
+  }
+  for (const source of plan.sources) {
+    if (plan.documents.some(document => document.relative === source.path)) continue;
+    const text = readJournalFile(root, source.path);
+    requireValue(text === null || journalFileHash(text) === source.hash,
+      'JOURNAL_MIGRATION_CONFLICT', '待清理旧日记已被修改，保留原件。', 409);
+    if (text !== null) removeJournalFile(root, source.path);
+  }
+  removeEmptyJournalDirectories(root);
+  db.prepare("DELETE FROM journal_metadata WHERE key='layout-migration'").run();
+}
+
+export function migratePrivateJournalLayout(db, root) {
+  const pending = db.prepare("SELECT value FROM journal_metadata WHERE key='layout-migration'").get();
+  if (pending) resumeJournalLayout(db, root, JSON.parse(pending.value));
+  const entries = db.prepare('SELECT * FROM entries ORDER BY created_at,id').all();
+  const changes = entries.filter(entry => !entry.day_key || entry.relative_path !== dailyJournalPath(entry.day_key));
+  if (!changes.length) { removeEmptyJournalDirectories(root); return; }
+  const plan = { phase: 'pending', entries: [], sources: [], documents: [] };
+  const sources = new Map(), groups = new Map();
+  const sourceText = path => {
+    if (!sources.has(path)) {
+      const content = readJournalFile(root, path);
+      requireValue(content !== null, 'JOURNAL_FILE_MISSING', '旧日记原件缺失，日期整理已停止。', 409);
+      sources.set(path, content);
+      plan.sources.push({ path, hash: journalFileHash(content) });
+    }
+    return sources.get(path);
+  };
+  for (const entry of changes) {
+    const content = entry.day_key ? null : originalEntryContent(sourceText(entry.relative_path), entry);
+    const originalDay = entry.day_key || originalJournalDay(content);
+    const day = originalDay || archiveDay(entry.created_at);
+    if (!groups.has(day)) groups.set(day, []);
+    groups.get(day).push({ ...entry, content, archiveDateOnly: !originalDay });
+    plan.entries.push({ id: entry.id, day });
+  }
+  let saved = false;
+  try {
+    for (const [day, additions] of groups) {
+      const state = db.prepare('SELECT * FROM journal_days WHERE day_key=?').get(day);
+      let content = state ? sourceText(state.relative_path) : null;
+      requireValue(!state || journalFileHash(content) === state.content_hash,
+        'JOURNAL_EXTERNAL_CHANGE', '旧日期日记已被修改，未覆盖。', 409);
+      for (const entry of additions) {
+        if (entry.day_key) {
+          requireValue(state && state.relative_path === entry.relative_path,
+            'JOURNAL_MIGRATION_CONFLICT', '旧日期日记索引不一致，原件已保留。', 409);
+        } else content = appendContribution(content, day, entry);
+      }
+      const path = dailyJournalPath(day), existing = readJournalFile(root, path);
+      requireValue(existing === null || (state?.relative_path === path && state.content_hash === journalFileHash(existing)) ||
+        existing === content, 'JOURNAL_MIGRATION_CONFLICT', '目标日期文件已存在且不一致，未覆盖。', 409);
+      requireValue(Buffer.byteLength(content) <= MAX_DAY_BYTES, 'JOURNAL_DAY_TOO_LARGE', '合并后的日记超过单日大小限制，原件已保留。', 413);
+      const staged = stageJournalFile(root, path, content);
+      plan.documents.push({ ...staged, day, oldHash: existing === null ? null : journalFileHash(existing),
+        revision: (state?.revision || 0) + (additions.some(entry => !entry.day_key) || !state ? 1 : 0),
+        updatedAt: [state?.updated_at, ...additions.map(entry => entry.created_at)].filter(Boolean).sort().at(-1) });
+    }
+    db.prepare("INSERT OR REPLACE INTO journal_metadata VALUES('layout-migration',?)").run(JSON.stringify(plan));
+    saved = true;
+    resumeJournalLayout(db, root, plan);
+  } catch (error) {
+    if (!saved) for (const document of plan.documents) removeJournalFile(root, document.temporary);
+    throw error;
+  }
 }
 
 export function appendPrivateEntry(db, root, { author, content, sourceIds = [], sourceSession = null,
@@ -328,6 +508,8 @@ export function appendPrivateEntry(db, root, { author, content, sourceIds = [], 
   requireValue(typeof operationId === 'string' && operationId.length > 0 && operationId.length <= 256,
     'INVALID_OPERATION_ID', '私人记录操作 ID 无效。');
   const timestamp = safeTime(now);
+  requireValue(timestamp, 'INVALID_PRIVATE_DATE', '私人日记写入时间无效，未写入。');
+  recoverJournalTransactions(db, root);
   const day = localDateKey(new Date(timestamp));
   const relativePath = dailyJournalPath(day);
   const entryId = randomUUID();
@@ -374,36 +556,44 @@ export function appendPrivateEntry(db, root, { author, content, sourceIds = [], 
   return db.prepare('SELECT * FROM entries WHERE id=?').get(entryId);
 }
 
-export function importPrivateEntry(db, root, { id, content, createdAt = new Date().toISOString(), sourceIds = [] }) {
+export function importPrivateEntry(db, root, { id, content, createdAt = new Date().toISOString(), sourceIds = [], filename = '' }) {
   requireValue(typeof id === 'string' && id.length > 0 && id.length <= 256, 'INVALID_ID', '私人导入 ID 无效。');
   requireValue(typeof content === 'string' && content.length > 0 &&
     Buffer.byteLength(content, 'utf8') <= MAX_DAY_BYTES, 'INVALID_PRIVATE_CONTENT', '私人导入文件超过大小限制。', 413);
-  const timestampValue = safeTime(createdAt) || new Date().toISOString();
+  const timestampValue = safeTime(createdAt);
+  requireValue(timestampValue, 'INVALID_PRIVATE_DATE', '私人日记导入时间无效，未写入。');
+  recoverJournalTransactions(db, root);
   const contentHash = journalFileHash(content);
   const existing = db.prepare('SELECT * FROM entries WHERE id=?').get(id);
   if (existing) {
     requireValue(existing.content_hash === contentHash, 'OPERATION_ID_REUSED', '私人导入 ID 已用于不同内容。', 409);
     return existing;
   }
-  const path = undatedJournalPath(id);
+  const originalDay = originalJournalDay(content, filename);
+  const day = originalDay || archiveDay(timestampValue);
+  const path = dailyJournalPath(day);
   const previous = readJournalFile(root, path);
-  requireValue(previous === null, 'JOURNAL_EXTERNAL_CHANGE', '私人导入目标文件已存在，未覆盖。', 409);
-  const entry = { id, author: 'legacy-import', created_at: timestampValue, content };
-  const document = `${contributionBlock(entry)}\n\n`;
+  const state = db.prepare('SELECT * FROM journal_days WHERE day_key=?').get(day);
+  requireValue(previous === null ? !state : state?.content_hash === journalFileHash(previous),
+    'JOURNAL_EXTERNAL_CHANGE', '私人导入目标文件与索引不一致，未覆盖。', 409);
+  const entry = { id, author: 'legacy-import', created_at: timestampValue, content, archiveDateOnly: !originalDay };
+  const document = appendContribution(previous, day, entry);
+  requireValue(Buffer.byteLength(document) <= MAX_DAY_BYTES, 'JOURNAL_DAY_TOO_LARGE', '合并后的日记超过单日大小限制，未导入。', 413);
   const staged = stageJournalFile(root, path, document);
   const operationId = `import-${randomUUID()}`;
   const payloadHash = journalFileHash(JSON.stringify({ id, contentHash }));
   try {
     transaction(db, () => {
       db.prepare(`INSERT INTO entries(id,author,created_at,source_ids,day_key,relative_path,revision,content_hash)
-        VALUES(?,?,?, ?,NULL,?,1,?)`).run(id, 'legacy-import', timestampValue, JSON.stringify(sourceIds), path, contentHash);
+        VALUES(?,?,?,?,?,?,1,?)`).run(id, 'legacy-import', timestampValue, JSON.stringify(sourceIds), day, path, contentHash);
       db.prepare('INSERT INTO journal_pending(entry_id,state,updated_at) VALUES(?,?,?)')
         .run(id, 'pending', timestampValue);
       db.prepare('INSERT INTO journal_operations(operation_id,payload_hash,entry_id,created_at) VALUES(?,?,?,?)')
         .run(operationId, payloadHash, id, timestampValue);
       db.prepare(`INSERT INTO journal_transactions
         (operation_id,entry_id,day_key,relative_path,temporary_path,old_hash,new_hash,revision,created_at)
-        VALUES(?,?,NULL,?,?,NULL,?,1,?)`).run(operationId, id, path, staged.temporary, staged.hash, timestampValue);
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(operationId, id, day, path, staged.temporary,
+          previous === null ? null : journalFileHash(previous), staged.hash, (state?.revision || 0) + 1, timestampValue);
     });
   } catch (error) {
     removeJournalFile(root, staged.temporary);
@@ -630,7 +820,7 @@ export function privateJournalStatus(db, root, now = new Date()) {
     format: 'markdown',
     count: summary.count,
     fileCount: files.length,
-    dailyCount: files.filter(file => /^\d{4}\/\d{4}-\d{2}-\d{2}\.md$/.test(file.path)).length,
+    dailyCount: files.filter(file => /^(?:\d{4}\/)?\d{4}-\d{2}-\d{2}\.md$/.test(file.path)).length,
     legacyCount: db.prepare('SELECT COUNT(*) AS count FROM entries WHERE day_key IS NULL').get().count,
     bytes: files.reduce((total, file) => total + Buffer.byteLength(file.content, 'utf8'), 0),
     lastWritten: safeTime(summary.lastWritten),

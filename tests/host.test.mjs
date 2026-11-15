@@ -272,7 +272,7 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     assert.equal(contribution.saved, true);
     assert.match(contribution.day, /^\d{4}-\d{2}-\d{2}$/);
     assert.equal(JSON.stringify(contribution).includes('SESSION_CONTRIBUTION_CANARY'), false);
-    const contributionDb = openDatabase(join(root, 'spaces', 'shared', 'private', 'journal.sqlite3'));
+    const contributionDb = openDatabase(join(root, 'spaces', 'shared', 'system', 'private', 'journal.sqlite3'));
     assert.equal(contributionDb.prepare('SELECT source_session FROM entries WHERE id=?')
       .get(contribution.id).source_session, 'session-a');
     contributionDb.close();
@@ -282,13 +282,13 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     assert.deepEqual(await requestHook({ turn: 1, step: 1 },
       async () => ({ provider: 'fixture-provider', model: 'fixture-model' })),
     { provider: 'fixture-provider', model: 'fixture-model' });
-    const beforeReply = openDatabase(join(root, 'spaces', 'shared', 'private', 'journal.sqlite3'));
+    const beforeReply = openDatabase(join(root, 'spaces', 'shared', 'system', 'private', 'journal.sqlite3'));
     assert.equal(beforeReply.prepare('SELECT count(*) AS n FROM journal_observations').get().n, 0);
     beforeReply.close();
     ctx.emit('session/event', session, { type: 'assistant/message', time: Date.now(),
       data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'synthetic response' }] },
         stream: [] } });
-    const afterReply = openDatabase(join(root, 'spaces', 'shared', 'private', 'journal.sqlite3'));
+    const afterReply = openDatabase(join(root, 'spaces', 'shared', 'system', 'private', 'journal.sqlite3'));
     assert.equal(afterReply.prepare('SELECT count(*) AS n FROM journal_observations').get().n, 1);
     afterReply.close();
     const childSession = { id: 'private-fork', header: { cwd, parentSession: 'session-a' }, snapshotEvents: () => [] };

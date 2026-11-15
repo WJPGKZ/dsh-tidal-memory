@@ -9,10 +9,11 @@ import { GraphIndex, clearGraphFiles, graphPair } from './graph-index.js';
 import { confirmedGraphNeighbors, graphDecision, graphList, graphNeighbors } from './graph.js';
 import { expandForgotten, ForgetLedger } from './forget-ledger.js';
 import {
-  appendPrivateEntry, clearPrivateJournal, initializePrivateJournal, organizePrivateDay, organizePrivateWindow,
+  appendPrivateEntry, clearPrivateJournal, openPrivateJournal, organizePrivateDay, organizePrivateWindow,
   privateJournalContext, recordPrivateObservation,
   privateJournalFiles, privateJournalStatus, removePrivateEntries
 } from './private-journal.js';
+import { privateJournalDatabasePath } from './journal-files.js';
 import { contextualSleepCandidate, SLEEP_CONTEXT_VERSION } from './sleep-context.js';
 import {
   LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MAX_PROVENANCE_ITEMS, MAX_PROVENANCE_BYTES, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
@@ -130,8 +131,7 @@ export class MemorySpace {
       'INVALID_LINEAGE', '记忆空间恢复谱系无效。');
       if (!existingLineage) this.system.prepare('INSERT INTO metadata VALUES(?,?)').run('lineage', this.lineageId);
       if (options.registerName !== false) this.forgetLedger.register(name, this.lineageId);
-      this.privateDb = openDatabase(join(this.privateDirectory, 'journal.sqlite3'));
-      initializePrivateJournal(this.privateDb, this.privateDirectory);
+      this.privateDb = openPrivateJournal(this.directory);
       if (!this.deferLedgerWrites) {
         this.forgetLedger.add(this.lineageId, this.system.prepare('SELECT * FROM tombstones').all(),
           this.system.prepare('SELECT dedupe_key FROM forgotten_keys').all().map(row => row.dedupe_key));
@@ -1888,12 +1888,12 @@ export class MemorySpace {
   privateStatus() {
     this.reconcileForgetLedger();
     const count = privateJournalStatus(this.privateDb, this.privateDirectory, new Date(this.clock()));
-    const file = join(this.directory, 'private', 'journal.sqlite3');
+    const file = privateJournalDatabasePath(this.directory);
     let bytes = 0;
     for (const path of [file, `${file}-wal`]) {
       try { bytes += statSync(path).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
-    return { ...count, bytes: bytes + count.bytes, directory: this.privateDirectory, authors: this.config.privateWriters,
+    return { ...count, bytes: bytes + count.bytes, directory: this.privateDirectory, indexFile: file, authors: this.config.privateWriters,
       contentVisible: false, generation: '由获准的外部作者插件提供，本插件不生成拟人人格日记。' };
   }
   clearPrivate(actor, confirmation) {
