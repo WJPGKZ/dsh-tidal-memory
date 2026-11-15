@@ -15,7 +15,7 @@ import { privateJournalDatabasePath } from './journal-files.js';
 import { automaticBackup, applyImport, importPreview, packBackup, restoreBackup, MAX_RESTORE_BODY_BYTES } from './transfer.js';
 import { automaticKeyStatus, readAutomaticKey, saveAutomaticKey } from './backup-key.js';
 import { bindingFor, classifyRememberDirective, configOf, ENCODING_VERSION, LAYERS, MAX_RECALL_QUERY_LENGTH,
-  localDateKey, MemoryError, requireValue, SEARCH_VERSION, slug, splitCapture, string } from './model.js';
+  canonicalCwd, localDateKey, MemoryError, requireValue, SEARCH_VERSION, slug, splitCapture, string } from './model.js';
 
 export const ADMIN = Object.freeze({ admin: true });
 export const PREFIX = '/tidal-memory';
@@ -737,6 +737,81 @@ export class TidalRuntime {
     });
     return job;
   }
+  hostService(name) {
+    return typeof this.ctx.get === 'function' ? this.ctx.get(name) : this.ctx[name];
+  }
+  sessionChoice(header, agent) {
+    const id = header.id ?? agent?.session.id ?? agent?.id;
+    const candidate = agent?.session ?? this.ctx.sessions?.get?.(id);
+    const live = candidate && canonicalCwd(candidate.header.cwd) === canonicalCwd(header.cwd) ? candidate : null;
+    let values = {}, metadataError = null;
+    try {
+      const cache = this.hostService('sessionProjectionCache');
+      const snapshot = live ? this.hostService('sessionProjections')?.cachedSnapshot?.(live) :
+        cache?.cachedSnapshot?.(header) ?? cache?.cachedPredecessorTitle?.(header);
+      values = snapshot?.values ?? {};
+    } catch {
+      metadataError = 'SESSION_METADATA_READ_FAILED';
+    }
+    const route = live?.requestContext?.() ?? values.modelSelection?.next ?? values.modelSelection?.lastUsed;
+    return { id, title: typeof values.title === 'string' ? values.title : '',
+      cwd: header.cwd ?? '', status: agent?.status ?? (live ? 'idle' : 'inactive'),
+      origin: header.origin ?? 'primary', createdAt: header.createdAt ?? null, metadataError,
+      provider: typeof route?.provider === 'string' ? route.provider : '',
+      model: typeof route?.model === 'string' ? route.model : '' };
+  }
+  liveSessionChoices(spaceName) {
+    return [...this.ctx.agents.list()]
+      .filter(agent => bindingFor(this.config, agent.session.header.cwd)?.space === spaceName)
+      .map(agent => this.sessionChoice(agent.session.header, agent));
+  }
+  async workspaceSessionChoices(spaceName, offset = 0) {
+    const binding = this.config.bindings.find(item => item.space === spaceName);
+    requireValue(binding, 'UNBOUND_WORKSPACE', '请先保存当前空间的工作区绑定，再读取会话。', 409);
+    requireValue(Number.isSafeInteger(offset) && offset >= 0, 'INVALID_OFFSET', '会话分页位置无效。');
+    const query = this.hostService('sessionQuery');
+    requireValue(typeof query?.listSessions === 'function', 'WORKSPACE_SESSIONS_UNAVAILABLE',
+      '当前宿主未提供会话目录服务，无法读取历史会话；现有主会话设置未改动。', 503);
+    const signal = AbortSignal.timeout(30_000);
+    const listed = await query.listSessions(signal);
+    requireValue(Array.isArray(listed), 'SESSION_CATALOG_INVALID', '宿主返回的会话目录格式无效。', 502);
+    const unique = new Map();
+    for (const item of listed) {
+      const header = item?.header;
+      if (typeof header?.id === 'string' && bindingFor(this.config, header.cwd)?.space === spaceName)
+        unique.set(header.id, header);
+    }
+    const headers = [...unique.values()].sort((a, b) =>
+      (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id.localeCompare(b.id));
+    const items = headers.slice(offset, offset + 25).map(header =>
+      this.sessionChoice(header, this.ctx.agents.get(header.id)));
+    const missing = items.filter(item => !item.title);
+    if (missing.length && typeof query.readTitleSnapshots === 'function') {
+      const results = await query.readTitleSnapshots(missing.map(item => item.id), signal);
+      requireValue(Array.isArray(results) && results.length === missing.length,
+        'SESSION_CATALOG_INVALID', '宿主返回的会话名称格式无效。', 502);
+      results.forEach((result, index) => {
+        const item = missing[index];
+        if (result.status === 'rejected') {
+          item.metadataError = 'SESSION_TITLE_READ_FAILED';
+          return;
+        }
+        requireValue(result.status === 'fulfilled' && result.value?.session?.id === item.id &&
+          canonicalCwd(result.value.session.cwd) === canonicalCwd(binding.cwd),
+        'WORKSPACE_SESSIONS_CHANGED', '会话所属工作区已变化，请重新读取。', 409);
+        item.title = typeof result.value.title?.title === 'string' ? result.value.title.title : '';
+      });
+    } else if (missing.length) {
+      for (const item of missing) item.metadataError ??= 'SESSION_TITLE_UNAVAILABLE';
+    }
+    signal.throwIfAborted();
+    this.syncConfig();
+    requireValue(!this.disposed && canonicalCwd(this.config.bindings.find(item => item.space === spaceName)?.cwd) ===
+      canonicalCwd(binding.cwd), 'WORKSPACE_SESSIONS_CHANGED', '工作区绑定已变化，请重新读取。', 409);
+    return { space: spaceName, cwd: binding.cwd, items, total: headers.length,
+      nextOffset: offset + items.length < headers.length ? offset + items.length : null,
+      warnings: items.filter(item => item.metadataError).length };
+  }
   readOnlyStatus(name) {
     const directory = join(this.root, 'spaces', name);
     const databaseFiles = [
@@ -795,7 +870,7 @@ export class TidalRuntime {
       return {
         space: name, directory, layers, errors: [], searchIndex,
         private: { ...count, bytes, directory: join(directory, 'private'), indexFile: privateFile, authors: this.config.privateWriters,
-          contentVisible: false, generation: '由获准的外部作者插件提供，本插件不生成拟人人格日记。' },
+          contentVisible: false, generation: '由获准作者插件或会话主动提交；主会话回顾不会自动生成每日新日记。' },
         encoding: { version: ENCODING_VERSION, inspected: encoded.length,
           saved: encoded.reduce((total, row) => total + row.saved, 0), reasons,
           sleep: JSON.parse(metadata.get('sleep-reencoding') ?? 'null'),
@@ -911,6 +986,14 @@ export class TidalRuntime {
   async api(method, path, query, body) {
     this.syncConfig();
     const spaceName = slug(query.get('space') ?? 'default');
+    if (method === 'GET' && path === '/workspace-sessions') {
+      try { return await this.workspaceSessionChoices(spaceName, Number(query.get('offset') ?? 0)); }
+      catch (error) {
+        if (error instanceof MemoryError) throw error;
+        throw new MemoryError(error?.name === 'TimeoutError' ? 'WORKSPACE_SESSIONS_TIMEOUT' : 'WORKSPACE_SESSIONS_READ_FAILED',
+          '读取工作区会话失败或超时，请重试；主会话选择和授权未改动。', 503);
+      }
+    }
     if (method === 'GET' && path === '/status') {
       let details;
       try { details = this.spaces.get(spaceName)?.status() ?? this.readOnlyStatus(spaceName); } catch (error) {
@@ -950,15 +1033,7 @@ export class TidalRuntime {
         settingsRevision: this.descriptor()?.revision ?? null, busy: this.busy,
         error: this.lastError?.space && this.lastError.space !== spaceName ? null : this.lastError,
         spaceErrors: Object.fromEntries(this.spaceErrors),
-        sessions: [...this.ctx.agents.list()]
-          .filter(a => bindingFor(this.config, a.session.header.cwd)?.space === spaceName)
-          .map(a => {
-            const route = a.session.requestContext?.();
-            return { id: a.id, cwd: a.session.header.cwd ?? '', status: a.status,
-              origin: a.session.header.origin ?? 'primary',
-              provider: typeof route?.provider === 'string' ? route.provider : '',
-              model: typeof route?.model === 'string' ? route.model : '' };
-          }) };
+        sessions: this.liveSessionChoices(spaceName) };
     }
     if (method === 'POST' && path === '/config') {
       const descriptor = this.descriptor();

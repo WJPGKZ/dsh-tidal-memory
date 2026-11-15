@@ -20,3 +20,7 @@ jobs:
         run: pnpm test:unit
       - name: Required real rc5 host contract and request tests
         run: pnpm test:host
+      - name: Prepare browser for settings UI tests
+        run: pnpm exec playwright install chromium
+      - name: Settings UI and workspace session picker
+        run: pnpm test:ui

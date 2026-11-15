@@ -18,13 +18,29 @@ export async function startPreview(port = 0, { embedding } = {}) {
   });
   let revision = 0;
   const agents = [
-    { id: 'demo-a', status: 'idle', session: { header: { cwd }, requestContext: () =>
+    { id: 'demo-a', status: 'idle', session: { id: 'demo-a', header: { id: 'demo-a', cwd }, requestContext: () =>
       ({ provider: 'synthetic-provider', model: 'synthetic-model' }), snapshotEvents: () => [] } },
-    { id: 'demo-b', status: 'idle', session: { header: { cwd }, requestContext: () =>
+    { id: 'demo-b', status: 'idle', session: { id: 'demo-b', header: { id: 'demo-b', cwd }, requestContext: () =>
       ({ provider: 'synthetic-provider', model: 'synthetic-model' }), snapshotEvents: () => [] } },
   ];
+  const titles = { 'demo-a': '日常主会话', 'demo-b': '代码讨论', 'saved-primary': '日常主会话', 'other-saved': '其他工作区会话' };
+  const sessionHeaders = [
+    ...agents.map(agent => agent.session.header),
+    { id: 'saved-primary', cwd },
+    { id: 'other-saved', cwd: otherCwd },
+  ];
+  const projection = header => ({ values: { title: titles[header.id],
+    modelSelection: { next: { provider: 'synthetic-provider', model: 'synthetic-model' } } } });
   const ctx = {
     agents: { list: () => agents, get: id => agents.find(a => a.id === id) },
+    sessions: { get: id => agents.find(agent => agent.id === id)?.session },
+    sessionProjections: { cachedSnapshot: session => projection(session.header) },
+    sessionProjectionCache: { cachedSnapshot: projection },
+    sessionQuery: {
+      listSessions: async () => sessionHeaders.map(header => ({ header })),
+      readTitleSnapshots: async ids => ids.map(id => ({ status: 'fulfilled',
+        value: { session: sessionHeaders.find(header => header.id === id), title: { title: titles[id] } } })),
+    },
     settings: {
       describe: () => [{ ns: 'tidal-memory', revision, value: config }],
       update: async (_ns, patch, expected) => {

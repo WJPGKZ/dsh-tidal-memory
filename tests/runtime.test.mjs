@@ -35,6 +35,108 @@ test('status version matches the installed package manifest', async t => {
   assert.equal(status.version, manifest.version);
 });
 
+test('workspace session catalog includes named inactive sessions and excludes other workspaces before reading titles', async t => {
+  const f = fixture(t);
+  const headers = [
+    { id: f.agent.id, cwd: f.cwd, createdAt: 3 },
+    { id: 'saved-main', cwd: f.cwd, createdAt: 2 },
+    { id: 'foreign', cwd: join(f.root, 'other'), createdAt: 1 },
+    { id: 'child-directory', cwd: join(f.cwd, 'child'), createdAt: 0 },
+  ];
+  f.ctx.sessions = { get: id => id === f.agent.id ? f.agent.session : undefined };
+  f.ctx.sessionProjections = { cachedSnapshot: () => ({ values: { title: '日常主会话' } }) };
+  f.ctx.sessionProjectionCache = { cachedSnapshot: () => ({ values: {
+    modelSelection: { next: { provider: 'saved-provider', model: 'saved-model' } },
+  } }) };
+  f.agent.session.snapshotEvents = () => { throw new Error('Do not read messages for session selection'); };
+  const requested = [];
+  f.ctx.sessionQuery = {
+    listSessions: async () => headers.map(header => ({ header })),
+    readTitleSnapshots: async ids => {
+      requested.push(...ids);
+      return ids.map(id => ({ status: 'fulfilled', value: {
+        session: headers.find(header => header.id === id), title: { title: '日常主会话', privateBody: 'DO_NOT_RETURN' },
+      } }));
+    },
+  };
+  const configBefore = JSON.stringify(f.runtime.config);
+  const data = await f.runtime.api('GET', '/workspace-sessions', new URLSearchParams({ space: 'shared' }));
+  assert.deepEqual(data.items.map(item => item.id), [f.agent.id, 'saved-main']);
+  assert.deepEqual(data.items.map(item => item.title), ['日常主会话', '日常主会话']);
+  assert.deepEqual(requested, ['saved-main']);
+  assert.equal(data.items[1].status, 'inactive');
+  assert.equal(data.items[1].provider, 'saved-provider');
+  assert.equal(data.items[1].model, 'saved-model');
+  assert.equal(data.total, 2);
+  assert.equal(data.nextOffset, null);
+  assert.equal(JSON.stringify(data).includes('DO_NOT_RETURN'), false);
+  assert.equal(JSON.stringify(f.runtime.config), configBefore);
+  assert.equal(existsSync(join(f.root, 'spaces')), false);
+});
+
+test('workspace catalog pagination is bounded and title changes do not change the saved session id', async t => {
+  const f = fixture(t);
+  const headers = Array.from({ length: 27 }, (_, index) => ({ id: `saved-${index}`, cwd: f.cwd, createdAt: 27 - index }));
+  let title = 'Original name', calls = 0;
+  f.ctx.sessionQuery = {
+    listSessions: async () => headers.map(header => ({ header })),
+    readTitleSnapshots: async ids => {
+      calls += ids.length;
+      return ids.map(id => ({ status: 'fulfilled', value: { session: headers.find(h => h.id === id), title: { title } } }));
+    },
+  };
+  f.config.privateMainSessions = [{ space: 'shared', sessionId: 'saved-0', provider: 'p', model: 'm' }];
+  const query = new URLSearchParams({ space: 'shared' });
+  const first = await f.runtime.api('GET', '/workspace-sessions', query);
+  assert.equal(first.items.length, 25);
+  assert.equal(first.nextOffset, 25);
+  assert.equal(calls, 25);
+  const next = await f.runtime.api('GET', '/workspace-sessions', new URLSearchParams({ space: 'shared', offset: '25' }));
+  assert.equal(next.items.length, 2);
+  assert.equal(next.nextOffset, null);
+  title = 'Renamed main';
+  const renamed = await f.runtime.api('GET', '/workspace-sessions', query);
+  assert.equal(renamed.items[0].title, 'Renamed main');
+  assert.equal(f.runtime.config.privateMainSessions[0].sessionId, 'saved-0');
+  await assert.rejects(f.runtime.api('GET', '/workspace-sessions', new URLSearchParams({ space: 'shared', offset: '-1' })),
+    { code: 'INVALID_OFFSET' });
+});
+
+test('missing catalog support and title errors are explicit instead of pretending the workspace is empty', async t => {
+  const f = fixture(t);
+  const query = new URLSearchParams({ space: 'shared' });
+  await assert.rejects(f.runtime.api('GET', '/workspace-sessions', query), { code: 'WORKSPACE_SESSIONS_UNAVAILABLE' });
+  f.ctx.sessionQuery = {
+    listSessions: async () => [{ header: { id: 'saved', cwd: f.cwd } }],
+    readTitleSnapshots: async () => [{ status: 'rejected', reason: new Error('PRIVATE_ERROR_CANARY') }],
+  };
+  const result = await f.runtime.api('GET', '/workspace-sessions', query);
+  assert.equal(result.total, 1);
+  assert.equal(result.warnings, 1);
+  assert.equal(result.items[0].metadataError, 'SESSION_TITLE_READ_FAILED');
+  assert.equal(JSON.stringify(result).includes('PRIVATE_ERROR_CANARY'), false);
+  await assert.rejects(f.runtime.api('GET', '/workspace-sessions', new URLSearchParams({ space: 'unbound' })),
+    { code: 'UNBOUND_WORKSPACE' });
+});
+
+test('changed workspace ownership during asynchronous name reads never returns the wrong titles', async t => {
+  const f = fixture(t);
+  f.ctx.sessionQuery = {
+    listSessions: async () => [{ header: { id: 'saved', cwd: f.cwd } }],
+    readTitleSnapshots: async () => [{ status: 'fulfilled', value: {
+      session: { id: 'saved', cwd: join(f.root, 'different') }, title: { title: 'NOT_AUTHORIZED' },
+    } }],
+  };
+  await assert.rejects(f.runtime.api('GET', '/workspace-sessions', new URLSearchParams({ space: 'shared' })),
+    { code: 'WORKSPACE_SESSIONS_CHANGED' });
+  f.ctx.sessionQuery.readTitleSnapshots = async () => {
+    f.config.bindings = [{ cwd: join(f.root, 'rebound'), space: 'shared' }];
+    return [{ status: 'fulfilled', value: { session: { id: 'saved', cwd: f.cwd }, title: { title: 'STALE_NAME' } } }];
+  };
+  await assert.rejects(f.runtime.api('GET', '/workspace-sessions', new URLSearchParams({ space: 'shared' })),
+    { code: 'WORKSPACE_SESSIONS_CHANGED' });
+});
+
 test('graph record editing does not return a concurrent sibling forget', async t => {
   const { runtime, root } = fixture(t);
   const store = runtime.space('shared');

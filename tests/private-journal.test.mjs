@@ -96,6 +96,9 @@ test('legacy SQLite bodies migrate losslessly and unknown dates are explicitly l
   assert.ok(space.privateDb.prepare('SELECT 1 FROM private_tombstones WHERE id=?').get('forgotten-id'));
   assert.equal(space.privateDb.prepare('PRAGMA table_info(entries)').all().some(column => column.name === 'content'), false);
   assert.equal(space.privateStatus().count, 2);
+  assert.equal(space.privateStatus().importedCount, 1);
+  assert.equal(space.privateStatus().lastContributionAt, known);
+  assert.equal(space.privateStatus().lastImportedAt, '2020-01-01T00:00:00.000Z');
   assert.ok(readdirSync(privateDirectory).every(name => /^\d{4}-\d{2}-\d{2}\.md$/.test(name)));
 });
 

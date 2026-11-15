@@ -32,6 +32,12 @@ test('real rc5 tool output preserves graph additions as lossless JSON', async ()
     } finally { store.close(); }
     ctx.provide('agents', { get: id => id === agent.id ? agent : undefined, list: () => [agent] });
     ctx.provide('sessions', {});
+    ctx.provide('sessionQuery', {
+      listSessions: async () => [{ header: { id: 'named-offline', cwd } }],
+      readTitleSnapshots: async () => [{ status: 'fulfilled', value: {
+        session: { id: 'named-offline', cwd }, title: { title: '合成的历史主会话' },
+      } }],
+    });
     ctx.provide('webServer', { register: value => { route = value; return () => {}; } });
     ctx.provide('connection', { requestRejection: () => undefined });
     ctx.provide('settings', { describe: () => [] });
@@ -49,6 +55,10 @@ test('real rc5 tool output preserves graph additions as lossless JSON', async ()
       assert.equal(value.ok, true, JSON.stringify(value));
       return value.data;
     };
+    const sessions = await request('GET', '/workspace-sessions');
+    assert.equal(sessions.items[0].id, 'named-offline');
+    assert.equal(sessions.items[0].title, '合成的历史主会话');
+    assert.equal(sessions.items[0].status, 'inactive');
     await request('POST', '/graph/prepare', {});
     let status;
     for (let attempt = 0; attempt < 100; attempt++) {

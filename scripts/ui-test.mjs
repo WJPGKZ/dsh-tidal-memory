@@ -107,11 +107,63 @@ try {
   await mainSession.selectOption('demo-a');
   assert.equal(await page.getByLabel('Provider ID').inputValue(), 'synthetic-provider');
   assert.equal(await page.getByLabel('Model ID').inputValue(), 'synthetic-model');
+  await page.getByLabel('Provider ID').fill('unsaved-provider');
+  await page.getByLabel('主会话日记上下文预算（字节）').fill('9000');
+  await page.getByRole('button', { name: '读取该工作区会话', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '已读取该工作区会话' }).waitFor();
+  assert.equal(await mainSession.inputValue(), 'demo-a');
+  assert.equal(await page.getByLabel('Provider ID').inputValue(), 'unsaved-provider');
+  assert.equal(await page.getByLabel('主会话日记上下文预算（字节）').inputValue(), '9000');
+  assert.match(await mainSession.locator('option[value="saved-primary"]').textContent(), /日常主会话.*未运行/);
+  assert.equal(await mainSession.locator('option[value="other-saved"]').count(), 0);
+  await mainSession.selectOption('saved-primary');
+  assert.equal(await page.getByLabel('Provider ID').inputValue(), 'synthetic-provider');
   await page.getByRole('button', { name: '保存主会话设置', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '设置已保存' }).waitFor();
   assert.deepEqual(preview.runtime.config.privateMainSessions, [{
-    space: 'default', sessionId: 'demo-a', provider: 'synthetic-provider', model: 'synthetic-model',
+    space: 'default', sessionId: 'saved-primary', provider: 'synthetic-provider', model: 'synthetic-model',
   }]);
+  const readProjection = preview.runtime.ctx.sessionProjectionCache.cachedSnapshot;
+  preview.runtime.ctx.sessionProjectionCache.cachedSnapshot = header => {
+    const snapshot = readProjection(header);
+    if (header.id === 'saved-primary') snapshot.values.title = '重命名后的主会话';
+    return snapshot;
+  };
+  const readLiveProjection = preview.runtime.ctx.sessionProjections.cachedSnapshot;
+  preview.runtime.ctx.sessionProjections.cachedSnapshot = session => {
+    const snapshot = readLiveProjection(session);
+    if (session.header.id === 'demo-a') snapshot.values.title = '重命名后的运行中会话';
+    return snapshot;
+  };
+  await page.getByRole('button', { name: '读取该工作区会话', exact: true }).click();
+  await page.getByRole('status').filter({ hasText: '已读取该工作区会话' }).waitFor();
+  assert.equal(await mainSession.inputValue(), 'saved-primary');
+  assert.match(await mainSession.locator('option[value="saved-primary"]').textContent(), /重命名后的主会话/);
+  assert.match(await mainSession.locator('option[value="demo-a"]').textContent(), /重命名后的运行中会话/);
+  const listSessions = preview.runtime.ctx.sessionQuery.listSessions;
+  preview.runtime.ctx.sessionQuery.listSessions = async () => { throw new Error('Synthetic catalog failure'); };
+  await page.getByRole('button', { name: '读取该工作区会话', exact: true }).click();
+  await page.getByRole('alert').filter({ hasText: '读取工作区会话失败或超时' }).waitFor();
+  assert.equal(await mainSession.inputValue(), 'saved-primary');
+  preview.runtime.ctx.sessionQuery.listSessions = listSessions;
+  let releaseCatalog, catalogStarted;
+  const started = new Promise(resolve => { catalogStarted = resolve; });
+  preview.runtime.ctx.sessionQuery.listSessions = async () => {
+    catalogStarted();
+    await new Promise(resolve => { releaseCatalog = resolve; });
+    return listSessions();
+  };
+  await page.getByRole('button', { name: '读取该工作区会话', exact: true }).click();
+  await started;
+  await page.getByRole('combobox', { name: '记忆空间' }).selectOption('workspace-b');
+  const oldResponse = page.waitForResponse(response => response.url().includes('/workspace-sessions'));
+  releaseCatalog();
+  await oldResponse;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await page.getByLabel('私人日记主会话').locator('option[value="saved-primary"]').count(), 0);
+  preview.runtime.ctx.sessionQuery.listSessions = listSessions;
+  await page.getByRole('combobox', { name: '记忆空间' }).selectOption('default');
+  await page.getByLabel('私人日记主会话').locator('option[value="demo-a"]').waitFor({ state: 'attached' });
   await page.getByRole('button', { name: '规范日记文件格式', exact: true }).click();
   await page.getByRole('status').filter({ hasText: '日记文件格式整理完成' }).waitFor();
   const writers = page.getByLabel('允许的作者插件名称（逗号分隔）');

@@ -340,15 +340,17 @@ test('async tool retrieval rechecks workspace authorization after local preparat
   await assert.rejects(pending, { code: 'UNBOUND_WORKSPACE' });
 });
 
-test('closing while local preparation waits releases pending work', { timeout: 15000 }, async t => {
+test('closing while local preparation waits releases pending work', { timeout: 60000 }, async t => {
   const { runtime, agent, embedding } = fixture(t);
-  embedding.pause();
-  const pending = runtime.recallForAgentAsync(agent, '数据保存在哪里？');
-  const rejected = assert.rejects(pending, { code: 'CLOSED' });
-  await new Promise(resolve => setImmediate(resolve));
-  await runtime.close();
-  await rejected;
-  assert.equal(runtime.jobs.size, 0);
+  await t.test('shutdown cancels the paused request within 15 seconds after fixture setup', { timeout: 15000 }, async () => {
+    embedding.pause();
+    const pending = runtime.recallForAgentAsync(agent, '数据保存在哪里？');
+    const rejected = assert.rejects(pending, { code: 'CLOSED' });
+    await new Promise(resolve => setImmediate(resolve));
+    await runtime.close();
+    await rejected;
+    assert.equal(runtime.jobs.size, 0);
+  });
 });
 
 test('disabled injection does not invoke embeddings and model changes rebuild only derived data', async t => {

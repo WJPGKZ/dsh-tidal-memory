@@ -791,7 +791,10 @@ export function organizePrivateDay(db, root, { day: dayKey, expectedHash, markdo
 
 export function privateJournalStatus(db, root, now = new Date()) {
   const summary = db.prepare(`SELECT COUNT(*) AS count, MAX(created_at) AS lastWritten,
-    MIN(day_key) AS firstDay, MAX(day_key) AS lastDay FROM entries`).get();
+    MIN(day_key) AS firstDay, MAX(day_key) AS lastDay,
+    COUNT(CASE WHEN author='legacy-import' THEN 1 END) AS importedCount,
+    MAX(CASE WHEN author='legacy-import' THEN created_at END) AS lastImportedAt,
+    MAX(CASE WHEN author<>'legacy-import' THEN created_at END) AS lastContributionAt FROM entries`).get();
   const pending = db.prepare('SELECT COUNT(*) AS count FROM journal_pending').get().count;
   const files = listJournalFiles(root);
   const yesterday = new Date(now);
@@ -824,6 +827,9 @@ export function privateJournalStatus(db, root, now = new Date()) {
     legacyCount: db.prepare('SELECT COUNT(*) AS count FROM entries WHERE day_key IS NULL').get().count,
     bytes: files.reduce((total, file) => total + Buffer.byteLength(file.content, 'utf8'), 0),
     lastWritten: safeTime(summary.lastWritten),
+    importedCount: summary.importedCount,
+    lastImportedAt: safeTime(summary.lastImportedAt),
+    lastContributionAt: safeTime(summary.lastContributionAt),
     firstDay: safeDay(summary.firstDay),
     lastDay: safeDay(summary.lastDay),
     pending,

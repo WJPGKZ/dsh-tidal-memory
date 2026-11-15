@@ -1894,7 +1894,7 @@ export class MemorySpace {
       try { bytes += statSync(path).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     return { ...count, bytes: bytes + count.bytes, directory: this.privateDirectory, indexFile: file, authors: this.config.privateWriters,
-      contentVisible: false, generation: '由获准的外部作者插件提供，本插件不生成拟人人格日记。' };
+      contentVisible: false, generation: '由获准作者插件或会话主动提交；主会话回顾不会自动生成每日新日记。' };
   }
   clearPrivate(actor, confirmation) {
     adminOnly(actor);

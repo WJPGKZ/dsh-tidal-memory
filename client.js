@@ -343,6 +343,9 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = React.useState([]);
       const [newCwd, setNewCwd] = React.useState('');
       const [newSpace, setNewSpace] = React.useState('');
+      const [sessionCatalog, setSessionCatalog] = React.useState(null);
+      const [sessionsLoading, setSessionsLoading] = React.useState(false);
+      const sessionRequest = React.useRef(0);
       const generation = React.useRef(0);
       const initialSpace = React.useRef(true);
 
@@ -361,8 +364,9 @@ window.__ModuleLoader__.load({
       }
       React.useEffect(() => {
         setDraft(null); setPlan(null); setExtra(null); setLifecycle(null); setRecall(null); setTopicDetail(null);
+        setSessionCatalog(null); setSessionsLoading(false);
         refresh().catch(error => setNotice({ error: true, text: error.message }));
-        return () => { generation.current++; };
+        return () => { generation.current++; sessionRequest.current++; };
       }, [space]);
       React.useEffect(() => {
         if (status?.unavailable) return;
@@ -395,6 +399,40 @@ window.__ModuleLoader__.load({
         revision: status.settingsRevision, patch: config,
       }), '设置已保存。');
       const privateMain = config?.privateMainSessions?.find(item => item.space === space) ?? null;
+      const knownSessions = new Map((sessionCatalog?.space === space ? sessionCatalog.items : [])
+        .map(item => [item.id, item]));
+      for (const session of status?.space === space ? status.sessions : []) {
+        const previous = knownSessions.get(session.id);
+        knownSessions.set(session.id, { ...session, ...previous });
+      }
+      const sessionChoices = [...knownSessions.values()].sort((a, b) =>
+        a.title.localeCompare(b.title, 'zh-CN') || a.id.localeCompare(b.id));
+      const chosenSession = sessionChoices.find(item => item.id === privateMain?.sessionId);
+      const boundWorkspace = status?.config.bindings.find(item => item.space === space)?.cwd;
+      const sessionLabel = session => {
+        const state = { idle: '空闲', running: '运行中', inactive: '未运行' }[session.status] || session.status;
+        return `${session.title || '未命名会话'} · ${state} · ${session.id.replace(/^session-/, '').slice(0, 8)}${session.origin === 'subagent' ? ' · 子会话' : ''}${session.metadataError ? ' · 元数据读取不完整' : ''}`;
+      };
+      async function readWorkspaceSessions(append = false) {
+        const ticket = ++sessionRequest.current;
+        setSessionsLoading(true); setNotice(null);
+        try {
+          const offset = append && sessionCatalog?.space === space ? sessionCatalog.nextOffset : 0;
+          const data = await request(space, `/workspace-sessions?offset=${offset ?? 0}`);
+          if (ticket !== sessionRequest.current || data.space !== space) return;
+          setSessionCatalog(previous => {
+            const items = new Map((append && previous?.space === space ? previous.items : []).map(item => [item.id, item]));
+            for (const item of data.items) items.set(item.id, item);
+            return { ...data, items: [...items.values()] };
+          });
+          setNotice({ error: data.warnings > 0,
+            text: `已读取该工作区会话：本批 ${data.items.length} 个，共 ${data.total} 个。${data.warnings ? `其中 ${data.warnings} 个的名称或模型元数据读取不完整，可重试。` : ''}主会话选择与未保存设置未改动。` });
+        } catch (error) {
+          if (ticket === sessionRequest.current) setNotice({ error: true, text: error.message });
+        } finally {
+          if (ticket === sessionRequest.current) setSessionsLoading(false);
+        }
+      }
       const setPrivateMain = patch => {
         if (!privateMain) return;
         patchConfig('privateMainSessions', [
@@ -405,11 +443,11 @@ window.__ModuleLoader__.load({
       const selectPrivateMain = sessionId => {
         const remaining = config.privateMainSessions.filter(item => item.space !== space);
         if (sessionId) {
-          const session = status.sessions.find(item => item.id === sessionId);
+          const session = sessionChoices.find(item => item.id === sessionId);
           remaining.push({
             space, sessionId,
-            provider: session?.provider || privateMain?.provider || '',
-            model: session?.model || privateMain?.model || '',
+            provider: session?.provider || '',
+            model: session?.model || '',
           });
         }
         patchConfig('privateMainSessions', remaining);
@@ -621,7 +659,8 @@ window.__ModuleLoader__.load({
           h('h2', null, '私人记录，不展示正文'),
           h('p', null, `${status.private.count} 条 · ${(status.private.bytes / 1024).toFixed(1)} KiB`),
           h('p', { className: 'muted' }, `每日 Markdown 文件 ${status.private.dailyCount ?? 0} 份 · 旧记录 ${status.private.legacyCount ?? 0} 条 · 日期范围 ${status.private.firstDay || '暂无'} 至 ${status.private.lastDay || '暂无'}`),
-          h('p', { className: 'muted' }, `最近写入：${status.private.lastWritten || '尚无记录'}`),
+          h('p', { className: 'muted' }, `最近入库（含历史导入）：${status.private.lastWritten || '尚无记录'} · 历史导入 ${status.private.importedCount ?? 0} 条`),
+          h('p', { className: 'muted' }, `最近会话／作者新写入：${status.private.lastContributionAt || '尚无新写入'}；历史导入时间不是日记日期。`),
           h('p', null, status.private.generation),
           h('p', { className: 'path' }, status.private.directory),
           h('p', { className: 'muted' }, '正文目录只保留 YYYY-MM-DD.md；同一天的贡献合并写入。索引和写入暂存保存在 system/private，不在正文目录。'),
@@ -630,22 +669,36 @@ window.__ModuleLoader__.load({
         h('div', { className: 'panel stack' },
           h('h3', null, '同工作区主会话回顾'),
           h('p', { className: 'muted' }, '仅指定会话可收到昨日及更早的私人日记片段；模型路由必须与设置一致。插件不显示日记正文，也不自动授权其他会话。'),
+          h('p', { className: 'path' }, `已保存工作区：${boundWorkspace || '尚未绑定，请先保存工作区设置'}`),
+          h('div', { className: 'row' },
+            h('button', { type: 'button', disabled: busy || sessionsLoading || !boundWorkspace,
+              onClick: () => readWorkspaceSessions() }, sessionsLoading ? '正在读取工作区会话…' : '读取该工作区会话'),
+            sessionCatalog?.space === space && sessionCatalog.nextOffset !== null ?
+              h('button', { type: 'button', disabled: busy || sessionsLoading,
+                onClick: () => readWorkspaceSessions(true) }, '读取更多会话') : null),
+          h('small', null, sessionCatalog?.space === space ?
+            `已载入 ${sessionCatalog.items.length} / ${sessionCatalog.total} 个工作区会话（包含未运行会话），按名称选择；同名时核对 ID。` :
+            '当前仅显示已加载会话。点击读取按钮获取该工作区的历史会话名称，不启动会话，也不更改授权。'),
           h('label', null, h('span', null, '主会话'),
             h('select', { 'aria-label': '私人日记主会话', value: privateMain?.sessionId ?? '',
               onChange: event => selectPrivateMain(event.target.value) },
             h('option', { value: '' }, '未启用（默认）'),
-            ...(privateMain && !status.sessions.some(item => item.id === privateMain.sessionId) ?
+            ...(privateMain && !sessionChoices.some(item => item.id === privateMain.sessionId) ?
               [h('option', { key: privateMain.sessionId, value: privateMain.sessionId },
-                `${privateMain.sessionId}（当前未运行）`)] : []),
-            ...status.sessions.map(session => h('option', { key: session.id, value: session.id },
-              `${session.id} · ${session.status} · ${session.origin}`)))),
+                `${privateMain.sessionId}（已选择，尚未载入名称）`)] : []),
+            ...sessionChoices.map(session => h('option', { key: session.id, value: session.id },
+              sessionLabel(session))))),
+          privateMain ? h('small', null, `已选择：${chosenSession?.title || '名称尚未读取'} · ID：${privateMain.sessionId}；修改后需保存才生效。`) : null,
           privateMain ? h('div', { className: 'fields' },
             field('Provider ID', privateMain.provider, value => setPrivateMain({ provider: value })),
             field('Model ID', privateMain.model, value => setPrivateMain({ model: value }))) : null,
+          privateMain && (!privateMain.provider || !privateMain.model) ?
+            h('small', null, '该会话暂无可用模型路由。请填写准确的 Provider ID / Model ID，或打开该会话并选定模型后重新读取。') : null,
           field('主会话日记上下文预算（字节）', config.privateContextBudget,
             value => patchConfig('privateContextBudget', value), 'number', { min: 1024, max: 32000, step: 512 }),
           check('允许同工作区其他会话提交私人日记贡献（默认关闭）', config.privateContributionsEnabled,
             value => patchConfig('privateContributionsEnabled', value)),
+          h('small', null, '此开关仅允许写入，不会自动写日记。启用后需会话实际调用 tidal_private_contribute，或由获准作者插件提交；仅选择主会话只会开启回顾，不会补写空缺日期。'),
           h('small', null, `待主会话回顾 ${status.private.reviewPendingDays ?? 0} 天 · 已完整观察 ${status.private.observedDays ?? 0} 天 · 近期日记按上下文预算分段提供。`),
           button('保存主会话设置', saveConfig, 'primary'),
           h('small', null, '主会话历史会保留已注入的私人片段。若会话被 fork、路由不符或继承了私人历史，插件会拒绝其继续运行；清空日记不会自动解除已污染会话的限制。'),
