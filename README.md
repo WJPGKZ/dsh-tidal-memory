@@ -2,9 +2,9 @@
 
 **让同一工作区的会话记住有用的事，并在需要时带着时间和出处回忆。**
 
-潮汐记忆 **1.0.2** 面向 DeepSeek Harness `0.2.2-rc.5`。它把短期线索、正在进行的任务、经历和长期知识分层保存；同工作区会话共享普通记忆，可按稳定任务与显式场景追溯 L2 经历；私人日记目录只保留按日期命名的 Markdown，同日贡献合并为一份。按日自动汇总默认关闭；启用后只读取绑定工作区会话，并由指定主会话模型写入私人日记。
+潮汐记忆 **1.0.3** 面向 DeepSeek Harness `0.2.2-rc.5`。它把短期线索、正在进行的任务、经历和长期知识分层保存；同工作区会话共享普通记忆，可按稳定任务与显式场景追溯 L2 经历；私人日记目录只保留按日期命名的 Markdown，同日贡献合并为一份。按日自动汇总默认关闭；启用后只读取绑定工作区会话，并由指定主会话模型写入私人日记。
 
-> **版本说明：**本文介绍已发布的 [1.0.2 版本](https://github.com/WJPGKZ/dsh-tidal-memory/releases/tag/v1.0.2)。安装请使用 Release 安装包；发布时的源码可查看 [`v1.0.2` 标签](https://github.com/WJPGKZ/dsh-tidal-memory/tree/v1.0.2)。
+> **版本说明：**本文介绍已发布的 [1.0.3 版本](https://github.com/WJPGKZ/dsh-tidal-memory/releases/tag/v1.0.3)。1.0.3 更新发行包文档和版本标识，插件运行逻辑与 1.0.2 相同；已安装 1.0.2 的用户无需为此更新。安装请使用 Release 安装包；发布时的源码可查看 [`v1.0.3` 标签](https://github.com/WJPGKZ/dsh-tidal-memory/tree/v1.0.3)。
 
 > **一个虚构例子：**在工作区的一次会话中说“记住：这个项目使用 pnpm”，之后在绑定同一空间的另一会话里询问包管理方式，插件可以从仍有效的记录中找回这一线索，并附上来源。实际结果受工作区绑定、记录状态、检索门槛和预算影响；并非每句对话都会被自动记住，也不保证每次都能召回。
 
@@ -25,7 +25,7 @@
 ## 快速开始
 
 1. 升级前退出 DSH，备份共享数据根和各工作区已有的 `.tidal-memory`。不要仅复制正在使用的单个 SQLite 文件；首次安装可跳过此步。
-2. 从 [1.0.2 Release](https://github.com/WJPGKZ/dsh-tidal-memory/releases/tag/v1.0.2) 下载一个 `standard`、`cpu` 或 `enhanced` 安装包，在兼容的桌面端通过插件安装流程安装并启用。三者使用同一插件 ID，**不要同时安装三份**。
+2. 从 [1.0.3 Release](https://github.com/WJPGKZ/dsh-tidal-memory/releases/tag/v1.0.3) 下载一个 `standard`、`cpu` 或 `enhanced` 安装包，在兼容的桌面端通过插件安装流程安装并启用。三者使用同一插件 ID，**不要同时安装三份**。
 3. 在页面**最上方选择 DSH 工作区**；这里显示 DSH 登记的名称，没有会话的工作区也在列表中。每个本地工作区用自己的 `.tidal-memory` 存四层记忆、日记和索引。要让新工作区的会话参与记忆，在设置页点击“绑定此工作区”；编辑中文别名仅影响下方设置卡片，不改工作区名称或目录。
 4. 在“分层记忆”中添加一条合成测试记录，或在已绑定工作区说“记住：……”；新建另一个会话，在“回忆与整理”中检查结果，再决定是否导入旧资料。
 5. 需要语义检索时，在“设置与迁移 → 高级设置 → 模型文件与下载”复制并手动运行对应安装命令，保存组合选择，再点击“准备本地语义索引”。标准组合不需要模型。
@@ -149,7 +149,7 @@ L1–L3 的可读 `views` 也是派生文件；请在设置页修改主记录，
 
 ## 进阶接口与验证
 
-普通工具包括 `tidal_remember`、`tidal_recall`、`tidal_timeline`、`tidal_read_evidence`、`tidal_correct` 和默认关闭的 `tidal_find_history`。出处可按 ID 或主题分页读取；历史、归档和指定时点需显式选择。删除和私人清空只在管理页确认，不提供给模型自动执行。其他插件可通过宿主 `tidalMemory.forAgent(agent)` 获取受当前真实会话及工作区约束的接口，包括 `createScene`、`joinScene`、`setFocus`、`recordEvent` 和增量 `changes`；私人日记只提供受路由绑定的贡献与主会话回顾接口，不提供给任意会话全文读取。此服务为 future multi-bot 留出记忆契约，不创建、调度或监工会话。类型见 [1.0.2 的 `index.d.ts`](https://github.com/WJPGKZ/dsh-tidal-memory/blob/v1.0.2/index.d.ts)。
+普通工具包括 `tidal_remember`、`tidal_recall`、`tidal_timeline`、`tidal_read_evidence`、`tidal_correct` 和默认关闭的 `tidal_find_history`。出处可按 ID 或主题分页读取；历史、归档和指定时点需显式选择。删除和私人清空只在管理页确认，不提供给模型自动执行。其他插件可通过宿主 `tidalMemory.forAgent(agent)` 获取受当前真实会话及工作区约束的接口，包括 `createScene`、`joinScene`、`setFocus`、`recordEvent` 和增量 `changes`；私人日记只提供受路由绑定的贡献与主会话回顾接口，不提供给任意会话全文读取。此服务为 future multi-bot 留出记忆契约，不创建、调度或监工会话。类型见 [1.0.3 的 `index.d.ts`](https://github.com/WJPGKZ/dsh-tidal-memory/blob/v1.0.3/index.d.ts)。
 
 开发需要 Node.js 24 和 pnpm；测试与预览使用隔离合成数据，不读取用户记忆：
 

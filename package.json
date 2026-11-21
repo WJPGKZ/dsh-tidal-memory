@@ -1,6 +1,6 @@
 {
   "name": "dsh-tidal-memory",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "四层共享记忆、场景经历召回与受控 Markdown 私人日记的 DeepSeek Harness 插件。",
   "type": "module",
   "packageManager": "pnpm@11.28.5",
