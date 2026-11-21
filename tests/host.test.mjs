@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -83,7 +83,7 @@ test('real rc5 tool output preserves graph additions as lossless JSON', async ()
     import('../index.js'), hostModule('@deepseek-ai/cordis'),
     hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-tools'), hostModule('@deepseek-ai/dsh-tool-executor-native'),
   ]);
-  const base = mkdtempSync(join(tmpdir(), 'tidal-graph-host-')), root = join(base, 'data');
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'tidal-graph-host-'))), root = join(base, 'data');
   const cwd = join(base, 'workspace'), ctx = new Context(), fibers = [];
   mkdirSync(cwd);
   const session = { id: 'reader', header: { cwd }, snapshotEvents: () => [] };

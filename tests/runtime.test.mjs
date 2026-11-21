@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync, statSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -43,7 +43,8 @@ test('registered workspaces bind without sessions; rename and unbind never migra
   f.ctx.settings = { describe: () => [{ ns: 'tidal-memory', revision }], update: async (_ns, patch, rev) => {
     assert.equal(rev, revision++); Object.assign(f.config, patch);
   } };
-  const projects = mkdtempSync(join(tmpdir(), 'tidal-projects-'));
+  // Windows runner TEMP may use an 8.3 alias; registered fixtures need physical paths.
+  const projects = realpathSync.native(mkdtempSync(join(tmpdir(), 'tidal-projects-')));
   t.after(() => rmSync(projects, { recursive: true, force: true }));
   const a = { id: 'one', path: join(projects, 'a'), title: '课程', sessionIds: ['DO_NOT_RETURN'] };
   const b = { id: 'two', path: join(projects, 'b'), title: '课程' };
@@ -81,7 +82,7 @@ test('registered workspaces bind without sessions; rename and unbind never migra
 });
 
 test('offline workspace migration preserves records, journal and ledger; busy or foreign folders are never overwritten', t => {
-  const base = mkdtempSync(join(tmpdir(), 'tidal-cold-location-'));
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'tidal-cold-location-')));
   t.after(() => rmSync(base, { recursive: true, force: true }));
   const root = join(base, 'global'), cwd = join(base, 'project'), target = join(cwd, '.tidal-memory');
   mkdirSync(cwd);

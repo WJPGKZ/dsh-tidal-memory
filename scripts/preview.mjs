@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,7 @@ import { configOf } from '../src/model.js';
 
 const repository = dirname(dirname(fileURLToPath(import.meta.url)));
 export async function startPreview(port = 0, { embedding } = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'tidal-preview-'));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'tidal-preview-')));
   const cwd = join(root, 'workspace-a'), otherCwd = join(root, 'workspace-b');
   const config = configOf({
     dataRoot: join(root, 'data'),
