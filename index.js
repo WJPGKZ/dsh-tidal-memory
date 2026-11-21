@@ -12,7 +12,9 @@ const integer = (value, min, max, description) => z.number().step(1).min(min).ma
 export const Config = z.object({
   enabled: z.boolean().default(true).volatile().description('启用记忆捕获与召回。关闭后管理界面仍可使用。'),
   dataRoot: z.string().default('').description('绝对数据根目录。留空使用 DSH_HOME 下的 tidal-memory；修改需要重启并自行迁移。'),
-  bindings: z.array(z.object({ cwd: z.string(), space: z.string() })).default([]).volatile().description('显式绑定工作区与空间，不自动共享其他工作区。'),
+  bindings: z.array(z.object({ cwd: z.string(), space: z.string(),
+    workspaceId: z.string().default(''), displayName: z.string().default(''),
+  })).default([]).volatile().description('按工作区绑定稳定空间键；显示名不影响目录和授权。'),
   tokenBudget: integer(DEFAULTS.tokenBudget, 256, MAX_CONTEXT_BUDGET, '总上下文预算（UTF-8 字节估算，包含 L3 常驻）。'),
   maxRecall: integer(DEFAULTS.maxRecall, 1, 100, '相关记忆最多条数；L3 常驻及最多 5 条来源或图谱关联另计。'),
   residentMode: z.string().default(DEFAULTS.residentMode).volatile().description('L3 常驻：all 全部有效条目 / core 身份偏好约定及固定项 / pinned 仅固定项。'),
@@ -69,6 +71,10 @@ export const Config = z.object({
 export function apply(ctx, rawConfig = {}) {
   const runtime = new TidalRuntime(ctx, rawConfig, resolveDshHome());
   ctx.effect(() => () => runtime.close());
+  runtime.observeWorkspaceDirectory();
+  ctx.on('domain/changed', change => {
+    if (change?.domain === 'workspace') queueMicrotask(() => runtime.observeWorkspaceDirectory());
+  }, { global: true });
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler: (req, res) => runtime.handle(req, res) }));
   for (const agent of ctx.agents.list()) runtime.attachPrivateAgent(agent);
   ctx.on('agent/created', value => runtime.attachPrivateAgent(value?.agent ?? value), { global: true });

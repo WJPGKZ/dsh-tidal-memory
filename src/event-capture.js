@@ -21,7 +21,8 @@ function allowedTarget(value, store, binding, bindings) {
   if (typeof value !== 'string' || value.length > 2048 || !isAbsolute(value) ||
       /[\u0000-\u001f\u007f]/.test(value) || sensitivePath(value)) return null;
   const path = resolve(value);
-  if (['spaces', 'system', 'secrets', 'backups'].some(name => within(path, join(store.root, name)))) return null;
+  if (path.split(/[\\/]/).some(part => /^\.tidal-memory(?:$|-init-)/i.test(part)) ||
+    ['spaces', 'system', 'secrets', 'backups', 'recovery'].some(name => within(path, join(store.root, name)))) return null;
   const owner = bindings.filter(item => within(path, item.cwd))
     .sort((a, b) => b.cwd.length - a.cwd.length)[0];
   if (owner && owner.space !== binding.space) return null;

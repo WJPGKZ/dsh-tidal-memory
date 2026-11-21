@@ -121,8 +121,8 @@ export function configOf(raw = {}) {
     ['privateContextBudget', 1024, 32000],
   ]) number(result[key], min, max, key, true);
   requireValue(typeof result.dataRoot === 'string' && (result.dataRoot === '' || isAbsolute(result.dataRoot)), 'INVALID_CONFIG', '数据根目录必须是绝对路径。');
-  requireValue(Array.isArray(result.bindings) && result.bindings.length <= 100, 'INVALID_CONFIG', '工作区绑定无效。');
-  const seen = new Set(), spaces = new Set();
+  requireValue(Array.isArray(result.bindings), 'INVALID_CONFIG', '工作区绑定无效。');
+  const seen = new Set(), spaces = new Set(), workspaceIds = new Set();
   result.bindings = result.bindings.map(binding => {
     const cwd = string(binding.cwd, '工作区目录', 2048);
     requireValue(isAbsolute(cwd), 'INVALID_CONFIG', '工作区必须是绝对路径。');
@@ -131,11 +131,18 @@ export function configOf(raw = {}) {
     requireValue(!spaces.has(binding.space), 'INVALID_CONFIG', '一个记忆空间只能绑定一个工作区，避免工作区之间串记忆。');
     seen.add(key);
     spaces.add(binding.space);
-    return { cwd: resolve(cwd), space: slug(binding.space) };
+    const result = { cwd: resolve(cwd), space: slug(binding.space) };
+    if (binding.workspaceId) {
+      result.workspaceId = string(binding.workspaceId, 'DSH 工作区 ID', 256);
+      requireValue(!workspaceIds.has(result.workspaceId), 'INVALID_CONFIG', '同一 DSH 工作区不能重复绑定。');
+      workspaceIds.add(result.workspaceId);
+    }
+    if (binding.displayName) result.displayName = string(binding.displayName, '空间显示名', 128);
+    return result;
   });
   requireValue(Array.isArray(result.privateWriters) && result.privateWriters.every(v => typeof v === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(v)), 'INVALID_CONFIG', '私人作者列表无效。');
   requireValue(typeof result.privateContributionsEnabled === 'boolean', 'INVALID_CONFIG', '私人贡献开关无效。');
-  requireValue(Array.isArray(result.privateMainSessions) && result.privateMainSessions.length <= 100,
+  requireValue(Array.isArray(result.privateMainSessions),
     'INVALID_CONFIG', '私人主会话列表无效。');
   const privateSpaces = new Set();
   result.privateMainSessions = result.privateMainSessions.map(item => {
@@ -149,7 +156,7 @@ export function configOf(raw = {}) {
     privateSpaces.add(space);
     return { space, sessionId, provider, model };
   });
-  requireValue(Array.isArray(result.historyMainSessions) && result.historyMainSessions.length <= 100,
+  requireValue(Array.isArray(result.historyMainSessions),
     'INVALID_CONFIG', '历史查证主会话列表无效。');
   const historySpaces = new Set();
   result.historyMainSessions = result.historyMainSessions.map(item => {
@@ -163,7 +170,7 @@ export function configOf(raw = {}) {
     historySpaces.add(space);
     return { space, sessionId, provider, model };
   });
-  requireValue(Array.isArray(result.deepOrganizationSessions) && result.deepOrganizationSessions.length <= 100,
+  requireValue(Array.isArray(result.deepOrganizationSessions),
     'INVALID_CONFIG', '深度整理模型会话列表无效。');
   const organizationSpaces = new Set();
   result.deepOrganizationSessions = result.deepOrganizationSessions.map(item => {

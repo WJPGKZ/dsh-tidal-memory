@@ -17,6 +17,7 @@ import { automaticKeyStatus, clearModelApiKey, modelApiKeyStatus, readAutomaticK
   saveAutomaticKey, saveModelApiKey } from './backup-key.js';
 import { organizeMemoryBatch, summarizeDailyMessages } from './model-consolidation.js';
 import { assistantClaim } from './event-capture.js';
+import { LOCAL_FOLDER, locations, prepareWorkspace, readLocation, suggestedSpace, verifiedLocalDirectory } from './workspace-storage.js';
 import { bindingFor, configOf, containsCredential, ENCODING_VERSION, LAYERS, MAX_RECALL_QUERY_LENGTH,
   canonicalCwd, hash, localCandidates, localDateKey, MemoryError, normalizeRecord, requireValue,
   SEARCH_VERSION, slug, string, terms } from './model.js';
@@ -33,6 +34,9 @@ const MAX_HISTORY_SESSIONS = 3;
 const MAX_HISTORY_WINDOWS = 2;
 const MAX_HISTORY_WINDOW_EVENTS = 5;
 const MAX_HISTORY_IMPORT_CANDIDATES = 200;
+const ROUTE_SETTINGS = ['privateMainSessions', 'historyMainSessions', 'deepOrganizationSessions'];
+const sameBinding = (current, expected) => Boolean(current && expected && current.workspaceId === expected.workspaceId &&
+  canonicalCwd(current.cwd) === canonicalCwd(expected.cwd));
 async function waitForLocal(promise, timeout, signal) {
   let timer, onAbort;
   const stopped = new Promise((_, reject) => {
@@ -90,6 +94,8 @@ export class TidalRuntime {
     this.lastSemanticTask = new Map();
     this.prewarmQueue = Promise.resolve();
     this.spaces = new Map();
+    this.localWorkspaces = new Map();
+    this.directoryReady = false;
     this.spaceErrors = new Map();
     this.plans = new Map();
     this.sessions = new Map();
@@ -125,9 +131,10 @@ export class TidalRuntime {
   space(name) {
     slug(name);
     requireValue(!this.disposed, 'CLOSED', '插件已停止。', 503);
+    const directory = this.directoryFor(name);
     if (!this.spaces.has(name)) {
       try {
-        this.spaces.set(name, new MemorySpace(this.root, name, { config: this.config, clock: () => this.clock().getTime() }));
+        this.spaces.set(name, new MemorySpace(this.root, name, { directory, config: this.config, clock: () => this.clock().getTime() }));
         this.spaces.get(name).onForget = () => {
           this.semanticQueries.clear();
           this.semanticResults.clear();
@@ -149,7 +156,48 @@ export class TidalRuntime {
         throw error;
       }
     }
-    return this.spaces.get(name);
+    const store = this.spaces.get(name);
+    requireValue(canonicalCwd(store.directory) === canonicalCwd(directory), 'WORKSPACE_CHANGED', '空间位置已变化；请重启插件。', 409);
+    return store;
+  }
+  directoryFor(name) {
+    if (!this.directoryReady && this.hostService('workspaceRegistry')?.list) this.refreshWorkspaceFolders();
+    const row = this.localWorkspaces.get(name);
+    if (!row) {
+      requireValue(!readLocation(this.root, name), 'WORKSPACE_OFFLINE', '该记忆库所属的 DSH 工作区已离线，未回退到集中目录。', 409);
+      return join(this.root, 'spaces', slug(name));
+    }
+    requireValue(!row.error, row.error?.code, row.error?.message, 409);
+    const live = this.hostService('workspaceRegistry')?.get?.(row.id);
+    requireValue(live && canonicalCwd(live.path) === canonicalCwd(row.cwd), 'WORKSPACE_OFFLINE', 'DSH 工作区位置已变化。', 409);
+    return verifiedLocalDirectory(this.root, row, name, !this.spaces.has(name));
+  }
+  refreshWorkspaceFolders() {
+    const rows = this.workspaceDirectory();
+    const receipts = locations(this.root), reserved = new Set([...this.names(), ...receipts.map(item => item.space)]);
+    const next = new Map();
+    for (const row of rows) {
+      const binding = this.config.bindings.find(b => b.workspaceId === row.id ||
+        (!b.workspaceId && canonicalCwd(b.cwd) === canonicalCwd(row.cwd)));
+      const known = receipts.find(item => item.id === row.id);
+      const space = known?.space ?? binding?.space ?? suggestedSpace(row, reserved);
+      reserved.add(space);
+      let error;
+      try {
+        requireValue(!next.has(space) && (!binding || !known || binding.space === known.space),
+          'WORKSPACE_CHANGED', '工作区和现有空间的对应关系冲突，未合并。', 409);
+        if (known && this.localWorkspaces.get(space)?.id === row.id && !this.localWorkspaces.get(space).error)
+          verifiedLocalDirectory(this.root, row, space);
+        else prepareWorkspace(this.root, row, space);
+      } catch (reason) {
+        error = { code: reason.code || 'WORKSPACE_FOLDER_UNAVAILABLE', message: reason instanceof MemoryError ?
+          reason.message : '工作区记忆目录不可用；请检查磁盘与访问权限。' };
+      }
+      next.set(space, { ...row, space, bound: Boolean(binding), memoryDirectory: join(row.cwd, LOCAL_FOLDER), ...(error ? { error } : {}) });
+    }
+    this.localWorkspaces = next;
+    this.directoryReady = true;
+    return [...next.values()];
   }
   names() {
     const path = join(this.root, 'spaces');
@@ -159,6 +207,103 @@ export class TidalRuntime {
       .map(item => item.name) : [];
     return [...new Set([...stored, ...this.config.bindings.map(b => b.space)])].sort();
   }
+  workspaceDirectory() {
+    const registry = this.hostService('workspaceRegistry');
+    requireValue(typeof registry?.list === 'function', 'WORKSPACE_DIRECTORY_UNAVAILABLE',
+      '当前宿主未提供工作区列表。可重试或使用高级手动绑定。', 503);
+    let rows;
+    try { rows = registry.list(); }
+    catch { throw new MemoryError('WORKSPACE_DIRECTORY_UNAVAILABLE', 'DSH 工作区目录暂不可用，请刷新重试。', 503); }
+    requireValue(Array.isArray(rows) && rows.every(row => typeof row?.id === 'string' && row.id &&
+      canonicalCwd(row.path) && typeof row.title === 'string'), 'WORKSPACE_DIRECTORY_INVALID', 'DSH 工作区列表格式无效。', 502);
+    return rows.map(({ id, title, path }) => ({ id, title, cwd: path }));
+  }
+  activeBinding(binding) {
+    if (!binding) return undefined;
+    const local = this.localWorkspaces.get(binding.space);
+    if (local?.error || (local && canonicalCwd(local.cwd) !== canonicalCwd(binding.cwd))) return undefined;
+    const id = binding.workspaceId || local?.id;
+    if (!id) return binding;
+    const row = this.hostService('workspaceRegistry')?.get?.(id);
+    return row?.id === id && canonicalCwd(row.path) === canonicalCwd(binding.cwd) ? binding : undefined;
+  }
+  bindingAt(cwd) { return this.activeBinding(bindingFor(this.config, cwd)); }
+  bindingIn(space) { return this.activeBinding(this.config.bindings.find(item => item.space === space)); }
+  async saveSettings(patch, revision) {
+    const descriptor = this.descriptor();
+    requireValue(descriptor, 'SETTINGS_UNAVAILABLE', '找不到宿主设置入口 tidal-memory。', 503);
+    requireValue(revision === descriptor.revision, 'REVISION_CONFLICT', '设置已变化。草稿保留；请刷新核对后重试。', 409);
+    const validated = configOf({ ...this.config, ...patch });
+    requireValue(validated.dataRoot === this.config.dataRoot, 'ROOT_RESTART_REQUIRED', '修改数据根目录需要停止插件并使用备份迁移。');
+    if (validated.autoBackupMode !== 'plain' && validated.autoBackupMode !== this.config.autoBackupMode)
+      readAutomaticKey(this.root);
+    const changed = Object.fromEntries(Object.keys(patch).filter(key => key !== 'dataRoot' &&
+      JSON.stringify(validated[key]) !== JSON.stringify(this.config[key])).map(key => [key, validated[key]]));
+    if (Object.keys(changed).length) await this.ctx.settings.update(descriptor.ns, changed, revision);
+    this.syncConfig();
+  }
+  async changeBinding(space, body) {
+    let bindings = this.config.bindings;
+    const patch = {};
+    if (body.action === 'bind' || body.action === 'manual') {
+      let cwd, workspaceId;
+      if (body.action === 'bind') {
+        const row = this.workspaceDirectory().find(item => item.id === body.workspaceId);
+        requireValue(row && canonicalCwd(row.cwd) === canonicalCwd(body.cwd), 'WORKSPACE_CHANGED',
+          '该工作区已变化，请刷新列表后重新选择。', 409);
+        ({ cwd, id: workspaceId } = row);
+      } else {
+        cwd = string(body.cwd, '工作区绝对路径', 2048);
+        requireValue(canonicalCwd(cwd), 'INVALID_CONFIG', '请输入工作区绝对路径。');
+        if (this.hostService('workspaceRegistry')?.list) {
+          workspaceId = this.workspaceDirectory().find(item => canonicalCwd(item.cwd) === canonicalCwd(cwd))?.id;
+        }
+      }
+      const existing = bindingFor(this.config, cwd);
+      if (existing) {
+        requireValue(this.activeBinding(existing), 'WORKSPACE_CHANGED', '旧绑定的工作区身份已失效；请先解除旧绑定。', 409);
+        return { space: existing.space, alreadyBound: true };
+      }
+      const local = workspaceId && this.refreshWorkspaceFolders().find(row => row.id === workspaceId);
+      if (local) requireValue(!local.error && (!body.reuseSpace || body.reuseSpace === local.space),
+        'WORKSPACE_FOLDER_UNAVAILABLE', local.error?.message || '不能将其他空间覆盖到现有工作区记忆目录。', 409);
+      const names = new Set(this.names());
+      if (local) {
+        space = local.space;
+      } else if (body.reuseSpace) {
+        space = slug(body.reuseSpace);
+        requireValue(names.has(space) && !bindings.some(item => item.space === space),
+          'SPACE_UNAVAILABLE', '所选已有空间不可绑定。', 409);
+      } else {
+        const ledger = join(this.root, 'system', 'forget-ledger.sqlite3');
+        if (existsSync(ledger)) {
+          const db = new DatabaseSync(ledger, { readOnly: true });
+          try { for (const row of db.prepare('SELECT name FROM spaces').iterate()) names.add(row.name); }
+          finally { db.close(); }
+        }
+        const prefix = `mem-${hash(workspaceId || canonicalCwd(cwd)).slice(0, 12)}`;
+        space = prefix;
+        for (let i = 2; names.has(space); i++) space = `${prefix}-${i}`;
+      }
+      bindings = [...bindings, { cwd, space, ...(workspaceId ? { workspaceId } : {}) }];
+    } else {
+      const target = bindings.find(item => item.space === space);
+      requireValue(target, 'UNBOUND_WORKSPACE', '此空间尚未绑定。', 409);
+      if (body.action === 'rename') {
+        const displayName = string(body.displayName, '空间显示名', 128, true);
+        bindings = bindings.map(item => item === target ? { ...item, displayName } : item);
+      } else {
+        requireValue(body.action === 'unbind', 'INVALID_INPUT', '未知的绑定操作。');
+        bindings = bindings.filter(item => item !== target);
+        for (const key of ROUTE_SETTINGS) patch[key] = this.config[key].filter(item => item.space !== space);
+      }
+    }
+    await this.saveSettings({ ...patch, bindings }, body.revision);
+    if (body.action === 'unbind') {
+      for (const [id, plan] of this.plans) if (plan.space === space) this.plans.delete(id);
+    }
+    return { space, saved: true };
+  }
   forAgent(agent) {
     this.syncConfig();
     requireValue(this.config.enabled, 'DISABLED', '记忆插件已关闭。', 403);
@@ -166,7 +311,7 @@ export class TidalRuntime {
       'NO_AGENT', '缺少宿主登记的会话身份。', 403);
     requireValue(!this.privateSessionBlock(agent), 'PRIVATE_SESSION_UNAUTHORIZED',
       '当前会话的私人历史或授权状态不允许普通记忆访问。', 403);
-    const binding = bindingFor(this.config, agent.session.header.cwd);
+    const binding = this.bindingAt(agent.session.header.cwd);
     requireValue(binding, 'UNBOUND_WORKSPACE', '当前工作区未绑定记忆空间，请在设置中绑定。', 403);
     const store = this.space(binding.space);
     store.reconcileForgetLedger();
@@ -295,7 +440,7 @@ export class TidalRuntime {
     if (index.state === 'ready') return index.status();
     const task = { controller: new AbortController(), promise: null };
     const shouldPause = () => this.disposed || [...this.ctx.agents.list()].some(agent =>
-      agent.status === 'running' && bindingFor(this.config, agent.session.header.cwd)?.space === store.name);
+      agent.status === 'running' && this.bindingAt(agent.session.header.cwd)?.space === store.name);
     const job = index.sync({ signal: task.controller.signal, shouldPause });
     task.promise = job;
     this.graphTasks.set(store.name, task);
@@ -316,7 +461,7 @@ export class TidalRuntime {
     requireValue(this.embedding.state.ready && this.embedding.pack, 'SEMANTIC_NOT_PREPARED',
       '请先完成当前空间的本地语义索引准备。', 409);
     const shouldPause = () => this.disposed || [...this.ctx.agents.list()].some(agent =>
-      agent.status === 'running' && bindingFor(this.config, agent.session.header.cwd)?.space === store.name);
+      agent.status === 'running' && this.bindingAt(agent.session.header.cwd)?.space === store.name);
     requireValue(!shouldPause(), 'CONVERSATION_BUSY', '当前空间正在生成回复，请空闲后再查找语义候选。', 409);
     this.graphSuggestionTasks.get(store.name)?.controller.abort();
     const task = { controller: new AbortController() };
@@ -483,7 +628,7 @@ export class TidalRuntime {
   }
   privateMainFor(agent) {
     if (!agent?.session || this.ctx.agents.get(agent.id) !== agent) return null;
-    const binding = bindingFor(this.config, agent.session.header.cwd);
+    const binding = this.bindingAt(agent.session.header.cwd);
     if (!binding) return null;
     const main = this.config.privateMainSessions.find(item =>
       item.space === binding.space && item.sessionId === agent.session.id);
@@ -507,7 +652,7 @@ export class TidalRuntime {
   }
   historyMainFor(agent) {
     if (!agent?.session || this.ctx.agents.get(agent.id) !== agent) return null;
-    const binding = bindingFor(this.config, agent.session.header.cwd);
+    const binding = this.bindingAt(agent.session.header.cwd);
     if (!binding) return null;
     const main = this.config.historyMainSessions.find(item =>
       item.space === binding.space && item.sessionId === agent.session.id);
@@ -539,7 +684,7 @@ export class TidalRuntime {
   async findWorkspaceHistory(agent, { sessionIds, query = '', date } = {}) {
     this.syncConfig();
     const { store, space } = this.forAgent(agent);
-    const binding = bindingFor(this.config, agent.session.header.cwd);
+    const binding = this.bindingAt(agent.session.header.cwd);
     const selection = this.requireHistoryMain(agent, binding);
     requireValue(Array.isArray(sessionIds) && sessionIds.length >= 1 && sessionIds.length <= MAX_HISTORY_SESSIONS &&
       sessionIds.every(id => typeof id === 'string' && /^[a-zA-Z0-9_.:@-]{1,256}$/.test(id)) &&
@@ -601,10 +746,10 @@ export class TidalRuntime {
       signal.throwIfAborted();
       verifyForgetState();
       this.syncConfig();
-      const currentBinding = this.config.bindings.find(item => item.space === space);
+      const currentBinding = this.bindingIn(space);
       const currentSelection = this.config.historyMainSessions.find(item => item.space === space);
       const currentRoute = agent.session.requestContext?.();
-      requireValue(currentBinding && canonicalCwd(currentBinding.cwd) === canonicalCwd(binding.cwd) &&
+      requireValue(sameBinding(currentBinding, binding) &&
         this.config.historyReadEnabled && currentSelection?.sessionId === selection.sessionId &&
         currentSelection.provider === selection.provider && currentSelection.model === selection.model &&
         currentRoute?.provider === selection.provider && currentRoute?.model === selection.model,
@@ -684,7 +829,7 @@ export class TidalRuntime {
     requireValue(this.config.historyReadEnabled &&
       this.config.historyMainSessions.some(item => item.space === space &&
         item.sessionId === selection.sessionId && item.provider === selection.provider && item.model === selection.model) &&
-      canonicalCwd(this.config.bindings.find(item => item.space === space)?.cwd) === canonicalCwd(binding.cwd),
+      sameBinding(this.bindingIn(space), binding),
     'HISTORY_AUTHORIZATION_CHANGED', '返回历史前授权或工作区发生变化；未返回内容。', 409);
     const result = { space, sessionsChecked: loadedCount, windows, bytes: 0, ignoredSensitive, forgottenEvents,
       coverage: '只搜索指定会话中可读的用户/助手文本；未检查其他会话、私人会话、工具输出或未覆盖历史。未命中不证明事件未发生。' };
@@ -700,7 +845,7 @@ export class TidalRuntime {
   }
   async previewHistoryImport(store, { sessionIds, query = '', date } = {}) {
     const space = store.name;
-    const binding = this.config.bindings.find(item => item.space === space);
+    const binding = this.bindingIn(space);
     requireValue(binding, 'UNBOUND_WORKSPACE', '请先绑定此工作区，再预览历史补录。', 409);
     requireValue(Array.isArray(sessionIds) && sessionIds.length >= 1 && sessionIds.length <= MAX_HISTORY_SESSIONS &&
       sessionIds.every(id => typeof id === 'string' && /^[a-zA-Z0-9_.:@-]{1,256}$/.test(id)) &&
@@ -760,8 +905,7 @@ export class TidalRuntime {
       catch { throw new MemoryError('SESSION_HISTORY_READ_FAILED', '读取所选工作区会话失败；未生成预览。', 503); }
       signal.throwIfAborted();
       this.syncConfig();
-      requireValue(canonicalCwd(this.config.bindings.find(item => item.space === space)?.cwd) ===
-        canonicalCwd(binding.cwd) && store.lineageId === lineageId &&
+      requireValue(sameBinding(this.bindingIn(space), binding) && store.lineageId === lineageId &&
         store.forgetVersion() === forgetVersion && registry.version() === privateVersion,
       'HISTORY_PREVIEW_SCOPE_CHANGED', '读取期间工作区、谱系、遗忘或私人隔离状态发生变化；未生成预览。', 409);
       requireValue(loaded?.session?.id === sessionId && canonicalCwd(loaded.session.cwd) === canonicalCwd(binding.cwd) &&
@@ -826,7 +970,7 @@ export class TidalRuntime {
     const expires = id ? this.clock().getTime() + 20 * 60_000 : null;
     if (id) {
       requireValue(this.plans.size < 5, 'TOO_MANY_PREVIEWS', '尚有预览待处理，请完成或等待过期。', 429);
-      this.plans.set(id, { id, kind: 'history', space, bindingCwd: binding.cwd, lineageId, forgetVersion,
+      this.plans.set(id, { id, kind: 'history', space, bindingCwd: binding.cwd, workspaceId: binding.workspaceId, lineageId, forgetVersion,
         privateVersion, sessionIds, eventVersions: [...eventVersions.values()], candidates, expires });
     }
     return { id, sessionsChecked, candidates: candidates.map(({ record, ...item }) => item),
@@ -846,8 +990,8 @@ export class TidalRuntime {
     requireValue(ids.size === selected.length && selected.every(id =>
       plan.candidates.some(candidate => candidate.importId === id)),
     'INVALID_SELECTION', '候选已变化，请重新预览。');
-    const binding = this.config.bindings.find(item => item.space === plan.space);
-    requireValue(binding && canonicalCwd(binding.cwd) === canonicalCwd(plan.bindingCwd),
+    const binding = this.bindingIn(plan.space);
+    requireValue(sameBinding(binding, { cwd: plan.bindingCwd, workspaceId: plan.workspaceId }),
       'HISTORY_PREVIEW_SCOPE_CHANGED', '工作区绑定已变化；请重新预览。', 409);
     const registry = this.privateSessionRegistry();
     requireValue(registry.version() === plan.privateVersion &&
@@ -891,8 +1035,7 @@ export class TidalRuntime {
       loadedById.set(sessionId, loaded);
     }
     this.syncConfig();
-    requireValue(canonicalCwd(this.config.bindings.find(item => item.space === plan.space)?.cwd) ===
-      canonicalCwd(plan.bindingCwd) && registry.version() === plan.privateVersion &&
+    requireValue(sameBinding(this.bindingIn(plan.space), binding) && registry.version() === plan.privateVersion &&
       store.lineageId === plan.lineageId && store.forgetVersion() === plan.forgetVersion,
     'HISTORY_PREVIEW_SCOPE_CHANGED', '重新核对期间授权、谱系、工作区或遗忘状态变化；未补录。', 409);
     for (const anchor of plan.eventVersions) {
@@ -938,7 +1081,7 @@ export class TidalRuntime {
   privateSessionBlock(agent) {
     const session = agent?.session;
     if (!session || this.ctx.agents.get(agent.id) !== agent) return null;
-    const binding = bindingFor(this.config, session.header.cwd);
+    const binding = this.bindingAt(session.header.cwd);
     const registry = this.privateSessionRegistry();
     const row = registry.get(session.id);
     const parent = session.header.parentSession ? registry.get(session.header.parentSession) : null;
@@ -1017,7 +1160,7 @@ export class TidalRuntime {
       '用户尚未启用同工作区会话私人贡献。', 403);
     requireValue(this.ctx.agents.get(agent?.id) === agent && !this.privateSessionBlock(agent),
       'PRIVATE_SESSION_UNAUTHORIZED', '当前会话不能提交私人日记贡献。', 403);
-    const binding = bindingFor(this.config, agent.session.header.cwd);
+    const binding = this.bindingAt(agent.session.header.cwd);
     requireValue(binding, 'UNBOUND_WORKSPACE', '私人贡献仅限已绑定工作区。', 403);
     const store = this.space(binding.space);
     const result = store.appendPrivateFromSession(agent.id, content, operationId);
@@ -1058,7 +1201,7 @@ export class TidalRuntime {
       this.syncConfig();
       if (!this.config.enabled) return decision;
       this.cancelPrewarm();
-      const binding = bindingFor(this.config, agent.session?.header.cwd);
+      const binding = this.bindingAt(agent.session?.header.cwd);
       if (!binding) return decision;
       this.cancelGraphBuild(binding.space);
       const { actor } = this.forAgent(agent);
@@ -1108,7 +1251,7 @@ export class TidalRuntime {
       this.syncConfig();
       if (!this.config.enabled || this.ctx.agents.get(session.id)?.session !== session) return;
       this.cancelPrewarm();
-      const binding = bindingFor(this.config, session.header.cwd);
+      const binding = this.bindingAt(session.header.cwd);
       if (!binding) return;
       this.cancelGraphBuild(binding.space);
       const agent = this.ctx.agents.get(session.id);
@@ -1211,7 +1354,7 @@ export class TidalRuntime {
     for (const row of rows) {
       if (store.blockedSessionIds.has(row.session_id)) continue;
       const agent = this.ctx.agents.get(row.session_id);
-      const binding = agent?.session && bindingFor(this.config, agent.session.header.cwd);
+      const binding = agent?.session && this.bindingAt(agent.session.header.cwd);
       if (!agent || binding?.space !== store.name || typeof agent.session.snapshotEvents !== 'function') {
         unavailable++;
         continue;
@@ -1239,7 +1382,7 @@ export class TidalRuntime {
       this.syncConfig();
       if (!this.config.enabled || !agent?.session) return '';
       if (!this.config.injectContext) return '';
-      const binding = bindingFor(this.config, agent.session.header.cwd);
+      const binding = this.bindingAt(agent.session.header.cwd);
       if (!binding) return '';
       selectedSpace = binding.space;
       const { store, actor, space } = this.forAgent(agent);
@@ -1291,7 +1434,7 @@ export class TidalRuntime {
       const names = selectedSpace ? [slug(selectedSpace)] : this.names();
       for (const name of names) {
         const agents = [...this.ctx.agents.list()].filter(agent =>
-          bindingFor(this.config, agent.session.header.cwd)?.space === name);
+          this.bindingAt(agent.session.header.cwd)?.space === name);
         if (agents.some(agent => agent.status === 'running')) {
           results.push({ space: name, waitingForConversation: true }); continue;
         }
@@ -1327,6 +1470,7 @@ export class TidalRuntime {
   }
   scheduleTick() {
     if (this.disposed) return;
+    this.observeWorkspaceDirectory();
     const job = this.checkDailyConsolidation().then(() => this.requestMaintenance());
     this.jobs.add(job);
     job.then(() => this.jobs.delete(job), error => {
@@ -1334,6 +1478,13 @@ export class TidalRuntime {
       this.noteError(error.code ?? 'MAINTENANCE_FAILED', '后台维护失败，请检查数据目录和设置。');
     });
     return job;
+  }
+  observeWorkspaceDirectory() {
+    if (!this.hostService('workspaceRegistry')?.list || this.disposed) return;
+    try { this.refreshWorkspaceFolders(); }
+    catch (error) {
+      this.noteError(error.code || 'WORKSPACE_DIRECTORY_UNAVAILABLE', '工作区目录暂不可用，将在下次检查重试。');
+    }
   }
   hostService(name) {
     return typeof this.ctx.get === 'function' ? this.ctx.get(name) : this.ctx[name];
@@ -1354,7 +1505,8 @@ export class TidalRuntime {
     const route = live?.requestContext?.() ?? values.modelSelection?.next ?? values.modelSelection?.lastUsed;
     return { id, title: typeof values.title === 'string' ? values.title : '',
       cwd: header.cwd ?? '', status: agent?.status ?? (live ? 'idle' : 'inactive'),
-      origin: header.origin ?? 'primary', createdAt: header.createdAt ?? null, metadataError,
+      origin: header.origin ?? 'primary', child: Boolean(header.parentSession || header.origin === 'subagent'),
+      createdAt: header.createdAt ?? null, metadataError,
       provider: typeof route?.provider === 'string' ? route.provider : '',
       model: typeof route?.model === 'string' ? route.model : '' };
   }
@@ -1363,7 +1515,7 @@ export class TidalRuntime {
     const byId = new Map(agents.map(agent => [agent.id, agent]));
     const registry = this.privateSessionRegistry();
     return agents.filter(agent => {
-      if (bindingFor(this.config, agent.session.header.cwd)?.space !== spaceName || registry.get(agent.id)) return false;
+      if (this.bindingAt(agent.session.header.cwd)?.space !== spaceName || registry.get(agent.id)) return false;
       let parentId = agent.session.header.parentSession;
       const seen = new Set([agent.id]);
       for (let depth = 0; parentId && depth < 32; depth++) {
@@ -1375,8 +1527,8 @@ export class TidalRuntime {
     })
       .map(agent => this.sessionChoice(agent.session.header, agent));
   }
-  async workspaceSessionChoices(spaceName, offset = 0) {
-    const binding = this.config.bindings.find(item => item.space === spaceName);
+  async workspaceSessionChoices(spaceName, offset = 0, picker = false) {
+    const binding = this.bindingIn(spaceName);
     requireValue(binding, 'UNBOUND_WORKSPACE', '请先保存当前空间的工作区绑定，再读取会话。', 409);
     requireValue(Number.isSafeInteger(offset) && offset >= 0, 'INVALID_OFFSET', '会话分页位置无效。');
     const query = this.hostService('sessionQuery');
@@ -1388,10 +1540,14 @@ export class TidalRuntime {
     const unique = new Map();
     for (const item of listed) {
       const header = item?.header;
-      if (typeof header?.id === 'string' && bindingFor(this.config, header.cwd)?.space === spaceName)
+      if (typeof header?.id === 'string' && this.bindingAt(header.cwd)?.space === spaceName)
         unique.set(header.id, header);
     }
     const registry = this.privateSessionRegistry();
+    const privacyVersion = registry.version();
+    const registryMembers = picker && binding.workspaceId ?
+      this.hostService('workspaceRegistry')?.get?.(binding.workspaceId)?.sessionIds : undefined;
+    const members = Array.isArray(registryMembers) ? new Set(registryMembers) : null;
     const visible = [...unique.values()].filter(header => {
       if (registry.get(header.id)) return false;
       const seen = new Set([header.id]);
@@ -1401,14 +1557,17 @@ export class TidalRuntime {
         seen.add(parentId);
         parentId = unique.get(parentId)?.parentSession;
       }
-      return !parentId;
+      // A child may be represented through its parent rather than as a top-level sidebar row.
+      return !parentId && (!members || [...seen].some(id => members.has(id)));
     });
     const headers = visible.sort((a, b) =>
       (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id.localeCompare(b.id));
-    const items = headers.slice(offset, offset + 25).map(header =>
+    // The picker searches cached metadata across the workspace; only the legacy explicit
+    // title lookup may ask rc.5 to fold a page of cold session logs.
+    const items = (picker ? headers : headers.slice(offset, offset + 25)).map(header =>
       this.sessionChoice(header, this.ctx.agents.get(header.id)));
     const missing = items.filter(item => !item.title);
-    if (missing.length && typeof query.readTitleSnapshots === 'function') {
+    if (!picker && missing.length && typeof query.readTitleSnapshots === 'function') {
       const results = await query.readTitleSnapshots(missing.map(item => item.id), signal);
       requireValue(Array.isArray(results) && results.length === missing.length,
         'SESSION_CATALOG_INVALID', '宿主返回的会话名称格式无效。', 502);
@@ -1428,14 +1587,14 @@ export class TidalRuntime {
     }
     signal.throwIfAborted();
     this.syncConfig();
-    requireValue(!this.disposed && canonicalCwd(this.config.bindings.find(item => item.space === spaceName)?.cwd) ===
-      canonicalCwd(binding.cwd), 'WORKSPACE_SESSIONS_CHANGED', '工作区绑定已变化，请重新读取。', 409);
+    requireValue(!this.disposed && registry.version() === privacyVersion && sameBinding(this.bindingIn(spaceName), binding),
+      'WORKSPACE_SESSIONS_CHANGED', '工作区绑定或会话可见性已变化，请重新读取。', 409);
     return { space: spaceName, cwd: binding.cwd, items, total: headers.length,
-      nextOffset: offset + items.length < headers.length ? offset + items.length : null,
+      nextOffset: !picker && offset + items.length < headers.length ? offset + items.length : null,
       warnings: items.filter(item => item.metadataError).length };
   }
   async workspaceSessionSnapshot(spaceName, signal) {
-    const binding = this.config.bindings.find(item => item.space === spaceName);
+    const binding = this.bindingIn(spaceName);
     requireValue(binding, 'UNBOUND_WORKSPACE', '请先绑定此工作区，再读取会话。', 409);
     const query = this.hostService('sessionQuery');
     requireValue(typeof query?.listSessions === 'function', 'WORKSPACE_SESSIONS_UNAVAILABLE',
@@ -1449,8 +1608,7 @@ export class TidalRuntime {
           canonicalCwd(header.cwd) === canonicalCwd(binding.cwd)) headers.set(header.id, header);
     }
     this.syncConfig();
-    requireValue(canonicalCwd(this.config.bindings.find(item => item.space === spaceName)?.cwd) ===
-      canonicalCwd(binding.cwd), 'WORKSPACE_SESSIONS_CHANGED', '工作区绑定已变化，请重新检查。', 409);
+    requireValue(sameBinding(this.bindingIn(spaceName), binding), 'WORKSPACE_SESSIONS_CHANGED', '工作区绑定已变化，请重新检查。', 409);
     return { binding, query, headers };
   }
   async verifiedModelSession(spaceName, selection, signal, purpose = 'deep') {
@@ -1512,7 +1670,9 @@ export class TidalRuntime {
         (!record.validUntil || Date.parse(record.validUntil) > now)));
     if (!records.length) return { mode, state: 'completed', batches: 0, inspected: 0, saved: 0 };
     const signal = AbortSignal.timeout(180_000);
-    const expectedCwd = this.config.bindings.find(item => item.space === store.name)?.cwd;
+    const expectedBinding = this.bindingIn(store.name);
+    if (this.config.bindings.some(item => item.space === store.name && item.workspaceId) && !expectedBinding)
+      throw new MemoryError('WORKSPACE_CHANGED', 'DSH 工作区已失效；未调用整理模型。', 409);
     const route = mode === 'session'
       ? await this.verifiedModelSession(store.name,
         this.config.deepOrganizationSessions.find(item => item.space === store.name), signal)
@@ -1523,8 +1683,8 @@ export class TidalRuntime {
       store.reconcileForgetLedger();
       if (store.privateVersion() !== privateVersion || store.forgetVersion() !== forgetVersion) return false;
       if (this.config.deepOrganizationMode !== mode) return false;
-      if (canonicalCwd(this.config.bindings.find(item => item.space === store.name)?.cwd) !==
-          canonicalCwd(expectedCwd)) return false;
+      const currentBinding = this.bindingIn(store.name);
+      if ((expectedBinding || currentBinding) && !sameBinding(currentBinding, expectedBinding)) return false;
       if (mode === 'api') return this.config.deepOrganizationApiEndpoint === route.endpoint &&
         this.config.deepOrganizationApiModel === route.model;
       const current = this.config.deepOrganizationSessions.find(item => item.space === store.name);
@@ -1624,11 +1784,10 @@ export class TidalRuntime {
       const settingsMatch = () => {
         this.syncConfig();
         const currentSelection = this.config.privateMainSessions.find(item => item.space === store.name);
-        const currentCwd = this.config.bindings.find(item => item.space === store.name)?.cwd;
         return this.config.privateAutoJournalEnabled && currentSelection &&
           currentSelection.sessionId === route.sessionId && currentSelection.provider === route.provider &&
           currentSelection.model === route.model &&
-          canonicalCwd(currentCwd) === canonicalCwd(sessionSnapshot.binding.cwd);
+          sameBinding(this.bindingIn(store.name), sessionSnapshot.binding);
       };
       requireValue(typeof query.readSession === 'function', 'SESSION_HISTORY_UNAVAILABLE',
         '宿主未提供历史会话读取服务；未写入私人日记。', 503);
@@ -1645,8 +1804,7 @@ export class TidalRuntime {
         requireValue(loaded?.session?.id === sessionId && typeof loaded.session.cwd === 'string' &&
           Array.isArray(loaded.events), 'SESSION_HISTORY_INVALID',
         '宿主返回的会话历史格式无效；未写入私人日记。', 502);
-        requireValue(canonicalCwd(loaded.session.cwd) === canonicalCwd(this.config.bindings.find(item =>
-          item.space === store.name)?.cwd), 'WORKSPACE_SESSIONS_CHANGED',
+        requireValue(canonicalCwd(loaded.session.cwd) === canonicalCwd(this.bindingIn(store.name)?.cwd), 'WORKSPACE_SESSIONS_CHANGED',
         '会话历史所属工作区已变化；未写入私人日记。', 409);
         const events = loaded.events;
         events.forEach((event, index) => {
@@ -1709,7 +1867,7 @@ export class TidalRuntime {
     }
   }
   readOnlyStatus(name) {
-    const directory = join(this.root, 'spaces', name);
+    const directory = this.directoryFor(name);
     const databaseFiles = [
       ...Object.values(LAYERS).map(info => join(directory, info.directory, info.file)),
       join(directory, 'system', 'operations.sqlite3'),
@@ -1805,7 +1963,7 @@ export class TidalRuntime {
           continue;
         }
         const agents = [...this.ctx.agents.list()].filter(agent =>
-          bindingFor(this.config, agent.session.header.cwd)?.space === name);
+          this.bindingAt(agent.session.header.cwd)?.space === name);
         if (agents.some(agent => agent.status === 'running')) {
           results.push({ space: name, waitingForConversation: true, day });
           continue;
@@ -1880,9 +2038,28 @@ export class TidalRuntime {
   }
   async api(method, path, query, body) {
     this.syncConfig();
+    if (method === 'GET' && path === '/workspaces') return { items: this.refreshWorkspaceFolders() };
     const spaceName = slug(query.get('space') ?? 'default');
+    if (method === 'POST' && path === '/workspace-binding') return this.changeBinding(spaceName, body);
+    if (method === 'POST' && path === '/workspace-selection') {
+      const key = body.setting, selection = body.selection;
+      requireValue(ROUTE_SETTINGS.includes(key), 'INVALID_INPUT', '未知的会话用途。');
+      requireValue(this.bindingIn(spaceName), 'UNBOUND_WORKSPACE', '请先绑定有效的 DSH 工作区。', 409);
+      const remaining = this.config[key].filter(item => item.space !== spaceName);
+      if (selection !== null) {
+        const catalog = await this.workspaceSessionChoices(spaceName, 0, true);
+        const found = catalog.items.find(item => item.id === selection?.sessionId);
+        requireValue(found && (!found.child || key === 'deepOrganizationSessions'),
+          'SESSION_UNAVAILABLE', '会话已不可选；请刷新后重新选择。', 409);
+        requireValue(found.provider && found.model && found.provider === selection.provider && found.model === selection.model,
+          'SESSION_MODEL_CHANGED', '模型路由缺失或已变化；请在 DSH 中选定模型，刷新后重新确认。', 409);
+        remaining.push({ space: spaceName, sessionId: found.id, provider: found.provider, model: found.model });
+      }
+      await this.saveSettings({ [key]: remaining }, body.revision);
+      return { saved: true };
+    }
     if (method === 'GET' && path === '/workspace-sessions') {
-      try { return await this.workspaceSessionChoices(spaceName, Number(query.get('offset') ?? 0)); }
+      try { return await this.workspaceSessionChoices(spaceName, Number(query.get('offset') ?? 0), query.get('view') === 'picker'); }
       catch (error) {
         if (error instanceof MemoryError) throw error;
         throw new MemoryError(error?.name === 'TimeoutError' ? 'WORKSPACE_SESSIONS_TIMEOUT' : 'WORKSPACE_SESSIONS_READ_FAILED',
@@ -1891,19 +2068,23 @@ export class TidalRuntime {
     }
     if (method === 'GET' && path === '/status') {
       let details;
-      try { details = this.spaces.get(spaceName)?.status() ?? this.readOnlyStatus(spaceName); } catch (error) {
-        if (error.code !== 'SPACE_BUSY') throw error;
-        details = { space: spaceName, unavailable: true, spaceError: this.spaceErrors.get(spaceName), layers: [] };
+      try {
+        this.directoryFor(spaceName);
+        details = this.spaces.get(spaceName)?.status() ?? this.readOnlyStatus(spaceName);
+      } catch (error) {
+        if (error.code !== 'SPACE_BUSY' && !String(error.code).startsWith('WORKSPACE_')) throw error;
+        details = { space: spaceName, unavailable: true, spaceError: { code: error.code, message: error.message }, layers: [] };
       }
+      const localDirectory = details.directory || this.localWorkspaces.get(spaceName)?.memoryDirectory || join(this.root, 'spaces', spaceName);
       const quote = value => process.platform === 'win32' ? `'${value.replaceAll("'", "''")}'` :
         `'${value.replaceAll("'", "'\\''")}'`;
       const command = `${process.platform === 'win32' ? '& ' : ''}${quote(process.execPath)} ${quote(fileURLToPath(
         new URL('../scripts/setup-model.mjs', import.meta.url)))}`;
       return { version: PACKAGE_VERSION, root: this.root, spaces: this.names(), ...details,
-        paths: { plugin: fileURLToPath(new URL('../', import.meta.url)), models: join(this.root, 'models'),
-          semanticIndex: join(this.root, 'spaces', spaceName, 'indexes', 'semantic.sqlite3'),
-          topicIndex: join(this.root, 'spaces', spaceName, 'indexes', 'topics.sqlite3'),
-          graphIndex: join(this.root, 'spaces', spaceName, 'indexes', 'graph.sqlite3'),
+        paths: { plugin: fileURLToPath(new URL('../', import.meta.url)), models: join(this.root, 'models'), memoryDirectory: localDirectory,
+          semanticIndex: join(localDirectory, 'indexes', 'semantic.sqlite3'),
+          topicIndex: join(localDirectory, 'indexes', 'topics.sqlite3'),
+          graphIndex: join(localDirectory, 'indexes', 'graph.sqlite3'),
           backups: join(this.root, 'backups', spaceName),
           backupKey: automaticKeyStatus(this.root).path,
           privateSessionRegistry: join(this.root, 'system', 'private-sessions.sqlite3'),
@@ -1932,22 +2113,19 @@ export class TidalRuntime {
         sessions: this.liveSessionChoices(spaceName) };
     }
     if (method === 'POST' && path === '/config') {
-      const descriptor = this.descriptor();
-      requireValue(descriptor, 'SETTINGS_UNAVAILABLE', '找不到宿主设置入口 tidal-memory。', 503);
       requireValue(body && typeof body.patch === 'object' && body.patch !== null, 'INVALID_CONFIG', '配置补丁无效。');
-      requireValue(Object.keys(body.patch).every(key => key in this.config), 'INVALID_CONFIG', '包含未知配置项。');
-      const validated = configOf({ ...this.config, ...body.patch });
-      requireValue(validated.dataRoot === this.config.dataRoot, 'ROOT_RESTART_REQUIRED', '修改数据根目录需要停止插件并使用备份迁移。');
-      requireValue(body.revision === descriptor.revision, 'REVISION_CONFLICT', '设置已变化，请刷新后重试。', 409);
-      if (validated.autoBackupMode !== 'plain' && validated.autoBackupMode !== this.config.autoBackupMode)
-        readAutomaticKey(this.root);
-      const patch = Object.fromEntries(Object.entries(body.patch).filter(([key, value]) =>
-        key !== 'dataRoot' && JSON.stringify(value) !== JSON.stringify(this.config[key])));
-      if (Object.keys(patch).length) await this.ctx.settings.update(descriptor.ns, patch, body.revision);
-      this.syncConfig();
+      const keys = Object.keys(body.patch);
+      requireValue(keys.every(key => Object.hasOwn(this.config, key)), 'INVALID_CONFIG', '包含未知配置项。');
+      // Older clients include unchanged scope fields in ordinary settings saves.
+      const scoped = key => key === 'bindings' || ROUTE_SETTINGS.includes(key);
+      requireValue(keys.every(key => !scoped(key) || JSON.stringify(body.patch[key]) === JSON.stringify(this.config[key])),
+        'INVALID_CONFIG', '请使用工作区设置入口修改绑定或授权。');
+      await this.saveSettings(Object.fromEntries(keys.filter(key => !scoped(key)).map(key => [key, body.patch[key]])), body.revision);
       return { saved: true };
     }
     if (method === 'POST' && path === '/restore') {
+      requireValue(!readLocation(this.root, slug(body.name)) && !this.localWorkspaces.has(body.name),
+        'SPACE_EXISTS', '已有工作区使用此空间标识，不允许恢复覆盖。', 409);
       const result = restoreBackup(this.root, slug(body.name), body.text, body.password ?? '', this.config);
       return result;
     }
@@ -2066,7 +2244,7 @@ export class TidalRuntime {
     if (method === 'POST' && path === '/consolidate') {
       requireValue(!this.busy, 'MAINTENANCE_BUSY', '整理任务正在运行，请稍后重试。', 409);
       requireValue(![...this.ctx.agents.list()].some(agent => agent.status === 'running' &&
-        bindingFor(this.config, agent.session.header.cwd)?.space === spaceName),
+        this.bindingAt(agent.session.header.cwd)?.space === spaceName),
       'CONVERSATION_BUSY', '当前空间正在生成回复，请等会话空闲后再整理。', 409);
       this.busy = true;
       try {
@@ -2108,7 +2286,7 @@ export class TidalRuntime {
       requireValue(this.config.privateAutoJournalEnabled, 'PRIVATE_AUTO_JOURNAL_DISABLED',
         '请先在设置中启用私人日记自动汇总。', 409);
       requireValue(![...this.ctx.agents.list()].some(agent => agent.status === 'running' &&
-        bindingFor(this.config, agent.session.header.cwd)?.space === spaceName),
+        this.bindingAt(agent.session.header.cwd)?.space === spaceName),
       'CONVERSATION_BUSY', '当前空间正在生成回复，请等会话空闲后再整理。', 409);
       const day = body.day;
       const parsedDay = typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day)
@@ -2129,7 +2307,7 @@ export class TidalRuntime {
     if (method === 'POST' && path === '/private/organize') {
       requireValue(!this.busy, 'MAINTENANCE_BUSY', '整理任务正在运行，请稍后重试。', 409);
       requireValue(![...this.ctx.agents.list()].some(agent => agent.status === 'running' &&
-        bindingFor(this.config, agent.session.header.cwd)?.space === spaceName),
+        this.bindingAt(agent.session.header.cwd)?.space === spaceName),
       'CONVERSATION_BUSY', '当前空间正在生成回复，请等会话空闲后再整理。', 409);
       const now = this.clock();
       const due = this.config.dailyConsolidateAt ? latestScheduledAt(now, this.config.dailyConsolidateAt) : now;

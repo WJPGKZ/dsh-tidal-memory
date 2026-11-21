@@ -84,11 +84,13 @@ export function unpackBackup(text, password = '') {
   'PRIVATE_PLAINTEXT', '拒绝包含私人日记的明文备份。');
   return document;
 }
+import { readLocation } from './workspace-storage.js';
+
 export function restoreBackup(root, name, text, password, config) {
   slug(name);
   requireValue(!/^restore-[a-f0-9-]{36}$/.test(name), 'INVALID_SPACE', '该名称保留给临时恢复空间，请使用其他名称。');
   const target = join(root, 'spaces', name);
-  requireValue(!existsSync(target), 'SPACE_EXISTS', '恢复必须使用一个尚不存在的新空间。', 409);
+  requireValue(!existsSync(target) && !readLocation(root, name), 'SPACE_EXISTS', '恢复必须使用一个尚不存在的新空间。', 409);
   const document = unpackBackup(text, password);
   requireValue(document.lineageId === undefined || typeof document.lineageId === 'string' &&
     /^[a-f0-9-]{36}$/.test(document.lineageId), 'INVALID_BACKUP', '恢复谱系无效。');
@@ -99,7 +101,7 @@ export function restoreBackup(root, name, text, password, config) {
     (document.lineageId ? 'local-ledger' : 'legacy-name-match') : 'backup-only';
   try {
     const sourceFile = document.space && join(root, 'spaces', document.space, 'system', 'operations.sqlite3');
-    if ((!lineageId || coverage === 'backup-only') && sourceFile && existsSync(sourceFile)) {
+    if ((!lineageId || coverage === 'backup-only') && sourceFile && (existsSync(sourceFile) || readLocation(root, document.space))) {
       const current = openSpaceFor(root, document.space);
       const source = current ?? new MemorySpace(root, document.space, { config });
       try {

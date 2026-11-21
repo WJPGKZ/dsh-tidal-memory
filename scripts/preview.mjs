@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,16 +28,31 @@ export async function startPreview(port = 0, { embedding } = {}) {
     ...agents.map(agent => agent.session.header),
     { id: 'saved-primary', cwd },
     { id: 'other-saved', cwd: otherCwd },
+    { id: 'child-agent', cwd, parentSession: 'demo-a', origin: 'subagent' },
+    ...Array.from({ length: 32 }, (_, i) => ({ id: `catalog-${i}`, cwd })),
   ];
+  Object.assign(titles, { 'child-agent': '合成子任务', ...Object.fromEntries(
+    Array.from({ length: 32 }, (_, i) => [`catalog-${i}`, `记录 ${String(i).padStart(2, '0')}`])) });
+  const workspaces = [{ id: 'ws-a', title: '示例项目 A', path: cwd }, { id: 'ws-b', title: '示例项目 B', path: otherCwd },
+    { id: 'ws-empty', title: '示例项目 C', path: join(root, 'empty') }];
+  for (const row of workspaces) mkdirSync(row.path);
+  const historyEvents = [{ type: 'user/message', seq: 1, time: new Date().toISOString(), data: {
+    role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '我喜欢简洁的回复。' }],
+  } }];
   const projection = header => ({ values: { title: titles[header.id],
     modelSelection: { next: { provider: 'synthetic-provider', model: 'synthetic-model' } } } });
   const ctx = {
+    workspaceRegistry: { list: () => workspaces, get: id => workspaces.find(item => item.id === id) },
     agents: { list: () => agents, get: id => agents.find(a => a.id === id) },
     sessions: { get: id => agents.find(agent => agent.id === id)?.session },
     sessionProjections: { cachedSnapshot: session => projection(session.header) },
     sessionProjectionCache: { cachedSnapshot: projection },
     sessionQuery: {
       listSessions: async () => sessionHeaders.map(header => ({ header })),
+      readSession: async id => {
+        const session = sessionHeaders.find(header => header.id === id);
+        return { session, events: id === 'saved-primary' ? historyEvents : [] };
+      },
       readTitleSnapshots: async ids => ids.map(id => ({ status: 'fulfilled',
         value: { session: sessionHeaders.find(header => header.id === id), title: { title: titles[id] } } })),
     },
@@ -70,6 +85,10 @@ export async function startPreview(port = 0, { embedding } = {}) {
       import React from 'react';
       import { createRoot } from 'react-dom/client';
       const root = createRoot(document.getElementById('root'));
+      const subscribers = new Set();
+      let summary = { byId: { 'saved-primary': { displayTitle: '侧栏里的主会话' } } };
+      const list = { getSnapshot: () => summary, subscribe: fn => { subscribers.add(fn); return () => subscribers.delete(fn); } };
+      window.renamePreviewSession = name => { summary = { byId: { 'saved-primary': { displayTitle: name } } }; subscribers.forEach(fn => fn()); };
       document.getElementById('open-settings').onclick = () => document.getElementById('settings').hidden = false;
       window.__ModuleLoader__ = { load(descriptor) {
         const plugin = descriptor.factory(name => {
@@ -77,6 +96,7 @@ export async function startPreview(port = 0, { embedding } = {}) {
           return React;
         });
         plugin.apply({
+          get: name => name === 'sessions' ? { list } : undefined,
           effect: fn => fn(),
           slots: {
             inject: (name, fn) => fn(),

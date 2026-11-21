@@ -16,6 +16,7 @@ import {
 } from './private-journal.js';
 import { privateJournalDatabasePath } from './journal-files.js';
 import { EventCapture } from './event-capture.js';
+import { readLocation, verifiedLocalDirectory } from './workspace-storage.js';
 import { contextualSleepCandidate, SLEEP_CONTEXT_VERSION } from './sleep-context.js';
 import {
   LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MAX_PROVENANCE_ITEMS, MAX_PROVENANCE_BYTES, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
@@ -35,7 +36,7 @@ const parse = row => {
 };
 const openSpaces = new Map();
 const MAX_TOPIC_PAGE_BYTES = 1024 * 1024;
-export const openSpaceFor = (root, name) => openSpaces.get(resolve(root, 'spaces', name));
+export const openSpaceFor = (root, name) => [...openSpaces.values()].find(store => store.root === resolve(root) && store.name === name);
 const adminOnly = actor => requireValue(actor?.admin === true, 'FORBIDDEN', '此操作仅限管理界面。', 403);
 const idValue = id => {
   requireValue(typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id), 'INVALID_ID', '记忆 ID 无效。');
@@ -95,7 +96,8 @@ export class MemorySpace {
   constructor(root, name, options = {}) {
     this.name = slug(name);
     this.root = resolve(root);
-    this.directory = join(root, 'spaces', name);
+    const local = readLocation(root, this.name);
+    this.directory = local ? verifiedLocalDirectory(root, local, this.name, true) : options.directory ?? join(root, 'spaces', name);
     this.privateDirectory = join(this.directory, 'private');
     const hasExistingSystem = existsSync(join(this.directory, 'system', 'operations.sqlite3'));
     this.config = configOf(options.config);
