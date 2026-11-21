@@ -496,7 +496,7 @@ export function migratePrivateJournalLayout(db, root) {
 }
 
 export function appendPrivateEntry(db, root, { author, content, sourceIds = [], sourceSession = null,
-  now = new Date().toISOString(), operationId = randomUUID() }) {
+  now = new Date().toISOString(), dayKey = null, operationId = randomUUID() }) {
   const writer = slug(author, 'author');
   requireValue(typeof content === 'string' && content.trim().length > 0 && content.length <= MAX_PRIVATE_CONTENT_LENGTH,
     'INVALID_PRIVATE_CONTENT', '私人记录内容无效或过长。');
@@ -510,10 +510,11 @@ export function appendPrivateEntry(db, root, { author, content, sourceIds = [], 
   const timestamp = safeTime(now);
   requireValue(timestamp, 'INVALID_PRIVATE_DATE', '私人日记写入时间无效，未写入。');
   recoverJournalTransactions(db, root);
-  const day = localDateKey(new Date(timestamp));
+  const day = dayKey === null ? localDateKey(new Date(timestamp)) : safeDay(dayKey);
+  requireValue(day, 'INVALID_PRIVATE_DATE', '私人日记目标日期无效，未写入。');
   const relativePath = dailyJournalPath(day);
   const entryId = randomUUID();
-  const payloadHash = journalFileHash(JSON.stringify({ writer, content, sourceIds, timestamp }));
+  const payloadHash = journalFileHash(JSON.stringify({ writer, content, sourceIds, timestamp, day }));
   const previousOperation = db.prepare('SELECT * FROM journal_operations WHERE operation_id=?').get(operationId);
   if (previousOperation) {
     requireValue(previousOperation.payload_hash === payloadHash, 'OPERATION_ID_REUSED', '操作 ID 已用于不同的私人记录内容。', 409);
@@ -806,6 +807,7 @@ export function privateJournalStatus(db, root, now = new Date()) {
     WHERE day_key=? AND content_hash=? LIMIT 1`).get(day.day_key, day.content_hash)).length;
   const organizationRow = db.prepare("SELECT value FROM journal_metadata WHERE key='last-organization'").get();
   const failureRow = db.prepare("SELECT value FROM journal_metadata WHERE key='last-failure'").get();
+  const automaticRow = db.prepare("SELECT value FROM journal_metadata WHERE key='auto-daily-summary'").get();
   let organization = null;
   if (organizationRow) {
     try {
@@ -818,6 +820,22 @@ export function privateJournalStatus(db, root, now = new Date()) {
         count: Number.isSafeInteger(value.count) ? value.count : 0
       };
     } catch { organization = null; }
+  }
+  let automaticSummary = null;
+  if (automaticRow) {
+    try {
+      const value = JSON.parse(automaticRow.value);
+      automaticSummary = {
+        state: ['completed', 'no-content', 'failed'].includes(value.state) ? value.state : null,
+        day: safeDay(value.day),
+        at: safeTime(value.at),
+        sessionCount: Number.isSafeInteger(value.sessionCount) ? value.sessionCount : 0,
+        messageCount: Number.isSafeInteger(value.messageCount) ? value.messageCount : 0,
+        provider: typeof value.provider === 'string' ? value.provider.slice(0, 128) : '',
+        model: typeof value.model === 'string' ? value.model.slice(0, 256) : '',
+        code: typeof value.code === 'string' ? value.code.slice(0, 128) : null,
+      };
+    } catch { automaticSummary = null; }
   }
   return {
     format: 'markdown',
@@ -837,6 +855,7 @@ export function privateJournalStatus(db, root, now = new Date()) {
     observedDays,
     files: files.map(file => file.path),
     organization,
+    automaticSummary,
     failure: failureRow ? { code: 'PRIVATE_ORGANIZATION_FAILED', at: failureRow.value } : null
   };
 }

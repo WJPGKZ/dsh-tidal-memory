@@ -180,8 +180,13 @@ try {
   assert.equal(rejected.status(), 403);
   await page.getByRole('tab', { name: '设置与迁移' }).click();
   await page.getByText(/工作区名称尽量使用英文/).waitFor();
-  assert.equal(await page.getByLabel('普通深度整理方式').inputValue(), 'local');
-  assert.equal(await page.getByRole('option', { name: /宿主自选模型/ }).evaluate(option => option.disabled), true);
+  const deepMode = page.getByLabel('普通深度整理方式');
+  assert.equal(await deepMode.inputValue(), 'local');
+  await deepMode.selectOption('session');
+  await page.getByLabel('整理模型会话', { exact: true }).waitFor();
+  await deepMode.selectOption('api');
+  assert.equal(await page.getByLabel('API 密钥（只写入，不回显）').getAttribute('type'), 'password');
+  await deepMode.selectOption('local');
   await page.getByRole('heading', { name: '文件位置', exact: true }).waitFor();
   await page.getByText('当前空间的派生主题索引', { exact: true }).waitFor();
   await page.getByText('当前空间的派生图谱索引', { exact: true }).waitFor();
@@ -221,8 +226,9 @@ try {
   await page.getByLabel('近期用户消息窗口').fill('4');
   await page.getByLabel('L1 工作记忆有效时长（小时，0 不自动到期）').fill('48');
   await page.getByLabel('每日深度整理时间（本机时间，留空关闭）').fill('04:30');
-  assert.equal(await page.getByLabel('自动记录并召回用户陈述（本地规则，无需审核）').isChecked(), true);
-  assert.equal(await page.getByLabel('额外保存助手全文到短期 L0（默认关闭）').isChecked(), false);
+  assert.equal(await page.getByLabel('自动记录用户陈述及受支持的工具回执').isChecked(), true);
+  await page.getByText(/助手全文不再自动捕获/).waitFor();
+  assert.equal(await page.getByLabel('允许指定主会话查找同工作区会话记录（默认关闭）').isChecked(), false);
   const graphRecall = page.getByLabel('已确认图谱关联辅助召回（默认关闭）');
   assert.equal(await graphRecall.isChecked(), false);
   await graphRecall.check();

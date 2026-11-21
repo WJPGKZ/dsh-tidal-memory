@@ -13,10 +13,20 @@ import { prepareHost } from './host-env.mjs';
 
 prepareHost();
 
+async function executeTool(ctx, agent, id, name, args) {
+  const { results } = await ctx.tools.execute({
+    calls: [{ type: 'tool-call', id, name, arguments: JSON.stringify(args) }],
+    agent, signal: new AbortController().signal,
+  });
+  assert.equal(results.length, 1);
+  return results[0].result;
+}
+
 test('real rc5 tool output preserves graph additions as lossless JSON', async () => {
-  const [plugin, { Context }, { SystemPrompt }, { ToolRuntime }] = await Promise.all([
+  const [plugin, { Context }, { SystemPrompt }, { ToolRuntime }, nativeExecutor] = await Promise.all([
     import('../index.js'), hostModule('@deepseek-ai/cordis'),
     hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-tools'),
+    hostModule('@deepseek-ai/dsh-tool-executor-native'),
   ]);
   const root = mkdtempSync(join(tmpdir(), 'tidal-graph-host-'));
   const cwd = join(root, 'workspace'), ctx = new Context(), fibers = [];
@@ -41,7 +51,7 @@ test('real rc5 tool output preserves graph additions as lossless JSON', async ()
     ctx.provide('webServer', { register: value => { route = value; return () => {}; } });
     ctx.provide('connection', { requestRejection: () => undefined });
     ctx.provide('settings', { describe: () => [] });
-    for (const dependency of [SystemPrompt, ToolRuntime]) fibers.push(await ctx.plugin(dependency, {}));
+    for (const dependency of [SystemPrompt, ToolRuntime, nativeExecutor]) fibers.push(await ctx.plugin(dependency, {}));
     fibers.push(await ctx.plugin(plugin, { dataRoot: root, bindings: [{ cwd, space: 'shared' }],
       autoBackup: false, residentBudget: 0, graphRecall: true }));
     const request = async (method, path, body) => {
@@ -67,10 +77,7 @@ test('real rc5 tool output preserves graph additions as lossless JSON', async ()
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     assert.equal(status.state, 'ready');
-    const result = await ctx.tools.execute({
-      callId: 'graph-recall-output', name: 'tidal_recall', arguments: { query: 'violet protocol' },
-      agent, signal: new AbortController().signal,
-    });
+    const result = await executeTool(ctx, agent, 'graph-recall-output', 'tidal_recall', { query: 'violet protocol' });
     assert.equal(result.isError, false, JSON.stringify(result));
     assert.deepEqual(JSON.parse(result.content[0].text), result.value);
     const graph = result.value.picked.find(item => item.id === related.id);
@@ -86,9 +93,10 @@ test('real rc5 tool output preserves graph additions as lossless JSON', async ()
 
 for (const embeddingMode of ['off', 'cpu']) {
   test(`real rc5 recall output is lossless JSON: ${embeddingMode === 'off' ? 'standard' : 'missing model fallback'}`, async () => {
-    const [plugin, { Context }, { SystemPrompt }, { ToolRuntime }] = await Promise.all([
+    const [plugin, { Context }, { SystemPrompt }, { ToolRuntime }, nativeExecutor] = await Promise.all([
       import('../index.js'), hostModule('@deepseek-ai/cordis'),
       hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-tools'),
+      hostModule('@deepseek-ai/dsh-tool-executor-native'),
     ]);
     const root = mkdtempSync(join(tmpdir(), 'tidal-tool-output-'));
     const cwd = join(root, 'workspace'), ctx = new Context(), fibers = [];
@@ -107,15 +115,12 @@ for (const embeddingMode of ['off', 'cpu']) {
       ctx.provide('webServer', { register: () => () => {} });
       ctx.provide('connection', { requestRejection: () => undefined });
       ctx.provide('settings', { describe: () => [] });
-      for (const dependency of [SystemPrompt, ToolRuntime]) fibers.push(await ctx.plugin(dependency, {}));
+      for (const dependency of [SystemPrompt, ToolRuntime, nativeExecutor]) fibers.push(await ctx.plugin(dependency, {}));
       fibers.push(await ctx.plugin(plugin, {
         dataRoot: root, bindings: [{ cwd, space: 'shared' }], autoBackup: false, embeddingMode,
       }));
       assert.ok(fibers.every(fiber => fiber.state === 2));
-      const result = await ctx.tools.execute({
-        callId: 'recall-output', name: 'tidal_recall', arguments: { query: 'violet protocol' },
-        agent, signal: new AbortController().signal,
-      });
+      const result = await executeTool(ctx, agent, 'recall-output', 'tidal_recall', { query: 'violet protocol' });
       assert.equal(result.isError, false, JSON.stringify(result));
       assert.deepEqual(JSON.parse(JSON.stringify(result.value)), result.value);
       assert.deepEqual(JSON.parse(result.content[0].text), result.value);
@@ -134,10 +139,7 @@ for (const embeddingMode of ['off', 'cpu']) {
       if (embeddingMode !== 'off') assert.equal(result.value.semanticStatus.code, 'MODEL_NOT_INSTALLED');
       const card = result.value.topicCards.find(item => item.label === 'orchid');
       assert.equal(card.count, 2);
-      const detail = await ctx.tools.execute({
-        callId: 'topic-output', name: 'tidal_read_evidence', arguments: { topic: card.id, limit: 1 },
-        agent, signal: new AbortController().signal,
-      });
+      const detail = await executeTool(ctx, agent, 'topic-output', 'tidal_read_evidence', { topic: card.id, limit: 1 });
       assert.equal(detail.isError, false, JSON.stringify(detail));
       assert.deepEqual(JSON.parse(detail.content[0].text), detail.value);
       assert.equal(detail.value.total, 2);
@@ -204,7 +206,7 @@ test('real rc5 Cordis lifecycle, volatile configuration, tools, context and priv
     assert.equal(configOf(fiber.config).workingHours, 24);
     assert.equal(configOf(fiber.config).privateContextBudget, 8000);
     assert.equal(routes.size, 1);
-    assert.deepEqual([...tools.keys()].sort(), ['tidal_correct', 'tidal_private_contribute', 'tidal_private_journal_commit',
+    assert.deepEqual([...tools.keys()].sort(), ['tidal_correct', 'tidal_find_history', 'tidal_private_contribute', 'tidal_private_journal_commit',
       'tidal_read_evidence', 'tidal_recall', 'tidal_remember', 'tidal_timeline']);
     const record = await tools.get('tidal_remember').execute({ text: '候选主题', layer: 'L3' }, { agent });
     assert.equal(record.status, 'active');

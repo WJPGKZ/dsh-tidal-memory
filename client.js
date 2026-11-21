@@ -336,11 +336,18 @@ window.__ModuleLoader__.load({
       const [password, setPassword] = React.useState('');
       const [automaticPassword, setAutomaticPassword] = React.useState('');
       const [privateWritersInput, setPrivateWritersInput] = React.useState('');
+      const [modelApiKeyInput, setModelApiKeyInput] = React.useState('');
+      const [privateSummaryDay, setPrivateSummaryDay] = React.useState('2026-11-15');
       const [restoreName, setRestoreName] = React.useState('');
       const [restoreText, setRestoreText] = React.useState('');
       const [privateImport, setPrivateImport] = React.useState(false);
       const [plan, setPlan] = React.useState(null);
       const [selected, setSelected] = React.useState([]);
+      const [historyImportPlan, setHistoryImportPlan] = React.useState(null);
+      const [historyImportSelected, setHistoryImportSelected] = React.useState([]);
+      const [historyImportSession, setHistoryImportSession] = React.useState('');
+      const [historyImportQuery, setHistoryImportQuery] = React.useState('');
+      const [historyImportDate, setHistoryImportDate] = React.useState('');
       const [newCwd, setNewCwd] = React.useState('');
       const [newSpace, setNewSpace] = React.useState('');
       const [sessionCatalog, setSessionCatalog] = React.useState(null);
@@ -363,7 +370,9 @@ window.__ModuleLoader__.load({
         setStatus(data); setConfig(data.config); setPrivateWritersInput(data.config.privateWriters.join(','));
       }
       React.useEffect(() => {
-        setDraft(null); setPlan(null); setExtra(null); setLifecycle(null); setRecall(null); setTopicDetail(null);
+        setDraft(null); setPlan(null); setHistoryImportPlan(null); setHistoryImportSelected([]);
+        setHistoryImportSession(''); setHistoryImportQuery(''); setHistoryImportDate('');
+        setExtra(null); setLifecycle(null); setRecall(null); setTopicDetail(null);
         setSessionCatalog(null); setSessionsLoading(false);
         refresh().catch(error => setNotice({ error: true, text: error.message }));
         return () => { generation.current++; sessionRequest.current++; };
@@ -399,6 +408,8 @@ window.__ModuleLoader__.load({
         revision: status.settingsRevision, patch: config,
       }), '设置已保存。');
       const privateMain = config?.privateMainSessions?.find(item => item.space === space) ?? null;
+      const deepOrganization = config?.deepOrganizationSessions?.find(item => item.space === space) ?? null;
+      const historyMain = config?.historyMainSessions?.find(item => item.space === space) ?? null;
       const knownSessions = new Map((sessionCatalog?.space === space ? sessionCatalog.items : [])
         .map(item => [item.id, item]));
       for (const session of status?.space === space ? status.sessions : []) {
@@ -452,6 +463,53 @@ window.__ModuleLoader__.load({
         }
         patchConfig('privateMainSessions', remaining);
       };
+      const selectDeepOrganization = sessionId => {
+        const remaining = config.deepOrganizationSessions.filter(item => item.space !== space);
+        if (sessionId) {
+          const session = sessionChoices.find(item => item.id === sessionId);
+          remaining.push({ space, sessionId, provider: session?.provider || '', model: session?.model || '' });
+        }
+        patchConfig('deepOrganizationSessions', remaining);
+      };
+      const setDeepOrganization = patch => {
+        if (!deepOrganization) return;
+        patchConfig('deepOrganizationSessions', [
+          ...config.deepOrganizationSessions.filter(item => item.space !== space),
+          { ...deepOrganization, ...patch },
+        ]);
+      };
+      const selectHistoryMain = sessionId => {
+        const remaining = config.historyMainSessions.filter(item => item.space !== space);
+        if (sessionId) {
+          const session = sessionChoices.find(item => item.id === sessionId);
+          remaining.push({ space, sessionId, provider: session?.provider || '', model: session?.model || '' });
+        }
+        patchConfig('historyMainSessions', remaining);
+      };
+      const setHistoryMain = patch => {
+        if (!historyMain) return;
+        patchConfig('historyMainSessions', [
+          ...config.historyMainSessions.filter(item => item.space !== space),
+          { ...historyMain, ...patch },
+        ]);
+      };
+      const previewSelectedHistory = () => run(async () => {
+        const result = await request(space, '/history/import-preview', {
+          sessionIds: [historyImportSession], query: historyImportQuery, date: historyImportDate,
+        });
+        setHistoryImportPlan(result);
+        setHistoryImportSelected([]);
+        return { candidates: result.candidateCount, skipped: result.skippedUnclassified + result.skippedTooLong,
+          truncated: result.truncated };
+      }, value => `历史预览完成：${value.candidates} 条待选候选；未分类或过长跳过 ${value.skipped} 条${value.truncated ? '；超过本批 200 条上限，请缩小范围' : ''}。尚未写入记忆。`);
+      const applySelectedHistory = () => run(async () => {
+        const result = await request(space, '/history/import-apply', {
+          id: historyImportPlan.id, selected: historyImportSelected,
+        });
+        setHistoryImportPlan(null);
+        setHistoryImportSelected([]);
+        return result;
+      }, value => value.status);
       const saveDraft = () => run(async () => {
         const patch = {
           text: draft.text, category: draft.category, status: draft.status, kind: draft.kind,
@@ -488,12 +546,12 @@ window.__ModuleLoader__.load({
         h('div', { className: 'panel stack' },
           h('h3', null, '同工作区共享，不按会话分库'),
           h('p', { className: 'muted' }, '四层分别落盘。新记忆自动保存并参与召回，无需逐条审核；可召回不等于已核实。人工确认和纠错是可选操作，冲突不会自动覆盖。'),
-          h('p', null, `整理和检索均在本地完成，不发起整理模型调用 · 每轮预算 ${config.tokenBudget}（UTF-8 字节保守估算）`),
+          h('p', null, `普通记忆默认本地整理；已显式配置模型时，深度整理按工作区设置发送普通 L1/L2 · 每轮注入预算 ${config.tokenBudget}（UTF-8 字节保守估算）`),
           h('p', { className: 'muted' }, config.injectContext
             ? '已开启普通记忆上下文：选中的记忆会随当前聊天请求发送给你配置的模型。'
             : '自动记忆上下文已关闭；聊天模型主动调用记忆工具时，工具结果仍会进入聊天请求。'),
           status.legacyModelExtractionIgnored ? h('div', { className: 'message' },
-            '已忽略旧版后台模型提炼配置；此版本不会为整理调用模型。') : null,
+            '已忽略旧版后台模型提炼配置；只有显式选择工作区模型或 API 并保存后才会发送整理材料。') : null,
           config.bindings.length === 0 ? h('div', { className: 'message' }, '尚未绑定工作区。请在“设置与迁移”中绑定；未绑定前不会读取或捕获聊天。') : null,
           h('div', { className: 'row' }, button('立即整理', () => run(() => request(space, '/maintenance', {}), value =>
             value.waitingForConversation ? '对话正在运行，整理已等待。' : JSON.stringify(value)), 'primary'),
@@ -505,6 +563,13 @@ window.__ModuleLoader__.load({
             `二次编码 ${status.encoding.sleep.from} 至 ${status.encoding.sleep.until} · 检查 ${status.encoding.sleep.inspected} 条 · 新增 ${status.encoding.sleep.candidates} 条待确认候选 · 到期前未二次检查 ${status.encoding.expiredBeforeSleep ?? 0} 条` :
             `尚未进行二次编码 · 到期前未二次检查 ${status.encoding.expiredBeforeSleep ?? 0} 条`),
           h('pre', null, JSON.stringify(status.encoding.reasons, null, 2))) : null,
+        status.capture ? h('div', { className: 'panel stack' }, h('h3', null, '事件捕获诊断'),
+          h('p', null, `有结果 ${status.capture.counts.saved} · 无产出 ${status.capture.counts.empty} · 待核 ${status.capture.counts.review} · 等待配对 ${status.capture.counts.waiting} · 失败 ${status.capture.counts.failed} · 处理中 ${status.capture.counts.pending}`),
+          h('p', { className: 'muted' }, `${status.capture.coverage} 有缺口的会话 ${status.capture.sessionsWithGaps} 个。`),
+          h('small', null, '只重试已登记且当前仍可访问的干净会话；无法访问的事件不会自动读取旧历史。'),
+          button('重试已登记事件', () => run(() => request(space, '/capture/retry', {}), value =>
+            `已重试 ${value.retried} 项；当前不可访问 ${value.unavailable} 项；失败 ${value.failed} 项。`)),
+          h('details', null, h('summary', null, '查看脱敏原因'), h('pre', null, JSON.stringify(status.capture.reasons, null, 2)))) : null,
         h('div', { className: 'panel' }, h('h3', null, '本地语义联想'),
           h('p', null, status.semantic?.mode === 'off' ? '标准组合：词面、别名、时间及来源关系检索，不加载 embedding。' :
             `${status.semantic?.ready ? '模型已加载' : '模型未就绪'} · ${status.semantic?.model ?? '等待首次准备'} · 索引 ${status.semantic?.index?.indexed ?? 0} / ${status.semantic?.index?.total ?? '?'} 条`),
@@ -668,7 +733,7 @@ window.__ModuleLoader__.load({
           h('small', null, '不出现在普通搜索、图谱和明文备份中。主会话回顾时，日记片段会进入该会话历史；此隔离不是对本机管理员或其他任意文件工具的绝对保密。')),
         h('div', { className: 'panel stack' },
           h('h3', null, '同工作区主会话回顾'),
-          h('p', { className: 'muted' }, '仅指定会话可收到昨日及更早的私人日记片段；模型路由必须与设置一致。插件不显示日记正文，也不自动授权其他会话。'),
+          h('p', { className: 'muted' }, '仅指定会话可收到昨日及更早的私人日记片段；模型路由必须与设置一致。自动日记汇总默认关闭；开启后也只读取绑定工作区会话，并且不在管理页显示正文。'),
           h('p', { className: 'path' }, `已保存工作区：${boundWorkspace || '尚未绑定，请先保存工作区设置'}`),
           h('div', { className: 'row' },
             h('button', { type: 'button', disabled: busy || sessionsLoading || !boundWorkspace,
@@ -700,6 +765,26 @@ window.__ModuleLoader__.load({
             value => patchConfig('privateContributionsEnabled', value)),
           h('small', null, '此开关仅允许写入，不会自动写日记。启用后需会话实际调用 tidal_private_contribute，或由获准作者插件提交；仅选择主会话只会开启回顾，不会补写空缺日期。'),
           h('small', null, `待主会话回顾 ${status.private.reviewPendingDays ?? 0} 天 · 已完整观察 ${status.private.observedDays ?? 0} 天 · 近期日记按上下文预算分段提供。`),
+          check('按日自动汇总同工作区会话为私人 Markdown 日记（默认关闭）', config.privateAutoJournalEnabled,
+            value => patchConfig('privateAutoJournalEnabled', value)),
+          h('small', null, '启用后只读取此绑定工作区内目标日期的用户与助手文本；由上方已授权主会话的模型生成，正文仅写入 YYYY-MM-DD.md，不进入普通记忆或界面状态。'),
+          h('small', null, status.private.automaticSummary ?
+            `最近自动汇总：${status.private.automaticSummary.day || '日期未知'} · ${
+              ({ completed: '已写入', 'no-content': '当天无可用文本', failed: '失败' })[status.private.automaticSummary.state] || '状态未知'} · ${
+              status.private.automaticSummary.messageCount} 条消息 · ${
+              status.private.automaticSummary.provider || '无路由'} / ${status.private.automaticSummary.model || '无模型'}` :
+            '尚无自动汇总记录；仅选择主会话不会自动生成日记。'),
+          h('div', { className: 'fields' },
+            field('单日回溯日期', privateSummaryDay, setPrivateSummaryDay, 'date'),
+            h('div', { className: 'stack' },
+              h('small', null, '只处理一个日期；若该日已有自动日记，不会重复追加。'),
+              h('button', { type: 'button', disabled: busy || !config.privateAutoJournalEnabled ||
+                !status.config.privateAutoJournalEnabled,
+                onClick: () => run(() => request(space, '/private/daily-summary', { day: privateSummaryDay }),
+                  value => value.state === 'completed'
+                    ? `已写入 ${value.day} 私人 Markdown 日记（${value.messageCount} 条会话消息）；正文未在界面展示。`
+                    : value.state === 'no-content' ? `${value.day} 没有可用会话文本，未写入日记。`
+                      : `该日期已处理：${value.day}。`) }, '生成该日私人日记'))),
           button('保存主会话设置', saveConfig, 'primary'),
           h('small', null, '主会话历史会保留已注入的私人片段。若会话被 fork、路由不符或继承了私人历史，插件会拒绝其继续运行；清空日记不会自动解除已污染会话的限制。'),
           status.private.failure ? h('p', { className: 'message error' },
@@ -794,13 +879,61 @@ window.__ModuleLoader__.load({
             pack.error ? h('p', { role: 'alert' }, `${pack.error.code} · ${pack.error.message}`) : null))),
         h('div', { className: 'panel stack' }, h('h3', null, '记忆策略'),
           check('启用记忆捕获与召回', config.enabled, value => patchConfig('enabled', value)),
-          check('自动记录并召回用户陈述（本地规则，无需审核）', config.autoCandidates, value => patchConfig('autoCandidates', value)),
-          check('额外保存助手全文到短期 L0（默认关闭）', config.captureAssistant, value => patchConfig('captureAssistant', value)),
+          check('自动记录用户陈述及受支持的工具回执', config.autoCandidates, value => patchConfig('autoCandidates', value)),
+          h('small', null, '助手全文不再自动捕获；明确的完成自述只作为待核线索。旧版助手全文设置保留但不再生效。'),
           check('将本地召回的普通记忆附加到当前聊天请求', config.injectContext, value => patchConfig('injectContext', value)),
+          h('div', { className: 'panel stack' }, h('h4', null, '按需查证工作区历史'),
+            check('允许指定主会话查找同工作区会话记录（默认关闭）', config.historyReadEnabled,
+              value => patchConfig('historyReadEnabled', value)),
+            h('p', { className: 'muted' }, '仅从这里选定的干净主会话和精确模型路由开放；每次须指定 1–3 个会话及查询词或日期。只返回最多 2 个窗口、6 KiB，不会自动记忆。宿主接口可能先在内存加载指定会话的完整快照；不搜索私人会话、工具输出或其他工作区。'),
+            h('div', { className: 'row' }, button('读取该工作区会话列表', () => readWorkspaceSessions()),
+              h('small', null, '列表只显示会话名称及路由，不读取会话正文。')),
+            h('label', null, h('span', null, '历史查证主会话'),
+              h('select', { 'aria-label': '历史查证主会话', value: historyMain?.sessionId ?? '',
+                onChange: event => selectHistoryMain(event.target.value) },
+              h('option', { value: '' }, '未授权'),
+              ...(historyMain && !sessionChoices.some(item => item.id === historyMain.sessionId) ?
+                [h('option', { key: historyMain.sessionId, value: historyMain.sessionId },
+                  `${historyMain.sessionId}（已选择，尚未载入名称）`)] : []),
+              ...sessionChoices.map(session => h('option', { key: session.id, value: session.id }, sessionLabel(session))))),
+            historyMain ? h('div', { className: 'fields' },
+              field('Provider ID', historyMain.provider, value => setHistoryMain({ provider: value })),
+              field('Model ID', historyMain.model, value => setHistoryMain({ model: value }))) : null,
+            h('small', null, '更换工作区、主会话或路由后必须重新保存。查证只返回临时证据，不会写入 L0–L3；历史补录是独立管理动作，必须逐条预览、勾选并确认。'),
+            h('div', { className: 'panel stack' }, h('h4', null, '历史补录（管理操作）'),
+              h('p', { className: 'muted' }, '只预览所选普通用户消息中可由本地规则识别的原句；助手消息、工具结果、私人/继承会话和已遗忘事件不参与。候选按 L1/L2 待核保存，不会自动成为长期事实。'),
+              h('label', null, h('span', null, '来源会话'),
+                h('select', { 'aria-label': '历史补录来源会话', value: historyImportSession, disabled: busy,
+                  onChange: event => { setHistoryImportSession(event.target.value); setHistoryImportPlan(null); } },
+                h('option', { value: '' }, '选择已载入的工作区会话'),
+                ...sessionChoices.map(session => h('option', { key: session.id, value: session.id }, sessionLabel(session))))),
+              field('历史补录查询词（或选择日期）', historyImportQuery, value => {
+                setHistoryImportQuery(value); setHistoryImportPlan(null);
+              }, 'text', { disabled: busy }),
+              field('历史补录日期（YYYY-MM-DD，可选）', historyImportDate, value => {
+                setHistoryImportDate(value); setHistoryImportPlan(null);
+              }, 'date', { disabled: busy }),
+              h('div', { className: 'row' },
+                button('预览所选会话历史', previewSelectedHistory),
+                historyImportPlan ? h('small', null,
+                  `${historyImportPlan.sessionsChecked} 个会话 · ${historyImportPlan.candidateCount} 条候选${historyImportPlan.id ? ' · 20 分钟后过期' : ''} · ${historyImportPlan.coverage}`) : null),
+              historyImportPlan ? h('div', { className: 'stack' },
+                historyImportPlan.truncated ? h('p', { className: 'message' }, '候选超过每批上限，请缩小查询范围后重新预览。') : null,
+                ...historyImportPlan.candidates.map(candidate => h('label', { className: 'import-candidate', key: candidate.importId },
+                  h('input', { type: 'checkbox', disabled: busy || !historyImportPlan.id || candidate.status === 'already-exists',
+                    checked: historyImportSelected.includes(candidate.importId),
+                    onChange: event => setHistoryImportSelected(current => event.target.checked ?
+                      [...current, candidate.importId] : current.filter(id => id !== candidate.importId)) }),
+                  h('span', null, `${candidate.status === 'already-exists' ? '已存在' : '待核'} · ${candidate.layer} · ${candidate.at} · ${candidate.rule} · ${candidate.text} · 来源 ${candidate.sessionId}:${candidate.eventSeq}`))),
+                historyImportPlan.candidates.length ?
+                  h('button', { type: 'button', className: 'primary',
+                    disabled: busy || !historyImportPlan.id || historyImportSelected.length === 0,
+                    onClick: applySelectedHistory }, `确认补录所选 ${historyImportSelected.length} 条`) :
+                  h('p', { className: 'muted' }, '没有可补录候选；这不代表所选范围内没有其他相关内容。')) : null)),
           check('已确认图谱关联辅助召回（默认关闭）', config.graphRecall, value => patchConfig('graphRecall', value)),
           h('p', { className: 'muted' }, '仅从通过本轮词面证据门槛的已选记忆扩展人工确认且仍有效的关联，最多补充 3 条，使用剩余预算；纯语义命中和主题相同不自动扩展。'),
           h('p', { className: 'muted' }, '人工关联不保证与当前问题相关，可能带入不同主体、时期或冲突内容；大空间下也可能增加延迟。启用前可先在“回忆与整理”中检查结果。'),
-          h('p', { className: 'muted' }, '关闭后不自动注入记忆，但模型主动调用记忆工具仍可读取普通记忆。整理不发起额外模型请求。'),
+          h('p', { className: 'muted' }, '关闭后不自动注入记忆，但模型主动调用记忆工具仍可读取普通记忆。纯本地整理模式不会发起生成模型请求。'),
           h('div', { className: 'fields' },
             field('最低相关性分数', config.minScore, value => patchConfig('minScore', value), 'number', { min: 0, max: 1, step: 0.05 }),
             field('相对最高分门槛', config.relativeFloor, value => patchConfig('relativeFloor', value), 'number', { min: 0, max: 1, step: 0.05 })),
@@ -827,10 +960,41 @@ window.__ModuleLoader__.load({
           h('label', null, h('span', null, '普通深度整理方式'),
             h('select', { 'aria-label': '普通深度整理方式', value: config.deepOrganizationMode,
               onChange: event => patchConfig('deepOrganizationMode', event.target.value) },
-            h('option', { value: 'local' }, '本地规则 / 语义索引（默认）'),
-            h('option', { value: 'selected', disabled: true }, '宿主自选模型（暂不可用）'))),
+            h('option', { value: 'local' }, '本地规则（默认，不调用生成模型）'),
+            h('option', { value: 'session' }, '使用所选工作区会话模型'),
+            h('option', { value: 'api' }, '使用 OpenAI-compatible API'))),
+          config.deepOrganizationMode === 'session' ? h('div', { className: 'stack' },
+            h('div', { className: 'row' },
+              button('读取工作区会话', () => readWorkspaceSessions()),
+              h('small', null, '整理只使用所选模型路由，不读取该会话正文。')),
+            h('label', null, h('span', null, '整理模型会话'),
+              h('select', { 'aria-label': '整理模型会话', value: deepOrganization?.sessionId ?? '',
+                onChange: event => selectDeepOrganization(event.target.value) },
+              h('option', { value: '' }, '未选择'),
+              ...(deepOrganization && !sessionChoices.some(item => item.id === deepOrganization.sessionId) ?
+                [h('option', { key: deepOrganization.sessionId, value: deepOrganization.sessionId },
+                  `${deepOrganization.sessionId}（已选择，尚未载入名称）`)] : []),
+              ...sessionChoices.map(session => h('option', { key: session.id, value: session.id }, sessionLabel(session))))),
+            deepOrganization ? h('div', { className: 'fields' },
+              field('Provider ID', deepOrganization.provider, value => setDeepOrganization({ provider: value })),
+              field('Model ID', deepOrganization.model, value => setDeepOrganization({ model: value }))) : null) : null,
+          config.deepOrganizationMode === 'api' ? h('div', { className: 'stack' },
+            field('完整 API 地址', config.deepOrganizationApiEndpoint,
+              value => patchConfig('deepOrganizationApiEndpoint', value)),
+            field('API 模型名', config.deepOrganizationApiModel,
+              value => patchConfig('deepOrganizationApiModel', value)),
+            field('API 密钥（只写入，不回显）', modelApiKeyInput, setModelApiKeyInput,
+              'password', { autoComplete: 'new-password' }),
+            h('div', { className: 'row' },
+              button('保存 API 密钥', () => run(async () => {
+                await request(space, '/model-api-key', { apiKey: modelApiKeyInput });
+                setModelApiKeyInput('');
+              }, 'API 密钥已受 Windows 当前账户保护并保存。')),
+              button('清除 API 密钥', () => run(() => request(space, '/model-api-key/clear', {}),
+                '本地整理 API 密钥已清除。'), 'danger')),
+            h('small', null, `API 密钥${status.modelApiKey?.configured ? '已保存' : '未保存'}；仅在启动整理请求时解封到内存，不进入配置或备份。`)) : null,
           h('small', null, status.organizationModels?.ordinary?.message),
-          h('small', null, 'rc5 暂无已验证的外部插件后台整理审计接口；宿主模型和手填 API 均暂不可用，不会为整理发送数据。'),
+          h('small', null, '深度整理材料仅包括当前工作区的有效普通 L1/L2；严格排除 L0 与私人日记。原始记录保留，模型输出作为 L3 待核候选，确认前不会自动召回。L3 存储不设总条数上限，常驻额度和单次召回条数只限制注入上下文，不限制保存。'),
           h('div', { className: 'fields' },
             field('每日深度整理时间（本机时间，留空关闭）', config.dailyConsolidateAt,
               value => patchConfig('dailyConsolidateAt', value), 'time'),
@@ -839,11 +1003,11 @@ window.__ModuleLoader__.load({
                 `${new Date(status.deepConsolidation.at).toLocaleString()} · ${status.deepConsolidation.manual ? '手动' : '定时'} · 提炼 ${status.deepConsolidation.promoted} 条` : '尚未运行'}`),
               h('small', null, `下次预计：${status.nextDailyConsolidationAt ?
                 new Date(status.nextDailyConsolidationAt).toLocaleString() : '已关闭'}`))),
-          h('p', { className: 'muted' }, '本地深度整理不调用生成模型。私人轻整理与普通整理分开；整理前按恢复点设置备份，不含 L0，是否包含私人日记由加密范围决定。宿主每分钟检查，停机后空闲时补跑最近一次。L1 时长仅影响此后自动捕获的任务。'),
+          h('p', { className: 'muted' }, '普通深度整理按上方模式运行；私人日记轻整理与普通记忆分开。整理前先创建恢复点，不含 L0，是否包含私人日记由备份范围决定。宿主每分钟检查，停机后空闲时补跑最近一次。L1 时长仅影响此后自动捕获的任务。'),
           button('立即深度整理一次', () => run(() => request(space, '/consolidate', {}),
-            value => `本地深度整理完成：检查 ${value.inspected} 条，提炼 ${value.promoted} 条，二次编码新增 ${value.reencoding?.candidates ?? 0} 条待确认候选，冲突待复核 ${value.conflicts} 条。${
+            value => `深度整理完成：检查 ${value.inspected} 条，规则提炼 ${value.promoted} 条，模型待核 ${value.modelOrganization?.pendingEvidence ?? 0} 条，二次编码新增 ${value.reencoding?.candidates ?? 0} 条待确认候选，冲突待复核 ${value.conflicts} 条。${
               value.privateOrganization?.state === 'completed' ? '' : '私人整理未全部完成，请查看私人日记状态。'}${
-              value.modelExtraction?.state === 'unavailable' ? '自选模型未运行。' : ''}`)),
+              value.modelOrganization?.state === 'failed' ? '模型整理失败，原始 L1/L2 保留；查看错误状态后重试。' : ''}`)),
           status.deepConsolidation?.eligibility ? h('details', null, h('summary', null, '查看上次整理未产出的原因'),
             h('pre', null, JSON.stringify(status.deepConsolidation, null, 2))) : null,
           check('空闲维护自动备份（范围在“备份与恢复”中选择）', config.autoBackup, value => patchConfig('autoBackup', value)),

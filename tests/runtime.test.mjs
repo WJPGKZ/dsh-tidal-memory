@@ -384,7 +384,7 @@ test('a failed recovery point prevents organizing pending records or marking a d
   assert.equal(runtime.busy, false);
 });
 
-test('ordinary and private model routes remain independent and unavailable routes never send content', async t => {
+test('legacy ordinary model selection stays local while the unaudited private author route sends nothing', async t => {
   const now = new Date(2026, 2, 4, 4, 0);
   const { runtime, modelCalls } = fixture(t, { deepOrganizationMode: 'selected',
     privateOrganizationMode: 'author', privateWriters: ['test-author'] }, { clock: () => now });
@@ -394,12 +394,14 @@ test('ordinary and private model routes remain independent and unavailable route
   store.capture({ sessionId: 's', eventId: '1', text: '我喜欢简短回答。' });
   const result = (await runtime.checkDailyConsolidation()).results[0];
   assert.equal(result.privateOrganization.code, 'PRIVATE_MODEL_ROUTE_UNVERIFIED');
-  assert.equal(result.modelExtraction.code, 'HOST_AUDIT_REQUIRED');
+  assert.equal(result.modelOrganization.state, 'rules-only');
+  assert.equal(result.modelOrganization.inspected, 0);
   assert.equal(result.localOrganization.organized, 1);
   assert.equal(modelCalls(), 0);
   const status = await runtime.api('GET', '/status', new URLSearchParams({ space: 'shared' }));
   assert.equal(status.organizationModels.private.authorAvailable, false);
-  assert.equal(status.organizationModels.ordinary.state, 'unavailable');
+  assert.equal(status.organizationModels.ordinary.mode, 'local');
+  assert.equal(status.organizationModels.ordinary.state, 'rules-only');
   assert.equal(JSON.stringify(status).includes('PRIVATE_MODEL_ROUTE_CANARY'), false);
   await assert.rejects(runtime.api('POST', '/private/organize', new URLSearchParams({ space: 'shared' }), {}),
     { code: 'PRIVATE_MODEL_ROUTE_UNVERIFIED' });

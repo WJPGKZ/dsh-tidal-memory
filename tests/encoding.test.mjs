@@ -58,6 +58,16 @@ test('contextual changes require a unique explicit subject and preserve temporal
   ]), []);
 });
 
+test('directory claims keep subjects and polarity separate and reject planned or ambiguous values', () => {
+  const report = technicalClaim('报告导出目录目前不是 D:\\reports。');
+  const project = technicalClaim('本项目的导出目录是 D:/reports。');
+  assert.equal(report.polarity, 'negative');
+  assert.equal(project.value, 'D:\\reports');
+  assert.notEqual(report.subject, project.subject);
+  for (const text of ['计划把报告导出目录改成 D:\\reports。', '报告导出目录是 D:\\reports 或 E:\\reports。',
+    '其他项目的导出目录是 D:\\reports。']) assert.equal(technicalClaim(text), null, text);
+});
+
 test('context does not cross sessions or silently overwrite protected knowledge', t => {
   const { space, capture } = fixture(t);
   capture('这个项目使用 npm。', 'a');

@@ -3,7 +3,7 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  rc5-contract:
+  host-contract:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
       - run: pnpm check
       - name: Unit tests with bounded Windows concurrency
         run: pnpm test:unit
-      - name: Required real rc5 host contract and request tests
+      - name: Required real host contract and request tests
         run: pnpm test:host
       - name: Prepare browser for settings UI tests
         run: pnpm exec playwright install chromium

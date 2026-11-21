@@ -177,7 +177,7 @@ test('private review is route-bound, segmented, observed after replies, and vers
   assert.notEqual(read()?.receipt.contentHash, result.contentHash);
 });
 
-test('private Markdown is encrypted in v3 backups and restored as files, never SQLite bodies', t => {
+test('private Markdown is encrypted in v4 backups and restored as files, never SQLite bodies', t => {
   const f = fixture(t), space = f.open();
   const entry = space.appendPrivate('author-a', 'BACKUP_PRIVATE_CANARY');
   f.now = new Date(2026, 2, 5, 12, 0).getTime();
@@ -198,7 +198,7 @@ test('private Markdown is encrypted in v3 backups and restored as files, never S
   const encrypted = packBackup(space, password);
   assert.equal(encrypted.includes('BACKUP_PRIVATE_CANARY'), false);
   const document = unpackBackup(encrypted, password);
-  assert.equal(document.version, 3);
+  assert.equal(document.version, 4);
   assert.equal(document.privateEntries.length, 1);
   assert.equal(document.privateObservations.length, 1);
   assert.equal(document.privateOrganized.length, 1);

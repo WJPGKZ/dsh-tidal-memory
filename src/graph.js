@@ -86,9 +86,9 @@ function neighborsOnce(store, { id, cursor = '', limit = 50, mode = 'current', a
 export function graphNeighbors(store, options, actor) {
   for (let attempt = 0; attempt < 3; attempt++) {
     store.reconcileForgetLedger();
-    const version = store.reconciledForgetVersion;
+    const version = store.reconciledForgetVersion, privateVersion = store.reconciledPrivateVersion;
     const result = neighborsOnce(store, options, actor);
-    if (version === store.forgetVersion()) return result;
+    if (version === store.forgetVersion() && privateVersion === store.privateVersion()) return result;
   }
   throw new MemoryError('FORGET_CONFLICT', '读取图谱期间遗忘标记持续变化，请稍后重试。', 409);
 }
@@ -153,9 +153,9 @@ function listOnce(store, { layer = 'L3', status = 'active', query = '', topic = 
 export function graphList(store, options, actor) {
   for (let attempt = 0; attempt < 3; attempt++) {
     store.reconcileForgetLedger();
-    const version = store.reconciledForgetVersion;
+    const version = store.reconciledForgetVersion, privateVersion = store.reconciledPrivateVersion;
     const result = listOnce(store, options, actor);
-    if (version === store.forgetVersion()) return result;
+    if (version === store.forgetVersion() && privateVersion === store.privateVersion()) return result;
   }
   throw new MemoryError('FORGET_CONFLICT', '读取图谱期间遗忘标记持续变化，请稍后重试。', 409);
 }
@@ -167,7 +167,7 @@ export function graphDecision(store, { id, otherId, decision, revision, otherRev
   requireValue(id !== otherId, 'INVALID_INPUT', '不能关联同一条记忆。');
   choice(decision, ['confirmed', 'excluded', 'reset'], '图谱修正');
   store.reconcileForgetLedger();
-  const version = store.reconciledForgetVersion;
+  const version = store.reconciledForgetVersion, privateVersion = store.reconciledPrivateVersion;
   const scope = store.recallScope(actor, { mode: 'history' });
   const first = recordInScope(store, id, scope), second = recordInScope(store, otherId, scope);
   if (revision !== undefined) number(revision, 1, Number.MAX_SAFE_INTEGER, '中心记忆版本', true);
@@ -187,7 +187,7 @@ export function graphDecision(store, { id, otherId, decision, revision, otherRev
       .run(left, right, decision, graphDecisionHash(leftRecord), graphDecisionHash(rightRecord), store.now());
   }
   store.generation++;
-  if (version !== store.forgetVersion()) {
+  if (version !== store.forgetVersion() || privateVersion !== store.privateVersion()) {
     store.reconciledForgetVersion = null;
     store.reconcileForgetLedger();
     throw new MemoryError('FORGET_CONFLICT', '图谱修正期间遗忘标记发生变化，请刷新后重试。', 409);

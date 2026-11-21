@@ -10,7 +10,7 @@ export function prepareHost() {
     try {
       actual = JSON.parse(readFileSync(join(root, name, 'package.json'), 'utf8')).version;
     } catch (cause) {
-      throw new Error(`Required rc5 host dependency ${name} is missing. Run pnpm install:host; host tests never skip.`, { cause });
+      throw new Error(`Required host dependency ${name} is missing. Run pnpm install:host; host tests never skip.`, { cause });
     }
     if (actual !== expected) throw new Error(`Host dependency ${name}: expected ${expected}, got ${actual}.`);
   }

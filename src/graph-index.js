@@ -139,7 +139,7 @@ export class GraphIndex {
         transaction(this.db, () => {
           for (const row of rows) {
             const record = this.store.rawOrdinary(row.id);
-            if (record && !this.store.isForgotten(record)) this.replace(record);
+            if (record && !this.store.quarantinedIds.has(record.id) && !this.store.isForgotten(record)) this.replace(record);
           }
         });
         this.resume.cursor = rows.at(-1).id;
@@ -156,7 +156,9 @@ export class GraphIndex {
           const removeParent = this.db.prepare('DELETE FROM parents WHERE parent=?');
           for (const row of rows) {
             const record = this.store.rawOrdinary(row.id);
-            if (!record || this.store.isForgotten(record)) { remove.run(row.id); removeParent.run(row.id); }
+            if (!record || this.store.quarantinedIds.has(record.id) || this.store.isForgotten(record)) {
+              remove.run(row.id); removeParent.run(row.id);
+            }
           }
         });
         this.resume.cursor = rows.at(-1).id;

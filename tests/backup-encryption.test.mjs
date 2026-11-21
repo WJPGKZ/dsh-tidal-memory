@@ -6,7 +6,8 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MemorySpace } from '../src/store.js';
-import { automaticKeyPath, automaticKeyStatus, readAutomaticKey, saveAutomaticKey } from '../src/backup-key.js';
+import { automaticKeyPath, automaticKeyStatus, modelApiKeyPath, modelApiKeyStatus, readAutomaticKey,
+  readModelApiKey, saveAutomaticKey, saveModelApiKey, clearModelApiKey } from '../src/backup-key.js';
 import { automaticBackup, restoreBackup, unpackBackup } from '../src/transfer.js';
 
 const admin = { admin: true };
@@ -54,6 +55,30 @@ test('Windows DPAPI failures are classified without leaking secrets or replacing
     calls++;
     assert.equal(options.timeout, 30000);
     return typeof result === 'function' ? result(calls) : result;
+  });
+
+  test('model API keys are DPAPI protected, read only for configured calls, and clearable', {
+    skip: process.platform !== 'win32',
+  }, t => {
+    const { root } = fixture(t);
+    const secret = 'synthetic-model-api-key';
+    t.mock.method(childProcess, 'spawnSync', (_command, _args, options) => ({
+      status: 0, stdout: Buffer.from(options.input, 'base64').toString('base64'), stderr: '',
+    }));
+    syncBuiltinESMExports();
+    try {
+      const saved = saveModelApiKey(root, secret);
+      assert.equal(saved.configured, true);
+      assert.equal(readFileSync(modelApiKeyPath(root), 'utf8').includes(secret), false);
+      const read = readModelApiKey(root);
+      assert.equal(read.toString('utf8'), secret);
+      read.fill(0);
+      assert.equal(clearModelApiKey(root).configured, false);
+      assert.equal(existsSync(modelApiKeyPath(root)), false);
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
   });
   syncBuiltinESMExports();
   try {

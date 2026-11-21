@@ -7,17 +7,19 @@ import { SemanticIndex, clearSemanticFiles } from './semantic-index.js';
 import { TopicIndex, clearTopicFiles, topicReferences } from './topic-index.js';
 import { GraphIndex, clearGraphFiles, graphPair } from './graph-index.js';
 import { confirmedGraphNeighbors, graphDecision, graphList, graphNeighbors } from './graph.js';
-import { expandForgotten, ForgetLedger } from './forget-ledger.js';
+import { expandForgotten, ForgetLedger, forgottenSourceCoverage, provenanceReferences, sourceEventAnchors } from './forget-ledger.js';
+import { PrivateSessionRegistry } from './private-session-registry.js';
 import {
   appendPrivateEntry, clearPrivateJournal, openPrivateJournal, organizePrivateDay, organizePrivateWindow,
   privateJournalContext, recordPrivateObservation,
   privateJournalFiles, privateJournalStatus, removePrivateEntries
 } from './private-journal.js';
 import { privateJournalDatabasePath } from './journal-files.js';
+import { EventCapture } from './event-capture.js';
 import { contextualSleepCandidate, SLEEP_CONTEXT_VERSION } from './sleep-context.js';
 import {
   LAYERS, MAX_CONTEXT_BUDGET, MAX_RECALL_QUERY_LENGTH, MAX_PROVENANCE_ITEMS, MAX_PROVENANCE_BYTES, MemoryError, choice, classifyRememberDirective, configOf, estimatedTokens,
-  consolidationConflict, consolidationEligibility, consolidationProfile, consolidationSimilarity, defaultImportance, hash, encodeCandidates, ENCODING_VERSION, localDateKey, memoryActivation, memoryContentHash, memorySearchText, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms, timestamp,
+  consolidationConflict, consolidationEligibility, consolidationProfile, consolidationSimilarity, containsCredential, defaultImportance, hash, encodeCandidates, ENCODING_VERSION, localDateKey, memoryActivation, memoryContentHash, memorySearchText, normalizeRecord, number, rankMemory, residentMemory, requireValue, SEARCH_VERSION, slug, string, terms, timestamp,
 } from './model.js';
 
 const parse = row => {
@@ -40,9 +42,59 @@ const idValue = id => {
   return id;
 };
 
+const sourceKinds = new Set(['manual', 'session', 'session-event', 'host-tool-receipt', 'agent-proposal', 'derived',
+  'local-rule', 'local-context', 'model-consolidation', 'import']);
+const pointerId = value => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
+function sourcePointer(value) {
+  if (Array.isArray(value)) return value.map(sourcePointer);
+  if (!value || typeof value !== 'object') return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([key, child]) => {
+    if ((key === 'original' || key === 'context') && child && typeof child === 'object')
+      return [[key, sourcePointer(child)]];
+    if (key === 'kind' && sourceKinds.has(child)) return [[key, child]];
+    if (['sessionId', 'sourceSession'].includes(key) && typeof child === 'string' &&
+        /^[a-zA-Z0-9_.:@-]{1,256}$/.test(child)) return [[key, child]];
+    if (key === 'eventId' && (Number.isSafeInteger(child) && child >= 0 ||
+        typeof child === 'string' && (/^\d{1,20}$/.test(child) || pointerId(child)))) return [[key, child]];
+    if (['id', 'parentId', 'contextSourceId', 'sourceId', 'taskRef', 'sceneRef', 'operationId'].includes(key) &&
+        pointerId(child)) return [[key, child]];
+    if (key === 'sourceIds' && Array.isArray(child)) return [[key, child.filter(pointerId)]];
+    if (key === 'at' && typeof child === 'string' && Number.isFinite(Date.parse(child))) return [[key, child]];
+    if (key === 'role' && ['user', 'assistant', 'tool'].includes(child)) return [[key, child]];
+    if (key === 'eventType' && ['result', 'check', 'correction', 'observation'].includes(child)) return [[key, child]];
+    if (key === 'callId' && typeof child === 'string' && /^[a-zA-Z0-9_.:@-]{1,256}$/.test(child)) return [[key, child]];
+    if (['callSeq', 'turn', 'step'].includes(key) && Number.isSafeInteger(child) && child >= 0) return [[key, child]];
+    if (key === 'tool' && ['write', 'edit'].includes(child)) return [[key, child]];
+    if (key === 'operation' && ['create', 'update', 'error'].includes(child)) return [[key, child]];
+    return [];
+  }));
+}
+const exposedRecord = (record, actor) => actor?.admin === true ? record :
+  { ...record, source: sourcePointer(record.source), sources: sourcePointer(record.sources) };
+
+function recallEvidence(record) {
+  if (record.source.kind === 'host-tool-receipt') return record.source.operation === 'error' ?
+    '工具报告调用失败，不能证明目标或任务状态' : '仅证明工具报告的文件操作，不证明任务完成';
+  if (record.kind === 'user_statement' && record.source.kind === 'local-rule') {
+    if (record.source.rule === 'plan') return '计划，不是已完成';
+    if (record.claim?.predicate === 'export-directory') return record.claim.polarity === 'negative' ?
+      `用户否认的导出目录：${record.claim.value}` : `用户陈述的导出目录：${record.claim.value}；不证明产物已生成`;
+  }
+  return record.reinforcedAt ? '人工确认过' : '未人工核实';
+}
+
+function identifierPattern(query) {
+  const identifier = query.trim();
+  if (!/^[a-z0-9][a-z0-9._:/\\+@#-]{1,255}$/i.test(identifier) ||
+      !/[._:/\\+@#-]/.test(identifier)) return null;
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![a-z0-9_])(?<![a-z0-9_][._+@#-])${escaped}(?![a-z0-9_]|[._+@#-][a-z0-9_])`, 'i');
+}
+
 export class MemorySpace {
   constructor(root, name, options = {}) {
     this.name = slug(name);
+    this.root = resolve(root);
     this.directory = join(root, 'spaces', name);
     this.privateDirectory = join(this.directory, 'private');
     const hasExistingSystem = existsSync(join(this.directory, 'system', 'operations.sqlite3'));
@@ -83,6 +135,8 @@ export class MemorySpace {
         CREATE INDEX IF NOT EXISTS operations_pending ON operations(created_at,id) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS tombstones (id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS forgotten_keys (dedupe_key TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS forgotten_events (session_id TEXT NOT NULL, event_seq INTEGER NOT NULL,
+          PRIMARY KEY(session_id,event_seq));
         CREATE TABLE IF NOT EXISTS reinforcements (id TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(id,evidence));
         CREATE TABLE IF NOT EXISTS traces (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0);
@@ -110,6 +164,23 @@ export class MemorySpace {
           operation_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, scene_id TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS encodings (source_id TEXT PRIMARY KEY, version TEXT NOT NULL, result TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS capture_sessions (
+          session_id TEXT PRIMARY KEY, first_seq INTEGER NOT NULL, contiguous_seq INTEGER NOT NULL,
+          last_seq INTEGER NOT NULL, started_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS capture_receipts (
+          session_id TEXT NOT NULL, event_seq INTEGER NOT NULL, event_type TEXT NOT NULL, fingerprint TEXT NOT NULL,
+          state TEXT NOT NULL, reason TEXT NOT NULL, attempts INTEGER NOT NULL, source_ids TEXT NOT NULL,
+          record_ids TEXT NOT NULL, call_id TEXT, rule_version TEXT NOT NULL, forget_version INTEGER NOT NULL,
+          first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(session_id,event_seq)
+        );
+        CREATE INDEX IF NOT EXISTS capture_receipts_pending ON capture_receipts(state,updated_at);
+        CREATE INDEX IF NOT EXISTS capture_receipts_by_call ON capture_receipts(session_id,call_id,state);
+        CREATE TABLE IF NOT EXISTS capture_calls (
+          session_id TEXT NOT NULL, call_id TEXT NOT NULL, event_seq INTEGER NOT NULL, turn INTEGER NOT NULL,
+          step INTEGER NOT NULL, tool TEXT NOT NULL, task_ref TEXT, scene_ref TEXT,
+          PRIMARY KEY(session_id,call_id)
+        );
         CREATE TABLE IF NOT EXISTS sleep_encodings (source_id TEXT PRIMARY KEY, source_revision INTEGER NOT NULL,
           version TEXT NOT NULL, context_hash TEXT NOT NULL, result TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sleep_expirations (source_id TEXT PRIMARY KEY);
@@ -123,6 +194,7 @@ export class MemorySpace {
         PRAGMA user_version=1;
       `);
       this.forgetLedger = new ForgetLedger(root);
+      this.privateRegistry = new PrivateSessionRegistry(root);
       const existingLineage = this.system.prepare("SELECT value FROM metadata WHERE key='lineage'").get()?.value;
       this.lineageId = existingLineage ?? options.lineageId ??
         (hasExistingSystem ? this.forgetLedger.lineageFor(name) : null) ?? randomUUID();
@@ -133,8 +205,13 @@ export class MemorySpace {
       if (options.registerName !== false) this.forgetLedger.register(name, this.lineageId);
       this.privateDb = openPrivateJournal(this.directory);
       if (!this.deferLedgerWrites) {
+        const coverageKnown = this.system.prepare("SELECT value FROM metadata WHERE key='forget-source-version'").get()?.value === '2';
+        const coverageUnknown = this.system.prepare("SELECT value FROM metadata WHERE key='forget-source-unknown'").get()?.value === '1';
         this.forgetLedger.add(this.lineageId, this.system.prepare('SELECT * FROM tombstones').all(),
-          this.system.prepare('SELECT dedupe_key FROM forgotten_keys').all().map(row => row.dedupe_key));
+          this.system.prepare('SELECT dedupe_key FROM forgotten_keys').all().map(row => row.dedupe_key), {
+            known: coverageKnown, unknown: coverageUnknown,
+            events: this.system.prepare('SELECT session_id AS sessionId,event_seq AS eventSeq FROM forgotten_events').all(),
+          });
         this.forgetLedger.addPrivate(this.lineageId,
           this.privateDb.prepare('SELECT id FROM private_tombstones').all().map(row => row.id));
       }
@@ -143,6 +220,7 @@ export class MemorySpace {
         catch (error) { this.logError('SEMANTIC_INDEX_INVALID', `派生语义索引不可用，原始记忆未改动：${error.code ?? 'INDEX_ERROR'}`); }
       }
       this.recover();
+      this.eventCapture = new EventCapture(this);
     } catch (error) {
       this.close();
       throw error;
@@ -157,16 +235,103 @@ export class MemorySpace {
     return this.dbs.get(layer);
   }
   visible(record, actor) {
-    return !this.isForgotten(record) &&
+    return !this.isPrivateQuarantined(record) && !this.isForgotten(record) &&
       (actor?.admin === true || (typeof actor?.sessionId === 'string' && record.scope === 'space'));
   }
   isForgotten(record) {
     return Boolean(this.system.prepare('SELECT 1 FROM tombstones WHERE id=? OR dedupe_key=? LIMIT 1')
       .get(record.id, record.dedupeKey) ||
       this.system.prepare('SELECT 1 FROM forgotten_keys WHERE dedupe_key=?').get(record.dedupeKey) ||
-      this.forgetLedger.has(this.lineageId, record));
+      this.forgetLedger.has(this.lineageId, record) ||
+      sourceEventAnchors(record).some(anchor =>
+        this.forgetLedger.hasEvent(this.lineageId, anchor.sessionId, anchor.eventSeq)));
   }
   forgetVersion() { return this.forgetLedger.version(this.lineageId); }
+  privateVersion() { return this.privateRegistry.version(); }
+  classifyPrivateRecords(records, sceneIds = this.quarantinedSceneIds ?? new Set()) {
+    const blockedSessions = this.blockedSessionIds ?? this.privateRegistry.blockedSessions();
+    const seeds = new Set(), children = new Map();
+    for (const record of records) {
+      const refs = provenanceReferences(record);
+      if ([...refs.sessions].some(id => blockedSessions.has(id)) ||
+          [...refs.scenes].some(id => sceneIds.has(id))) seeds.add(record.id);
+      for (const parent of refs.parents) {
+        if (!children.has(parent)) children.set(parent, new Set());
+        children.get(parent).add(record.id);
+      }
+    }
+    const queue = [...seeds];
+    for (let index = 0; index < queue.length; index++) for (const child of children.get(queue[index]) ?? []) {
+      if (!seeds.has(child)) { seeds.add(child); queue.push(child); }
+    }
+    return seeds;
+  }
+  reconcilePrivateRegistry() {
+    if (!this.privateRegistry) return;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const version = this.privateVersion();
+      if (this.reconciledPrivateVersion === version) return;
+      const sessions = this.privateRegistry.blockedSessions();
+      const scenes = new Set(this.system.prepare('SELECT scene_id,session_id FROM scene_members').all()
+        .filter(row => sessions.has(row.session_id)).map(row => row.scene_id));
+      const records = sessions.size ? this.allRaw() : [];
+      const revisions = sessions.size ? [...this.dbs].filter(([layer]) => layer !== 'L0')
+        .flatMap(([, db]) => db.prepare('SELECT data FROM revisions').all().map(parse)) : [];
+      this.blockedSessionIds = sessions;
+      this.quarantinedSceneIds = scenes;
+      const ids = this.classifyPrivateRecords([...records, ...revisions], scenes);
+      if (version !== this.privateVersion()) continue;
+      if (ids.size) {
+        for (const [layer, db] of this.dbs) {
+          transaction(db, () => {
+            const remove = db.prepare('DELETE FROM search WHERE id=?');
+            for (const id of ids) remove.run(id);
+          });
+          for (const id of ids) {
+            const path = join(this.directory, LAYERS[layer].directory, 'views', `${id}.md`);
+            if (existsSync(path) && readFileSync(path, 'utf8')
+              .startsWith('<!-- Generated read-only view. Edit through Tidal Memory UI. -->')) rmSync(path);
+          }
+        }
+        if (this.semanticIndex) this.semanticIndex.forget(ids);
+        else clearSemanticFiles(this.directory);
+        if (this.topicIndex) this.topicIndex.forget(ids);
+        else clearTopicFiles(this.directory);
+        if (this.graphIndex) this.graphIndex.forget(ids);
+        else clearGraphFiles(this.directory);
+      }
+      if (ids.size || scenes.size) {
+        this.system.exec('DELETE FROM traces');
+        const applied = this.system.prepare("SELECT value FROM metadata WHERE key='private-revision'").get()?.value;
+        if (applied !== String(version)) for (const db of this.dbs.values())
+          db.prepare("INSERT OR REPLACE INTO index_state VALUES('changes-epoch',?)").run(randomUUID());
+      }
+      this.system.prepare("INSERT OR REPLACE INTO metadata VALUES('private-revision',?)").run(String(version));
+      this.quarantinedIds = ids;
+      this.reconciledPrivateVersion = version;
+      this.generation++;
+      this.statisticsCache.clear();
+      this.topicCardCache.clear();
+      this.onPrivacyChange?.();
+      if (version === this.privateVersion()) return;
+    }
+    throw new MemoryError('PRIVATE_REGISTRY_CHANGED', '私人会话隔离状态持续变化，普通记忆暂不可用。', 409);
+  }
+  isPrivateQuarantined(record) {
+    if (!record) return false;
+    this.reconcilePrivateRegistry();
+    if (!this.blockedSessionIds.size) return false;
+    const refs = provenanceReferences(record);
+    return this.quarantinedIds.has(record.id) ||
+      [...refs.sessions].some(id => this.blockedSessionIds.has(id)) ||
+      [...refs.parents].some(id => this.quarantinedIds.has(id)) ||
+      [...refs.scenes].some(id => this.quarantinedSceneIds.has(id));
+  }
+  requireOrdinaryWriter(actor) {
+    this.reconcilePrivateRegistry();
+    requireValue(!actor?.sessionId || !this.blockedSessionIds.has(actor.sessionId),
+      'PRIVATE_SESSION_QUARANTINED', '私人历史会话不能写入普通记忆；请使用干净会话。', 403);
+  }
   raw(id) {
     idValue(id);
     for (const db of this.dbs.values()) {
@@ -188,10 +353,14 @@ export class MemorySpace {
     this.reconcileForgetLedger();
     const record = this.raw(id);
     requireValue(record && this.visible(record, actor), 'NOT_FOUND', '找不到此范围内的记忆。', 404);
-    return record;
+    return exposedRecord(record, actor);
+  }
+  allRaw() {
+    return [...this.dbs.values()].flatMap(db => db.prepare('SELECT data FROM memories ORDER BY created_at,id').all().map(parse));
   }
   all() {
-    return [...this.dbs.values()].flatMap(db => db.prepare('SELECT data FROM memories ORDER BY created_at,id').all().map(parse));
+    this.reconcilePrivateRegistry();
+    return this.allRaw().filter(record => !this.quarantinedIds.has(record.id));
   }
   searchRecords(query, { layer, statuses, limitPerLayer, mode = 'any', persistentOnly = false } = {}) {
     const queryTerms = terms(query);
@@ -254,9 +423,11 @@ export class MemorySpace {
       (!layer || record.layer === layer) && (!status || record.status === status) &&
       this.visible(record, actor)
     ).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
-    return { total: rows.length, items: rows.slice(offset, offset + limit) };
+    return { total: rows.length, items: rows.slice(offset, offset + limit).map(record => exposedRecord(record, actor)) };
   }
   persist(record) {
+    requireValue(!this.isPrivateQuarantined(record), 'PRIVATE_SESSION_QUARANTINED',
+      '此记忆来源涉及私人历史，已隔离而未写入普通记忆。', 403);
     requireValue(!this.isForgotten(record), 'FORGOTTEN', '此内容已被遗忘，不能重新保存。', 409);
     const db = this.db(record.layer);
     const before = parse(db.prepare('SELECT data FROM memories WHERE id=?').get(record.id));
@@ -313,6 +484,7 @@ export class MemorySpace {
     this.ensureOpen();
     this.reconcileForgetLedger();
     requireValue(actor?.admin === true || actor?.sessionId, 'FORBIDDEN', '缺少调用会话。', 403);
+    if (!actor.admin) this.requireOrdinaryWriter(actor);
     const candidate = actor.admin ? input : {
       ...input, scope: 'space', sessionId: actor.sessionId, pinned: false,
       kind: 'inference', status: 'active', source: { kind: 'agent-proposal', sessionId: actor.sessionId },
@@ -328,9 +500,11 @@ export class MemorySpace {
       !this.system.prepare('SELECT 1 FROM tombstones WHERE dedupe_key=?').get(record.dedupeKey), 'FORGOTTEN', '此内容已被遗忘，不允许自动重新导入。', 409);
     const duplicate = parse(this.db(record.layer).prepare('SELECT data FROM memories WHERE dedupe_key=?').get(record.dedupeKey));
     if (duplicate) {
+      requireValue(!this.isPrivateQuarantined(duplicate), 'PRIVATE_SESSION_QUARANTINED',
+        '相同内容涉及已隔离的私人来源，未合并或返回。', 403);
       const merged = this.mergeSources(duplicate, record);
       if (merged !== duplicate) { this.persist(merged); this.writeView(merged); }
-      return merged;
+      return exposedRecord(merged, actor);
     }
     if (record.factKey && record.status === 'active') {
       const conflict = this.all().find(other => other.factKey === record.factKey &&
@@ -340,12 +514,12 @@ export class MemorySpace {
     }
     this.persist(record);
     this.writeView(record);
-    return record;
+    return exposedRecord(record, actor);
   }
   indexSceneRecord(record) {
     if (record.layer !== 'L2') return;
     this.system.prepare('DELETE FROM scene_records WHERE record_id=?').run(record.id);
-    const sceneRef = record.source?.kind === 'session-event' ? record.source.sceneRef : null;
+    const sceneRef = ['session-event', 'host-tool-receipt'].includes(record.source?.kind) ? record.source.sceneRef : null;
     if (typeof sceneRef === 'string' && this.system.prepare(`SELECT 1 FROM scenes s
       JOIN scene_members m ON m.scene_id=s.id WHERE s.id=? AND m.session_id=?`).get(sceneRef, record.sessionId))
       this.system.prepare('INSERT INTO scene_records VALUES(?,?,?)').run(sceneRef, record.id, record.sessionId);
@@ -356,6 +530,7 @@ export class MemorySpace {
     this.reconcileForgetLedger();
     requireValue(typeof actor?.sessionId === 'string' && actor.sessionId.length > 0,
       'FORBIDDEN', '结果事件需要宿主会话身份。', 403);
+    this.requireOrdinaryWriter(actor);
     string(text, '经历内容', 16000);
     choice(eventType, ['result', 'check', 'correction', 'observation'], '经历类型');
     idValue(operationId);
@@ -398,8 +573,9 @@ export class MemorySpace {
     return record;
   }
   requireSceneMember(sceneRef, actor) {
+    this.reconcilePrivateRegistry();
     idValue(sceneRef);
-    requireValue(typeof actor?.sessionId === 'string' &&
+    requireValue(!this.quarantinedSceneIds.has(sceneRef) && typeof actor?.sessionId === 'string' &&
       this.system.prepare(`SELECT 1 FROM scenes s JOIN scene_members m ON m.scene_id=s.id
         WHERE s.id=? AND m.session_id=?`).get(sceneRef, actor.sessionId),
     'SCENE_UNAVAILABLE', '场景不存在或当前会话尚未加入。', 403);
@@ -408,6 +584,7 @@ export class MemorySpace {
     this.ensureOpen();
     requireValue(typeof actor?.sessionId === 'string' && actor.sessionId.length > 0,
       'FORBIDDEN', '创建场景需要宿主会话身份。', 403);
+    this.requireOrdinaryWriter(actor);
     string(title, '场景名称', 160);
     idValue(operationId);
     const payloadHash = hash(JSON.stringify([title.trim(), actor.sessionId]));
@@ -430,6 +607,8 @@ export class MemorySpace {
     this.ensureOpen();
     requireValue(typeof actor?.sessionId === 'string' && actor.sessionId.length > 0,
       'FORBIDDEN', '加入场景需要宿主会话身份。', 403);
+    this.requireOrdinaryWriter(actor);
+    requireValue(!this.quarantinedSceneIds.has(sceneRef), 'SCENE_UNAVAILABLE', '场景已隔离。', 403);
     idValue(sceneRef);
     requireValue(this.system.prepare('SELECT 1 FROM scenes WHERE id=?').get(sceneRef),
       'SCENE_UNAVAILABLE', '找不到此工作区场景。', 404);
@@ -446,15 +625,19 @@ export class MemorySpace {
   }
   sceneTitle(sceneRef) {
     if (typeof sceneRef !== 'string') return null;
+    this.reconcilePrivateRegistry();
+    if (this.quarantinedSceneIds.has(sceneRef)) return null;
     return this.system.prepare('SELECT title FROM scenes WHERE id=?').get(sceneRef)?.title ?? null;
   }
   listScenes(actor) {
+    this.reconcilePrivateRegistry();
     requireValue(typeof actor?.sessionId === 'string' && actor.sessionId.length > 0,
       'FORBIDDEN', '场景列表需要宿主会话身份。', 403);
     return this.system.prepare(`SELECT s.id,s.title,s.created_at AS createdAt,
       (SELECT count(*) FROM scene_members WHERE scene_id=s.id) AS memberCount
       FROM scenes s JOIN scene_members m ON m.scene_id=s.id
-      WHERE m.session_id=? ORDER BY s.created_at DESC,s.id LIMIT 100`).all(actor.sessionId);
+      WHERE m.session_id=? ORDER BY s.created_at DESC,s.id LIMIT 100`).all(actor.sessionId)
+      .filter(scene => !this.quarantinedSceneIds.has(scene.id));
   }
   sessionFocus(actor) {
     this.ensureOpen();
@@ -464,18 +647,20 @@ export class MemorySpace {
       .get(actor.sessionId);
     if (!focus) return { taskRef: null, sceneRef: null, updatedAt: null, task: null, scene: null };
     const task = focus.taskRef ? this.rawOrdinary(focus.taskRef) : null;
-    const scene = focus.sceneRef && this.system.prepare(`SELECT s.id,s.title,s.created_at AS createdAt
+    this.reconcilePrivateRegistry();
+    const scene = focus.sceneRef && !this.quarantinedSceneIds.has(focus.sceneRef) && this.system.prepare(`SELECT s.id,s.title,s.created_at AS createdAt
       FROM scenes s JOIN scene_members m ON m.scene_id=s.id
       WHERE s.id=? AND m.session_id=?`).get(focus.sceneRef, actor.sessionId);
     return { taskRef: task && this.visible(task, actor) && task.layer === 'L1' ? task.id : null,
       sceneRef: scene?.id ?? null, updatedAt: focus.updatedAt,
-      task: task && this.visible(task, actor) && task.layer === 'L1' ? task : null,
+      task: task && this.visible(task, actor) && task.layer === 'L1' ? exposedRecord(task, actor) : null,
       scene: scene ?? null };
   }
   setSessionFocus({ taskRef = null, sceneRef = null } = {}, actor) {
     this.ensureOpen();
     requireValue(typeof actor?.sessionId === 'string' && actor.sessionId.length > 0,
       'FORBIDDEN', '会话焦点需要宿主会话身份。', 403);
+    this.requireOrdinaryWriter(actor);
     if (taskRef !== null) {
       idValue(taskRef);
       requireValue(this.get(taskRef, actor).layer === 'L1', 'INVALID_TASK', '任务焦点必须指向当前工作区的 L1 任务。');
@@ -540,7 +725,7 @@ export class MemorySpace {
     for (const item of selected) nextSequence[item.layer] = Math.max(nextSequence[item.layer], item.seq);
     const returnedByLayer = new Map(layers.map(layer => [layer, selected.filter(item => item.layer === layer).length]));
     const hasMore = batches.some(batch => batch.rows.length > returnedByLayer.get(batch.layer));
-    return { items: selected.map(({ seq, id, revision, status, changedAt, layer }) =>
+    return { items: selected.filter(item => !this.quarantinedIds.has(item.id)).map(({ seq, id, revision, status, changedAt, layer }) =>
       ({ id, layer, revision, status, changedAt })), cursor: encode(nextSequence), hasMore };
   }
   capture({ sessionId, eventId, text, role = 'user', at, chunk }) {
@@ -553,14 +738,34 @@ export class MemorySpace {
   organizePending(limit = 200, onlyId) {
     this.reconcileForgetLedger();
     number(limit, 1, 1000, '本地整理上限', true);
-    const records = (onlyId
+    const rows = onlyId
       ? this.db('L0').prepare("SELECT data FROM memories WHERE id=? AND status='pending' AND json_extract(data,'$.source.kind')='session'").all(idValue(onlyId))
       : this.db('L0').prepare(
-        "SELECT data FROM memories WHERE status='pending' AND json_extract(data,'$.source.kind')='session' ORDER BY created_at,id LIMIT ?",
-      ).all(limit)).map(parse);
+        "SELECT data FROM memories WHERE status='pending' AND json_extract(data,'$.source.kind')='session' ORDER BY created_at,id",
+      ).iterate();
+    const records = [];
+    for (const row of rows) {
+      const record = parse(row);
+      if (!this.isPrivateQuarantined(record)) records.push(record);
+      if (records.length >= limit) break;
+    }
     const result = { inspected: records.length, organized: 0, needsReview: 0 };
     for (const source of records) {
       if (source.source?.kind !== 'session') continue;
+      const eventId = source.source.eventId;
+      const receipt = /^\d{1,15}$/.test(eventId ?? '') ?
+        this.system.prepare(`SELECT state,reason,forget_version FROM capture_receipts
+          WHERE session_id=? AND event_seq=?`).get(source.sessionId, Number(eventId)) : null;
+      if (receipt && (receipt.reason === 'SOURCE_CHANGED' ||
+          receipt.forget_version !== this.forgetVersion() &&
+          (['pending', 'failed', 'waiting'].includes(receipt.state) || receipt.reason === 'FORGET_CHANGED'))) {
+        this.update(source.id, { status: 'review' }, source.revision, { admin: true });
+        this.recordEncoding(source.id, { reason: 'capture-needs-review', saved: 0 });
+        if (receipt.reason !== 'SOURCE_CHANGED')
+          this.eventCapture.finish(source.sessionId, Number(eventId), { state: 'review', reason: 'FORGET_CHANGED' });
+        result.needsReview++;
+        continue;
+      }
       if (source.source.role !== 'user') {
         this.update(source.id, { status: 'processed' }, source.revision, { admin: true });
         this.recordEncoding(source.id, { reason: 'non-user-source', saved: 0 });
@@ -579,10 +784,10 @@ export class MemorySpace {
           const previous = this.db('L0').prepare(`SELECT data FROM memories WHERE session_id=? AND id<>?
             AND json_extract(data,'$.source.role')='user' AND created_at<=?
             ORDER BY created_at DESC,id DESC LIMIT 4`).all(source.sessionId, source.id, source.createdAt).map(parse)
-            .filter(item => item.source.eventId !== source.source.eventId).reverse();
+            .filter(item => !this.isPrivateQuarantined(item) && item.source.eventId !== source.source.eventId).reverse();
           const input = source.source.chunk?.inCodeFence ? `\`\`\`\n${source.text}` : source.text;
           const candidates = this.config.autoCandidates ? encodeCandidates(input, previous) : [];
-          const outcomes = { version: ENCODING_VERSION, at: this.now(), selected: candidates.length, saved: 0,
+          const outcomes = { version: ENCODING_VERSION, at: this.now(), selected: candidates.length, saved: 0, recordIds: [],
             reason: !this.config.autoCandidates ? 'disabled' : candidates.length ? 'encoded' : 'no-explicit-rule' };
           for (const candidate of candidates) {
             requireValue(source.text.includes(candidate.text), 'INVALID_EVIDENCE', '规则候选必须是来源原文片段。');
@@ -604,6 +809,7 @@ export class MemorySpace {
               this.linkTaskEvent(saved);
               result.organized++;
               outcomes.saved++;
+              outcomes.recordIds.push(saved.id);
             } catch (error) {
               if (error.code !== 'FORGOTTEN') {
                 this.recordEncoding(source.id, { ...outcomes, reason: 'failed', code: error.code ?? 'ENCODING_FAILED' });
@@ -617,7 +823,7 @@ export class MemorySpace {
         }
         continue;
       }
-      this.promote(source.id, {
+      const promoted = this.promote(source.id, {
         layer: classified.layer, text: classified.text, category: classified.category,
         kind: 'user_statement', status: 'active', horizon: classified.horizon,
         ...(classified.layer === 'L1' ? {
@@ -626,7 +832,7 @@ export class MemorySpace {
             this.config.workingHours * 3600000).toISOString() : null,
         } : {}),
       }, { admin: true });
-      this.recordEncoding(source.id, { reason: 'explicit-directive', selected: 1, saved: 1 });
+      this.recordEncoding(source.id, { reason: 'explicit-directive', selected: 1, saved: 1, recordIds: [promoted.id] });
       result.organized++;
     }
     return result;
@@ -640,6 +846,8 @@ export class MemorySpace {
       const legacyKey = normalizeRecord({ ...input, factKey: '' }, this.now()).dedupeKey;
       const legacy = parse(this.db(input.layer).prepare('SELECT data FROM memories WHERE dedupe_key=?').get(legacyKey));
       if (legacy) {
+        requireValue(!this.isPrivateQuarantined(legacy), 'PRIVATE_SESSION_QUARANTINED',
+          '相同内容涉及已隔离的私人来源，未合并或返回。', 403);
         const merged = this.mergeSources(legacy, normalizeRecord(input, this.now()));
         if (merged !== legacy) { this.persist(merged); this.writeView(merged); }
         return merged;
@@ -703,7 +911,8 @@ export class MemorySpace {
     const records = db.prepare(`SELECT data FROM memories WHERE status='processed' AND created_at>=? AND created_at<=?
       AND updated_at>=?
       AND json_extract(data,'$.source.kind')='session' AND json_extract(data,'$.source.role')='user'
-      ORDER BY created_at,rowid`).all(start, end, retentionStart).map(parse);
+      ORDER BY created_at,rowid`).all(start, end, retentionStart).map(parse)
+      .filter(record => !this.isPrivateQuarantined(record));
     for (const source of records) {
       const initial = this.system.prepare('SELECT result FROM encodings WHERE source_id=?').get(source.id);
       if (!initial || JSON.parse(initial.result).reason !== 'no-explicit-rule' || source.source.chunk?.inCodeFence) continue;
@@ -714,7 +923,7 @@ export class MemorySpace {
       const previous = parse(context);
       const sourceTime = Date.parse(source.occurredAt ?? source.createdAt);
       const previousTime = previous && Date.parse(previous.occurredAt ?? previous.createdAt);
-      const usableContext = previous && previous.updatedAt >= retentionStart &&
+      const usableContext = previous && !this.isPrivateQuarantined(previous) && previous.updatedAt >= retentionStart &&
         !previous.source.chunk?.inCodeFence && previousTime <= sourceTime &&
         sourceTime - previousTime <= 30 * 60000 ? previous : null;
       const contextHash = hash(JSON.stringify([source.id, source.revision,
@@ -777,7 +986,8 @@ export class MemorySpace {
         if (!scenes.has(key)) scenes.set(key, { at, ids: [], entries: [] });
         if (scenes.get(key).ids.includes(record.id)) continue;
         scenes.get(key).ids.push(record.id);
-        scenes.get(key).entries.push({ id: record.id, text: record.text, kind: record.kind, source });
+        scenes.get(key).entries.push({ id: record.id, text: record.text, kind: record.kind,
+          source: actor?.admin === true ? source : sourcePointer(source) });
       }
     }
     return { totalScenes: scenes.size, totalRecords: new Set([...scenes.values()].flatMap(scene => scene.ids)).size,
@@ -785,6 +995,7 @@ export class MemorySpace {
       coverage: '仅统计已保存且匹配的情景；一条用户消息可含多个实际事件，不能视作实际发生总次数。' };
   }
   update(id, patch, expectedRevision, actor) {
+    if (!actor?.admin) this.requireOrdinaryWriter(actor);
     const previous = this.get(id, actor);
     requireValue(previous.revision === expectedRevision, 'REVISION_CONFLICT', '记忆已被修改，请刷新后重试。', 409);
     requireValue(!patch.layer || patch.layer === previous.layer, 'USE_PROMOTION', '跨层请使用提炼/转层操作。');
@@ -821,13 +1032,14 @@ export class MemorySpace {
     }
     this.persist(record);
     this.writeView(record);
-    return record;
+    return exposedRecord(record, actor);
   }
   revisions(id, actor) {
     const memory = this.get(id, actor);
     if (memory.layer === 'L0') return [memory];
     const history = this.db(memory.layer).prepare('SELECT data FROM revisions WHERE id=? ORDER BY revision DESC').all(id).map(parse);
-    return history[0]?.revision === memory.revision ? history : [memory, ...history];
+    return (history[0]?.revision === memory.revision ? history : [memory, ...history])
+      .map(record => exposedRecord(record, actor));
   }
   lifecycle(id, actor) {
     const record = this.get(id, actor), now = this.clock();
@@ -934,7 +1146,7 @@ export class MemorySpace {
     } else if (operation.kind === 'usage') {
       const { memoryId, evidenceId, at } = operation;
       const current = this.raw(memoryId);
-      if (current && !this.isForgotten(current)) {
+      if (current && !this.isPrivateQuarantined(current) && !this.isForgotten(current)) {
         const db = this.db(current.layer);
         transaction(db, () => {
           const inserted = db.prepare('INSERT OR IGNORE INTO retrieval_events VALUES(?,?)').run(memoryId, evidenceId).changes;
@@ -953,7 +1165,8 @@ export class MemorySpace {
     } else if (operation.kind === 'reinforce') {
       const { record, evidenceId } = operation;
       const current = this.raw(record.id);
-      if (current && !this.isForgotten(current) && !this.isForgotten(record)) {
+      if (current && !this.isPrivateQuarantined(current) && !this.isPrivateQuarantined(record) &&
+          !this.isForgotten(current) && !this.isForgotten(record)) {
         if (current.revision < record.revision) {
           this.persist(record);
           this.failpoint('after-reinforcement-write');
@@ -965,10 +1178,10 @@ export class MemorySpace {
     } else if (operation.kind === 'consolidate') {
       if (operation.sourceIds.every(sourceId => {
         const source = this.raw(sourceId);
-        return source && !this.isForgotten(source);
+        return source && !this.isPrivateQuarantined(source) && !this.isForgotten(source);
       })) {
         for (const record of operation.records) {
-          if (this.isForgotten(record)) continue;
+          if (this.isPrivateQuarantined(record) || this.isForgotten(record)) continue;
           const current = this.raw(record.id);
           if (!current || current.revision < record.revision) this.persist(record);
           this.failpoint('after-consolidation-write');
@@ -978,7 +1191,8 @@ export class MemorySpace {
     } else {
       const { sourceId, target } = operation;
       const source = this.raw(sourceId);
-      if (source && !this.isForgotten(source) && !this.isForgotten(target)) {
+      if (source && !this.isPrivateQuarantined(source) && !this.isPrivateQuarantined(target) &&
+          !this.isForgotten(source) && !this.isForgotten(target)) {
         const existing = this.raw(target.id);
         this.persist(existing ? this.mergeSources(existing, target) : target);
         this.failpoint('after-target');
@@ -999,6 +1213,7 @@ export class MemorySpace {
     }
   }
   reconcileForgetLedger() {
+    this.reconcilePrivateRegistry();
     const result = { deleted: 0, privateDeleted: 0 };
     for (;;) {
       const version = this.forgetVersion();
@@ -1006,18 +1221,21 @@ export class MemorySpace {
       const state = this.forgetLedger.state(this.lineageId);
       const ids = new Set(state.tombstones.map(row => row.id));
       const keys = new Set([...state.tombstones.map(row => row.dedupe_key), ...state.forgottenKeys]);
-      const all = this.all();
-      const revisions = ids.size || keys.size ? [...this.dbs].filter(([layer]) => layer !== 'L0')
+      const eventKeys = new Set(state.eventAnchors.map(anchor => JSON.stringify([anchor.sessionId, anchor.eventSeq])));
+      const all = this.allRaw();
+      const revisions = ids.size || keys.size || eventKeys.size ? [...this.dbs].filter(([layer]) => layer !== 'L0')
         .flatMap(([, db]) => db.prepare('SELECT data FROM revisions').all().map(parse)) : [];
       const history = [...all, ...revisions];
       const selected = expandForgotten(history, [...ids,
-        ...history.filter(record => keys.has(record.dedupeKey)).map(record => record.id)]);
+        ...history.filter(record => keys.has(record.dedupeKey) || sourceEventAnchors(record)
+          .some(anchor => eventKeys.has(JSON.stringify([anchor.sessionId, anchor.eventSeq])))).map(record => record.id)]);
       const records = all.filter(record => selected.has(record.id));
       const extraMarkers = records.map(record => ({ id: record.id, dedupe_key: record.dedupeKey }));
       const extraKeys = records.flatMap(record =>
         this.db(record.layer).prepare('SELECT data FROM revisions WHERE id=?').all(record.id).map(row => parse(row).dedupeKey));
-      if (!this.deferLedgerWrites && (extraMarkers.length || extraKeys.length))
-        this.forgetLedger.add(this.lineageId, extraMarkers, extraKeys);
+      const coverage = forgottenSourceCoverage(history.filter(record => selected.has(record.id)));
+      if (!this.deferLedgerWrites && (extraMarkers.length || extraKeys.length || coverage.events.length || coverage.unknown))
+        this.forgetLedger.add(this.lineageId, extraMarkers, extraKeys, { ...coverage, known: true });
       const privateIds = new Set(state.privateIds);
       const aliases = this.privateDb.prepare('SELECT alias_id,entry_id FROM entry_aliases').all();
       const aliasedPrivateIds = new Set(aliases.filter(alias => privateIds.has(alias.alias_id)).map(alias => alias.entry_id));
@@ -1051,6 +1269,28 @@ export class MemorySpace {
           key.run(row.dedupe_key);
         }
         for (const value of [...state.forgottenKeys, ...extraKeys]) key.run(value);
+        const markEvent = this.system.prepare('INSERT OR IGNORE INTO forgotten_events VALUES(?,?)');
+        const clearReceipt = this.system.prepare(`UPDATE capture_receipts
+          SET state='empty',reason='forgotten-source',source_ids='[]',record_ids='[]',updated_at=?
+          WHERE session_id=? AND event_seq=?`);
+        const affected = new Set();
+        for (const anchor of state.eventAnchors) {
+          markEvent.run(anchor.sessionId, anchor.eventSeq);
+          if (clearReceipt.run(this.now(), anchor.sessionId, anchor.eventSeq).changes) affected.add(anchor.sessionId);
+        }
+        this.system.prepare("INSERT OR REPLACE INTO metadata VALUES('forget-source-version','2')").run();
+        if (state.unknownEventCoverage)
+          this.system.prepare("INSERT OR REPLACE INTO metadata VALUES('forget-source-unknown','1')").run();
+        const sessionCursor = this.system.prepare('SELECT contiguous_seq AS seq FROM capture_sessions WHERE session_id=?');
+        const receipt = this.system.prepare('SELECT state FROM capture_receipts WHERE session_id=? AND event_seq=?');
+        const advance = this.system.prepare('UPDATE capture_sessions SET contiguous_seq=?,updated_at=? WHERE session_id=?');
+        for (const sessionId of affected) {
+          const current = sessionCursor.get(sessionId);
+          if (!current) continue;
+          let cursor = current.seq;
+          while (['saved', 'empty', 'review'].includes(receipt.get(sessionId, cursor + 1)?.state)) cursor++;
+          advance.run(cursor, this.now(), sessionId);
+        }
         const removeGraph = this.system.prepare('DELETE FROM graph_relations WHERE left_id=? OR right_id=?');
         for (const id of new Set([...state.tombstones.map(row => row.id), ...records.map(record => record.id)]))
           removeGraph.run(id, id);
@@ -1067,13 +1307,15 @@ export class MemorySpace {
     adminOnly(actor);
     this.recover();
     this.get(id, actor);
-    const all = this.all();
+    const all = this.allRaw();
     const ids = expandForgotten(all, [id]);
     const records = all.filter(item => ids.has(item.id));
     const markers = records.map(record => ({ id: record.id, dedupe_key: record.dedupeKey }));
-    const keys = records.flatMap(record => this.db(record.layer).prepare('SELECT data FROM revisions WHERE id=?')
-      .all(record.id).map(row => parse(row).dedupeKey));
-    this.forgetLedger.add(this.lineageId, markers, keys);
+    const revisions = records.flatMap(record => this.db(record.layer).prepare('SELECT data FROM revisions WHERE id=?')
+      .all(record.id).map(parse));
+    const keys = revisions.map(record => record.dedupeKey);
+    const coverage = forgottenSourceCoverage([...records, ...revisions]);
+    this.forgetLedger.add(this.lineageId, markers, keys, { ...coverage, known: true });
     const result = this.reconcileForgetLedger();
     return { deleted: result.deleted, notice: '已删除当前库、相关历史及派生记录；同数据根的同谱系恢复会遵守遗忘标记。旧备份和离线副本不会被改写。' };
   }
@@ -1157,13 +1399,13 @@ export class MemorySpace {
   }
   recordRetrieval(id, evidenceId) {
     const record = this.raw(id);
-    if (!record || record.status !== 'active' || this.isForgotten(record)) return;
+    if (!record || record.status !== 'active' || this.isPrivateQuarantined(record) || this.isForgotten(record)) return;
     const key = `recall:${hash(evidenceId)}`;
     if (this.system.prepare('SELECT 1 FROM reinforcements WHERE id=? AND evidence=?').get(id, key)) return;
     if (this.system.prepare("SELECT 1 FROM operations WHERE state='pending' LIMIT 1").get()) this.recover();
     if (this.system.prepare('SELECT 1 FROM reinforcements WHERE id=? AND evidence=?').get(id, key)) return;
     const current = this.raw(id);
-    if (!current || current.status !== 'active' || this.isForgotten(current)) return;
+    if (!current || current.status !== 'active' || this.isPrivateQuarantined(current) || this.isForgotten(current)) return;
     const operationId = randomUUID();
     this.system.prepare('INSERT INTO operations VALUES(?,?,?,?)')
       .run(operationId, JSON.stringify({ kind: 'usage', memoryId: id, evidenceId: key, at: this.now() }), 'pending', this.now());
@@ -1184,6 +1426,34 @@ export class MemorySpace {
       (mode === 'history' || ((!record.validFrom || Date.parse(record.validFrom) <= now) &&
         (!record.validUntil || Date.parse(record.validUntil) > now))) };
   }
+  exactIdentifierRecords(query, actor, options = {}) {
+    const pattern = identifierPattern(query);
+    if (!pattern) return [];
+    const scope = this.recallScope(actor, options);
+    const direct = pointerId(query.trim()) ? this.rawOrdinary(query.trim()) : null;
+    const records = new Map();
+    if (direct && scope.accept(direct)) records.set(direct.id, direct);
+    const words = terms(query);
+    if (!words.length) return [...records.values()];
+    const match = words.map(word => `"${word.replaceAll('"', '""')}"`).join(' AND ');
+    const placeholders = scope.statuses.map(() => '?').join(',');
+    for (const [layer, db] of this.dbs) {
+      if (layer === 'L0') continue;
+      requireValue(db.prepare("SELECT value FROM index_state WHERE key='tokenizer'").get()?.value === SEARCH_VERSION,
+        'INDEX_REBUILD_REQUIRED', '分词索引版本已变化，请在设置中重建搜索索引。', 409);
+      let accepted = 0;
+      const rows = db.prepare(`SELECT m.data FROM search JOIN memories m ON m.id=search.id
+        WHERE search MATCH ? AND m.status IN (${placeholders}) ORDER BY rank,m.updated_at DESC,m.id`)
+        .iterate(match, ...scope.statuses);
+      for (const row of rows) {
+        const record = parse(row);
+        if (!scope.accept(record) || !pattern.test(memorySearchText(record))) continue;
+        records.set(record.id, record);
+        if (++accepted >= 200) break;
+      }
+    }
+    return [...records.values()];
+  }
   topics() {
     this.ensureOpen();
     if (!this.topicIndex) this.topicIndex = new TopicIndex(this);
@@ -1200,7 +1470,7 @@ export class MemorySpace {
   topicCards(ids, scope) {
     for (let attempt = 0; attempt < 3; attempt++) {
       this.reconcileForgetLedger();
-      const version = this.reconciledForgetVersion, references = new Map();
+      const version = this.reconciledForgetVersion, privateVersion = this.reconciledPrivateVersion, references = new Map();
       for (const id of ids) {
         const record = this.raw(id);
         if (!record || !scope.accept(record)) continue;
@@ -1241,7 +1511,7 @@ export class MemorySpace {
         cards.push({ ...ref, count: cached.count, evidenceIds: [...cached.evidenceIds] });
         if (cards.length >= 10) break;
       }
-      if (version === this.forgetVersion()) return cards;
+      if (version === this.forgetVersion() && privateVersion === this.privateVersion()) return cards;
       this.topicCardCache.clear();
     }
     throw new MemoryError('FORGET_CONFLICT', '主题读取期间遗忘标记持续变化，请稍后重试。', 409);
@@ -1249,9 +1519,9 @@ export class MemorySpace {
   readEvidence(options = {}, actor) {
     for (let attempt = 0; attempt < 3; attempt++) {
       this.reconcileForgetLedger();
-      const version = this.reconciledForgetVersion;
+      const version = this.reconciledForgetVersion, privateVersion = this.reconciledPrivateVersion;
       const result = this.readEvidenceOnce(options, actor);
-      if (version === this.forgetVersion()) return result;
+      if (version === this.forgetVersion() && privateVersion === this.privateVersion()) return result;
     }
     throw new MemoryError('FORGET_CONFLICT', '读取证据期间遗忘标记持续变化，请稍后重试。', 409);
   }
@@ -1263,7 +1533,8 @@ export class MemorySpace {
     requireValue(typeof includeArchived === 'boolean', 'INVALID_INPUT', '归档选项必须是布尔值。');
     const scope = this.recallScope(actor, { mode, asOf, includeArchived });
     const detail = record => ({ id: record.id, layer: record.layer, text: record.text, status: record.status,
-      sources: record.sources, occurredAt: record.occurredAt, kind: record.kind, horizon: record.horizon,
+      sources: actor?.admin === true ? record.sources : sourcePointer(record.sources),
+      occurredAt: record.occurredAt, kind: record.kind, horizon: record.horizon, evidence: recallEvidence(record),
       taskKey: record.taskKey, topics: record.topics ?? [], validFrom: record.validFrom ?? null, validUntil: record.validUntil ?? null });
     if (topic === undefined) {
       const record = this.get(id, actor);
@@ -1313,9 +1584,9 @@ export class MemorySpace {
   recall(query, actor, options = {}) {
     for (let attempt = 0; attempt < 3; attempt++) {
       this.reconcileForgetLedger();
-      const version = this.reconciledForgetVersion;
+      const version = this.reconciledForgetVersion, privateVersion = this.reconciledPrivateVersion;
       const result = this.recallOnce(query, actor, options);
-      if (version === this.forgetVersion()) return result;
+      if (version === this.forgetVersion() && privateVersion === this.privateVersion()) return result;
     }
     throw new MemoryError('FORGET_CONFLICT', '召回期间遗忘标记持续变化，请稍后重试。', 409);
   }
@@ -1328,10 +1599,14 @@ export class MemorySpace {
     requireValue(actor?.sessionId || actor?.admin, 'FORBIDDEN', '召回需要明确范围。', 403);
     requireValue(Array.isArray(contextQueries) && contextQueries.length <= 10, 'INVALID_INPUT', '情境窗最多 10 条消息。');
     contextQueries.forEach(text => string(text, '情境线索', MAX_RECALL_QUERY_LENGTH, true));
+    requireValue(!containsCredential(query) && !contextQueries.some(containsCredential),
+      'SENSITIVE_QUERY_EXCLUDED', '查询可能包含凭据，未检索或记录。', 403);
     if (evidenceId !== undefined) string(evidenceId, '召回轮次', 512);
     const queries = [...new Set([query, ...contextQueries].filter(text => terms(text).length))];
     const queryTerms = [...new Set(queries.flatMap(text => terms(text)))];
     const searchOptions = { persistentOnly: true, limitPerLayer: 200, statuses };
+    const exact = this.exactIdentifierRecords(query, actor, { mode, asOf, includeArchived });
+    const exactIds = new Set(exact.map(record => record.id));
     const indexed = [], phraseIds = new Set(), lexicalByQuery = [];
     for (const text of queries) {
       const local = this.searchRecords(text, { ...searchOptions, mode: 'all' });
@@ -1344,6 +1619,7 @@ export class MemorySpace {
       indexed.push(...local);
       lexicalByQuery.push(new Set(local.map(record => record.id)));
     }
+    indexed.push(...exact);
     const semanticById = new Map(semantic.filter(item => {
       const record = this.raw(item.id);
       return record && item.contentHash === memoryContentHash(record) &&
@@ -1385,15 +1661,17 @@ export class MemorySpace {
         { score: 0, hits: [], specificity: 0, freshness: 1, contextIndex: 0 };
       const resident = mode === 'current' && this.config.residentBudget > 0 && record.status === 'active' && residentMemory(record, this.config.residentMode);
       const semanticScore = semanticById.get(record.id)?.score;
-      return { ...ranked, score: Math.min(1, ranked.score + (phraseIds.has(record.id) ? 0.05 : 0)),
-        record, resident, semanticScore, reason: resident ? 'L3 常驻背景（不等于已核实）' :
+      const exactMatch = exactIds.has(record.id);
+      return { ...ranked, score: exactMatch ? 1 : Math.min(1, ranked.score + (phraseIds.has(record.id) ? 0.05 : 0)),
+        record, resident, semanticScore, exactMatch, reason: exactMatch ? '精确标识符匹配（不等于事实验证）' :
+          resident ? 'L3 常驻背景（不等于已核实）' :
           ranked.aliasMatch ? '工作区别名精确匹配' :
           semanticScore !== undefined ? '本地语义联想（不等于事实验证）' :
           ranked.contextIndex ? '近期用户情境匹配' : phraseIds.has(record.id) ? '连续分词匹配' : '关键词匹配' };
     });
     const bestScore = Math.max(0, ...scored.map(item => item.score));
     const threshold = Math.max(this.config.minScore, bestScore * this.config.relativeFloor);
-    const lexicalEvidence = item => item.hits.length > 0 &&
+    const lexicalEvidence = item => item.exactMatch || item.hits.length > 0 &&
       (item.hits.length > 1 || item.specificity >= 0.5) && item.score >= threshold;
     const hasEvidence = item => lexicalEvidence(item) || item.semanticScore !== undefined;
     const lexicalOrder = scored.filter(lexicalEvidence).sort((a, b) => b.score - a.score);
@@ -1463,7 +1741,7 @@ export class MemorySpace {
     let residentBytes = 0, queryCount = 0;
     const excluded = scored.filter(item => !accepted.includes(item)).slice(0, 100)
       .map(item => ({ id: item.record.id, score: Number(item.score.toFixed(4)), reason: '低于相关性门槛' }));
-    const blockFor = r => `\n[${r.layer} ${r.id} | ${r.kind} | ${r.reinforcedAt ? '人工确认过' : '未人工核实'} | ${r.occurredAt ?? '事件时间未知'}${mode !== 'current' ? ` | ${r.status} | 有效期 ${r.validFrom ?? '?'} 至 ${r.validUntil ?? '未指定'}` : ''}]\n${r.text}\n`;
+    const blockFor = r => `\n[${r.layer} ${r.id} | ${r.kind} | ${recallEvidence(r)} | ${r.occurredAt ?? '事件时间未知'}${mode !== 'current' ? ` | ${r.status} | 有效期 ${r.validFrom ?? '?'} 至 ${r.validUntil ?? '未指定'}` : ''}]\n${r.text}\n`;
     for (const item of candidates) {
       const r = item.record;
       const block = blockFor(r);
@@ -1554,9 +1832,11 @@ export class MemorySpace {
         returnedResident: picked.filter(item => item.channel === 'resident').length,
         returnedAssociation: picked.filter(item => item.channel === 'association').length, returnedGraph: graphAdded },
       accounting: 'UTF-8 字节数保守估算，不是模型 tokenizer 的精确计数' };
-    this.system.prepare('INSERT INTO traces(data) VALUES(?)')
-      .run(JSON.stringify({ at: this.now(), sessionId: actor.sessionId ?? null, ...result, text: undefined }));
-    this.system.exec('DELETE FROM traces WHERE id NOT IN (SELECT id FROM traces ORDER BY id DESC LIMIT 100)');
+    if (!actor.privateSession) {
+      this.system.prepare('INSERT INTO traces(data) VALUES(?)')
+        .run(JSON.stringify({ at: this.now(), sessionId: actor.sessionId ?? null, ...result, text: undefined }));
+      this.system.exec('DELETE FROM traces WHERE id NOT IN (SELECT id FROM traces ORDER BY id DESC LIMIT 100)');
+    }
     return result;
   }
   traces(actor) {
@@ -1568,7 +1848,7 @@ export class MemorySpace {
     this.errors = this.errors.slice(-20);
   }
   writeView(record) {
-    if (!record || record.layer === 'L0') return;
+    if (!record || record.layer === 'L0' || this.isPrivateQuarantined(record)) return;
     const path = join(this.directory, LAYERS[record.layer].directory, 'views', `${record.id}.md`);
     try {
       atomicFile(path, `<!-- Generated read-only view. Edit through Tidal Memory UI. -->\n# ${record.layer} · ${record.id}\n\n` +
@@ -1579,8 +1859,7 @@ export class MemorySpace {
     }
   }
   rebuildViews() {
-    const all = [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([, db]) =>
-      db.prepare('SELECT data FROM memories').all().map(parse));
+    const all = this.all().filter(record => record.layer !== 'L0');
     for (const [layer, info] of Object.entries(LAYERS)) {
       const dir = join(this.directory, info.directory, 'views');
       mkdirSync(dir, { recursive: true });
@@ -1598,6 +1877,7 @@ export class MemorySpace {
       expectedVersion: SEARCH_VERSION }));
   }
   rebuildSearch() {
+    this.reconcilePrivateRegistry();
     this.statisticsCache.clear();
     const layers = [];
     for (const [layer, db] of this.dbs) {
@@ -1607,6 +1887,7 @@ export class MemorySpace {
         const insert = db.prepare('INSERT INTO search(id,words) VALUES(?,?)');
         for (const row of db.prepare('SELECT data FROM memories ORDER BY id').iterate()) {
           const record = parse(row);
+          if (this.isPrivateQuarantined(record)) continue;
           insert.run(record.id, terms(memorySearchText(record), Infinity).join(' '));
           count++;
         }
@@ -1623,16 +1904,18 @@ export class MemorySpace {
     const cursor = deep ? '' :
       (this.system.prepare("SELECT value FROM metadata WHERE key='consolidation-cursor'").get()?.value ?? '');
     const db = this.db('L2');
-    const batch = deep
+    const rawBatch = deep
       ? db.prepare("SELECT data FROM memories WHERE status='active' ORDER BY id").all().map(parse)
       : db.prepare("SELECT data FROM memories WHERE status='active' AND id>? ORDER BY id LIMIT ?")
         .all(cursor, limit + 1).map(parse);
-    const truncated = !deep && batch.length > limit;
-    if (!deep) batch.length = Math.min(batch.length, limit);
+    const truncated = !deep && rawBatch.length > limit;
+    if (!deep) rawBatch.length = Math.min(rawBatch.length, limit);
+    const batch = rawBatch.filter(record => !this.isPrivateQuarantined(record));
     const result = { inspected: batch.length, promoted: 0, conflicts: 0, skipped: 0, deep, truncated,
       eligibility: { accepted: 0, historicalOrInferred: 0, episodicCategory: 0, horizon: 0, validity: 0 },
       insufficientIndependentEvidence: 0, alreadyConsolidated: 0 };
-    const eligible = record => consolidationEligibility(record, this.clock(), { includeReview: true }) === 'accepted';
+    const eligible = record => !this.isPrivateQuarantined(record) &&
+      consolidationEligibility(record, this.clock(), { includeReview: true }) === 'accepted';
     const records = new Map(batch.filter(eligible).map(record => [record.id, record]));
     for (const record of batch) {
       const reason = consolidationEligibility(record, this.clock());
@@ -1658,7 +1941,8 @@ export class MemorySpace {
       groups.get(key).push(record);
     }
     const longTerm = this.db('L3').prepare("SELECT data FROM memories WHERE status IN ('active','review')")
-      .all().map(parse).filter(record => (!record.validFrom || Date.parse(record.validFrom) <= this.clock()) &&
+      .all().map(parse).filter(record => !this.isPrivateQuarantined(record) &&
+        (!record.validFrom || Date.parse(record.validFrom) <= this.clock()) &&
         (!record.validUntil || Date.parse(record.validUntil) > this.clock()));
     const targets = new Map();
     for (const record of longTerm) {
@@ -1754,12 +2038,12 @@ export class MemorySpace {
       }
     }
     if (!deep) this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
-      .run('consolidation-cursor', truncated ? batch.at(-1).id : '');
+      .run('consolidation-cursor', truncated ? rawBatch.at(-1).id : '');
     this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)')
       .run('consolidation', JSON.stringify({ at: this.now(), ...result }));
     return result;
   }
-  deepConsolidation(day, { missed = false, manual = false, backup, from, until } = {}) {
+  deepConsolidation(day, { missed = false, manual = false, backup, from, until, modelOrganization } = {}) {
     requireValue(/^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(`${day}T00:00:00Z`)) &&
       new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day,
       'INVALID_DATE', '每日整理日期无效。');
@@ -1778,7 +2062,8 @@ export class MemorySpace {
     const start = timestamp(from ?? last ?? new Date(Date.parse(end) - 24 * 3600000).toISOString(), '二次编码起点');
     const reencoding = this.reencodeRecent({ from: start, until: end });
     const result = this.consolidate(200, { deep: true });
-    const entry = { day, at: this.now(), missed, manual, backup, localOrganization, reencoding, ...result };
+    const entry = { day, at: this.now(), missed, manual, backup, localOrganization, reencoding,
+      modelOrganization, ...result };
     transaction(this.system, () => {
       const save = this.system.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)');
       if (!manual) {
@@ -1832,7 +2117,7 @@ export class MemorySpace {
     }
     for (const db of this.dbs.values()) {
       const records = db.prepare("SELECT data FROM memories WHERE status='active' AND valid_until<=? LIMIT 500").all(this.now()).map(parse);
-      for (const record of records) this.update(record.id, { status: 'archived', expiredAt: this.now(),
+      for (const record of records.filter(record => !this.isPrivateQuarantined(record))) this.update(record.id, { status: 'archived', expiredAt: this.now(),
         archiveReason: 'expired', archivedAt: this.now() }, record.revision, { admin: true });
     }
     let forgottenEpisodes = 0;
@@ -1841,7 +2126,7 @@ export class MemorySpace {
       const records = this.db('L2').prepare(
         "SELECT data FROM memories WHERE status='active' AND pinned=0 AND created_at<=? ORDER BY created_at LIMIT 500",
       ).all(new Date(cutoff).toISOString()).map(parse);
-      for (const record of records) {
+      for (const record of records.filter(record => !this.isPrivateQuarantined(record))) {
         if (record.stability > 1 || record.importance > 0.5 || record.recallCount ||
             Date.parse(record.reinforcedAt ?? record.createdAt) > cutoff) continue;
         this.update(record.id, { status: 'archived', archiveReason: 'inactivity', archivedAt: this.now() }, record.revision, { admin: true });
@@ -1862,6 +2147,13 @@ export class MemorySpace {
       author, content, sourceIds, now: new Date(this.clock()).toISOString()
     });
     return { ...entry, saved: true };
+  }
+  appendAutomaticPrivateEntry({ content, sourceIds = [], sourceSession, dayKey }) {
+    this.reconcileForgetLedger();
+    return { ...appendPrivateEntry(this.privateDb, this.privateDirectory, {
+      author: 'tidal-auto', content, sourceIds, sourceSession, dayKey,
+      now: new Date(this.clock()).toISOString(),
+    }), saved: true };
   }
   appendPrivateFromSession(sessionId, content, operationId) {
     this.reconcileForgetLedger();
@@ -1913,15 +2205,19 @@ export class MemorySpace {
   status() {
     this.ensureOpen();
     this.reconcileForgetLedger();
+    const visible = this.quarantinedIds.size ? this.all() : null;
     const layers = Object.entries(LAYERS).map(([id, info]) => ({
       id, name: info.name,
-      count: this.db(id).prepare('SELECT count(*) AS n FROM memories').get().n,
-      pending: this.db(id).prepare("SELECT count(*) AS n FROM memories WHERE status IN ('pending','candidate','review')").get().n,
+      count: visible ? visible.filter(record => record.layer === id).length :
+        this.db(id).prepare('SELECT count(*) AS n FROM memories').get().n,
+      pending: visible ? visible.filter(record => record.layer === id &&
+        ['pending', 'candidate', 'review'].includes(record.status)).length :
+        this.db(id).prepare("SELECT count(*) AS n FROM memories WHERE status IN ('pending','candidate','review')").get().n,
       directory: join(this.directory, info.directory),
       file: join(this.directory, info.directory, info.file),
     }));
     return { space: this.name, directory: this.directory, layers, errors: this.errors, searchIndex: this.searchIndexStatus(),
-      private: this.privateStatus(), encoding: this.encodingStatus(),
+      private: this.privateStatus(), encoding: this.encodingStatus(), capture: this.eventCapture.status(),
       maintenance: JSON.parse(this.system.prepare("SELECT value FROM metadata WHERE key='maintenance'").get()?.value ?? 'null'),
       dailyConsolidation: this.dailyConsolidationStatus(),
       deepConsolidation: JSON.parse(this.system.prepare("SELECT value FROM metadata WHERE key='deep-consolidation'").get()?.value ?? 'null'),
@@ -1930,7 +2226,7 @@ export class MemorySpace {
   snapshot({ includePrivate = false } = {}) {
     for (let attempt = 0; attempt < 3; attempt++) {
       this.recover();
-      const version = this.reconciledForgetVersion;
+      const version = this.reconciledForgetVersion, privateVersion = this.reconciledPrivateVersion;
       // Backups retain provenance IDs, not copied session excerpts.
       const provenance = source => {
         if (!source || typeof source !== 'object') return source;
@@ -1939,17 +2235,22 @@ export class MemorySpace {
           .map(([key, value]) => [key, provenance(value)]));
       };
       const retained = record => ({ ...record, source: provenance(record.source), sources: provenance(record.sources) });
-      const records = [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([, db]) =>
-        db.prepare('SELECT data FROM memories ORDER BY created_at,id').all().map(row => retained(parse(row))));
+      const records = this.all().filter(record => record.layer !== 'L0').map(retained);
       const included = new Set(records.map(record => record.id));
+      const allowedScene = id => !this.quarantinedSceneIds.has(id);
+      const forgetState = this.forgetLedger.state(this.lineageId);
+      const eventAnchors = forgetState.eventAnchors.filter(anchor => !this.blockedSessionIds.has(anchor.sessionId));
       const snapshot = {
-        schema: 'tidal-memory', version: 3, space: this.name, lineageId: this.lineageId, createdAt: this.now(),
-        excluded: ['L0', 'source-excerpts'],
+        schema: 'tidal-memory', version: 4, space: this.name, lineageId: this.lineageId, createdAt: this.now(),
+        excluded: ['L0', 'source-excerpts', 'private-session-provenance'],
         records,
         revisions: [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([layer, db]) =>
-          db.prepare('SELECT data FROM revisions ORDER BY id,revision').all().map(row => ({ layer, record: retained(parse(row)) }))),
+          db.prepare('SELECT data FROM revisions ORDER BY id,revision').all()
+            .map(parse).filter(record => included.has(record.id)).map(record => ({ layer, record: retained(record) }))),
         tombstones: this.system.prepare('SELECT * FROM tombstones').all(),
         forgottenKeys: this.system.prepare('SELECT dedupe_key FROM forgotten_keys').all().map(row => row.dedupe_key),
+        eventAnchors, unknownEventCoverage: forgetState.unknownEventCoverage ||
+          eventAnchors.length !== forgetState.eventAnchors.length,
         graphRelations: this.system.prepare(`SELECT left_id AS leftId,right_id AS rightId,state,
           left_hash AS leftHash,right_hash AS rightHash,updated_at AS updatedAt
           FROM graph_relations ORDER BY left_id,right_id`).all()
@@ -1959,12 +2260,17 @@ export class MemorySpace {
         retrievalEvents: [...this.dbs].filter(([layer]) => layer !== 'L0').flatMap(([layer, db]) =>
           db.prepare('SELECT id,evidence FROM retrieval_events ORDER BY id,evidence').all()
             .filter(row => included.has(row.id)).map(row => ({ layer, id: row.id, evidence: row.evidence }))),
-        sessionFocus: this.system.prepare('SELECT session_id,task_ref,scene_ref,updated_at FROM session_focus ORDER BY session_id').all(),
+        sessionFocus: this.system.prepare('SELECT session_id,task_ref,scene_ref,updated_at FROM session_focus ORDER BY session_id').all()
+          .filter(row => !this.blockedSessionIds.has(row.session_id) &&
+            (!row.task_ref || included.has(row.task_ref)) && (!row.scene_ref || allowedScene(row.scene_ref))),
         eventOperations: this.system.prepare('SELECT operation_id,payload_hash,record_id,created_at FROM event_operations ORDER BY operation_id').all()
           .filter(row => included.has(row.record_id)),
-        scenes: this.system.prepare('SELECT id,title,created_at FROM scenes ORDER BY id').all(),
-        sceneMembers: this.system.prepare('SELECT scene_id,session_id,joined_at FROM scene_members ORDER BY scene_id,session_id').all(),
-        sceneOperations: this.system.prepare('SELECT operation_id,payload_hash,scene_id,created_at FROM scene_operations ORDER BY operation_id').all(),
+        scenes: this.system.prepare('SELECT id,title,created_at FROM scenes ORDER BY id').all()
+          .filter(row => allowedScene(row.id)),
+        sceneMembers: this.system.prepare('SELECT scene_id,session_id,joined_at FROM scene_members ORDER BY scene_id,session_id').all()
+          .filter(row => allowedScene(row.scene_id) && !this.blockedSessionIds.has(row.session_id)),
+        sceneOperations: this.system.prepare('SELECT operation_id,payload_hash,scene_id,created_at FROM scene_operations ORDER BY operation_id').all()
+          .filter(row => allowedScene(row.scene_id)),
         ...(includePrivate ? {
           privateEntries: this.privateDb.prepare('SELECT * FROM entries ORDER BY created_at,id').all(),
           privateAliases: this.privateDb.prepare('SELECT * FROM entry_aliases ORDER BY alias_id').all(),
@@ -1980,16 +2286,16 @@ export class MemorySpace {
           privateOrganized: this.privateDb.prepare('SELECT * FROM journal_organized ORDER BY day_key').all(),
         } : {}),
       };
-      if (version === this.forgetVersion()) return snapshot;
+      if (version === this.forgetVersion() && privateVersion === this.privateVersion()) return snapshot;
     }
-    throw new MemoryError('FORGET_CONFLICT', '生成快照期间遗忘标记持续变化，请稍后重试；未生成备份。', 409);
+    throw new MemoryError('SNAPSHOT_CONFLICT', '生成快照期间遗忘或私人隔离状态持续变化；未生成备份。', 409);
   }
   close() {
     if (this.closed) return;
     this.closed = true;
     const errors = [];
     if (openSpaces.get(resolve(this.directory)) === this) openSpaces.delete(resolve(this.directory));
-    for (const resource of [this.semanticIndex, this.topicIndex, this.graphIndex, ...this.dbs.values(), this.privateDb, this.system, this.forgetLedger, this.lock].filter(Boolean)) {
+    for (const resource of [this.semanticIndex, this.topicIndex, this.graphIndex, ...this.dbs.values(), this.privateDb, this.system, this.privateRegistry, this.forgetLedger, this.lock].filter(Boolean)) {
       try { resource.close(); } catch (error) { errors.push(error); }
     }
     if (errors.length) throw new AggregateError(errors, '部分记忆空间资源未能关闭。');

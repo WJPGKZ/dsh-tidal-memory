@@ -19,7 +19,9 @@ export const DEFAULTS = Object.freeze({
   autoCandidates: true, captureAssistant: false, minScore: 0.28, relativeFloor: 0.6,
   injectContext: true, autoBackup: true, autoBackupMode: 'plain', backupKeep: 14, privateWriters: [],
   privateMainSessions: [], privateContributionsEnabled: false, privateContextBudget: 8000,
-  deepOrganizationMode: 'local', privateOrganizationMode: 'local',
+  deepOrganizationMode: 'local', deepOrganizationSessions: [], deepOrganizationApiEndpoint: '',
+  deepOrganizationApiModel: '', privateOrganizationMode: 'local', privateAutoJournalEnabled: false,
+  historyReadEnabled: false, historyMainSessions: [],
   graphRecall: false,
   embeddingMode: edition.embeddingMode, embeddingModelPath: '', embeddingDevice: 'auto',
   embeddingTimeoutSeconds: 300,
@@ -39,6 +41,12 @@ export function requireValue(condition, code, message, status = 400) {
   if (!condition) throw new MemoryError(code, message, status);
 }
 export const hash = value => createHash('sha256').update(value).digest('hex');
+export function containsCredential(text) {
+  if (typeof text !== 'string') return false;
+  return /-----BEGIN [A-Z ]*PRIVATE KEY-----/i.test(text) ||
+    /\b(?:gh[pousr]_[a-z0-9_]{20,}|github_pat_[a-z0-9_]{20,}|sk-[a-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|Bearer\s+[a-z0-9._~+\/=-]{16,})\b/i.test(text) ||
+    /(?:api[_ -]?key|access[_ -]?token|password|passwd|secret|credential|密码|口令|令牌|密钥)\s*(?:[:：=]|是|为)\s*['"]?\S{4,}/i.test(text);
+}
 export function localDateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
@@ -72,11 +80,12 @@ export function configOf(raw = {}) {
   delete result.captureBatch;
   delete result.maxModelCallsPerDay;
   delete result.maxModelOutputTokens;
-  for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant', 'autoConsolidate', 'autoArchive', 'graphRecall']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
+  for (const key of ['enabled', 'injectContext', 'autoBackup', 'autoCandidates', 'captureAssistant', 'autoConsolidate', 'autoArchive', 'graphRecall', 'privateAutoJournalEnabled', 'historyReadEnabled']) requireValue(typeof result[key] === 'boolean', 'INVALID_CONFIG', `${key} 必须是布尔值。`);
   choice(result.residentMode, ['all', 'core', 'pinned'], 'L3 常驻模式');
   choice(result.embeddingMode, ['off', 'cpu', 'enhanced'], '本地语义组合');
   choice(result.embeddingDevice, ['auto', 'cpu'], '本地推理设备');
-  choice(result.deepOrganizationMode, ['local', 'selected'], '普通深度整理方式');
+  if (result.deepOrganizationMode === 'selected') result.deepOrganizationMode = 'local';
+  choice(result.deepOrganizationMode, ['local', 'session', 'api'], '普通深度整理方式');
   choice(result.privateOrganizationMode, ['local', 'author'], '私人日记整理方式');
   choice(result.autoBackupMode, ['plain', 'encrypted', 'encrypted-private'], '自动备份方式');
   for (const key of ['embeddingMinScore', 'embeddingRelativeFloor']) {
@@ -89,6 +98,19 @@ export function configOf(raw = {}) {
   requireValue(typeof result.dailyConsolidateAt === 'string' &&
     (result.dailyConsolidateAt === '' || /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(result.dailyConsolidateAt)),
   'INVALID_CONFIG', '每日深度整理时间必须是 HH:mm 格式或留空关闭。');
+  requireValue(typeof result.deepOrganizationApiEndpoint === 'string' &&
+    result.deepOrganizationApiEndpoint.length <= 2048 &&
+    (result.deepOrganizationApiEndpoint === '' || (() => {
+      try {
+        const url = new URL(result.deepOrganizationApiEndpoint);
+        const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname.toLowerCase());
+        return ['https:', ...(loopback ? ['http:'] : [])].includes(url.protocol) &&
+          !url.username && !url.password && !url.search && !url.hash;
+      } catch { return false; }
+    })()),
+  'INVALID_CONFIG', '整理 API 必须是 HTTPS URL；仅允许本机回环地址使用 HTTP，且不能包含凭据、查询或片段。');
+  requireValue(typeof result.deepOrganizationApiModel === 'string' && result.deepOrganizationApiModel.length <= 256,
+    'INVALID_CONFIG', '整理 API 模型名无效。');
   for (const key of ['minScore', 'relativeFloor']) number(result[key], 0, 1, key);
   for (const [key, min, max] of [
     ['tokenBudget', 256, MAX_CONTEXT_BUDGET], ['maxRecall', 1, 100],
@@ -127,6 +149,38 @@ export function configOf(raw = {}) {
     privateSpaces.add(space);
     return { space, sessionId, provider, model };
   });
+  requireValue(Array.isArray(result.historyMainSessions) && result.historyMainSessions.length <= 100,
+    'INVALID_CONFIG', '历史查证主会话列表无效。');
+  const historySpaces = new Set();
+  result.historyMainSessions = result.historyMainSessions.map(item => {
+    requireValue(item && typeof item === 'object' && !Array.isArray(item), 'INVALID_CONFIG', '历史查证主会话条目无效。');
+    const space = slug(item.space);
+    const sessionId = string(item.sessionId, '历史查证主会话 ID', 256);
+    const provider = string(item.provider, '历史查证主会话 provider', 128);
+    const model = string(item.model, '历史查证主会话 model', 256);
+    requireValue(spaces.has(space), 'INVALID_CONFIG', '历史查证主会话必须属于一个已绑定的工作区。');
+    requireValue(!historySpaces.has(space), 'INVALID_CONFIG', '每个工作区只能配置一个历史查证主会话。');
+    historySpaces.add(space);
+    return { space, sessionId, provider, model };
+  });
+  requireValue(Array.isArray(result.deepOrganizationSessions) && result.deepOrganizationSessions.length <= 100,
+    'INVALID_CONFIG', '深度整理模型会话列表无效。');
+  const organizationSpaces = new Set();
+  result.deepOrganizationSessions = result.deepOrganizationSessions.map(item => {
+    requireValue(item && typeof item === 'object' && !Array.isArray(item),
+      'INVALID_CONFIG', '深度整理模型会话条目无效。');
+    const space = slug(item.space);
+    const sessionId = string(item.sessionId, '深度整理会话 ID', 256);
+    const provider = string(item.provider, '深度整理 provider', 128);
+    const model = string(item.model, '深度整理 model', 256);
+    requireValue(spaces.has(space), 'INVALID_CONFIG', '深度整理模型会话必须属于一个已绑定的工作区。');
+    requireValue(!organizationSpaces.has(space), 'INVALID_CONFIG', '每个工作区只能配置一个深度整理模型会话。');
+    organizationSpaces.add(space);
+    return { space, sessionId, provider, model };
+  });
+  if (result.deepOrganizationMode === 'api')
+    requireValue(result.deepOrganizationApiEndpoint && result.deepOrganizationApiModel,
+      'INVALID_CONFIG', 'API 模式必须填写完整的整理端点和模型名。');
   return result;
 }
 export function canonicalCwd(cwd) {
@@ -216,7 +270,10 @@ export function normalizeRecord(input, now, existing) {
   sources.forEach(validateSource);
   requireValue(JSON.stringify(sources).length <= MAX_PROVENANCE_BYTES, 'PROVENANCE_LIMIT', '来源集合过大，需要人工整理。', 409);
   const canonicalText = text.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
-  const eventKey = layer === 'L0' ? JSON.stringify(source) : layer === 'L2' ? (occurredAt?.slice(0, 10) ?? 'unknown') : '';
+  const sourceBound = kind === 'historical' && source.kind === 'session' && (layer === 'L1' || layer === 'L2') ||
+    layer === 'L2' && source.kind === 'host-tool-receipt';
+  const eventKey = layer === 'L0' ? JSON.stringify(source) : sourceBound ?
+    JSON.stringify([source.sessionId, source.eventId]) : layer === 'L2' ? occurredAt?.slice(0, 10) ?? 'unknown' : '';
   return {
     id: existing?.id ?? randomUUID(), layer, text, category, kind, status, scope, sessionId,
     source, sources, tags: [...new Set(tags)], aliases: [...new Set(aliases)],
@@ -243,6 +300,26 @@ const LONG_TERM_CUE = /(?:以后|今后|长期|一直|始终|总是|默认|偏�
 const TASK_ACTION = /(?:修复|实现|检查|整理|分析|编写|创建|查找|解释|比较|验证|完成|发布|部署|迁移|重构|优化|更新|安装|删除|设计|测试|处理|归纳|总结|记录|回答|搜索|研究|看一下|看看|写进|写到|拆成|拆分|加入|添加|放到|放进|改成|改为|运行|跑一下|打开|保存)/;
 const TASK_REQUEST = /(?:请(?:你|帮我|协助我)?|麻烦(?:你|帮我)?|帮我|替我|能否|能不能|可以(?:帮我|请)?|接下来|下一步|现在|这次|本轮|我们先|先)/;
 const SCHEDULED_TASK = /^(?:我|我们)?(?:明天|后天|本周|下周).{0,30}(?:开会|会议|交付|提交|发布|复查|验收)/;
+const PLAN_CUE = /^(?:(?:我|我们|本项目|当前项目)(?:目前|现在|明天)?\s*)?(?:准备|计划|打算)\s*\S/;
+const CORRECTION_PREFIX = /^(?:不对[，,：:]|更正[：:]|纠正[：:]|我说错了[，,：:]|correction:)\s*/i;
+const EXPORT_SUBJECT = /^(报告导出目录|(?:本项目|这个项目|当前项目|项目)的?导出目录)\s*/;
+const EXPORT_VALUE = String.raw`([A-Za-z]:[\\/][\p{L}\p{N}_\\/.-]{0,190}?)`;
+const EXPORT_REPLACEMENT = new RegExp(`^(?:由|从)\\s*${EXPORT_VALUE}\\s*(?:改为|改成|换为|换成)\\s*${EXPORT_VALUE}[。.]?$`, 'u');
+const EXPORT_CURRENT = new RegExp(`^(?:目前|现在|当前)?\\s*(是|为|不是|不在|在|位于)\\s*${EXPORT_VALUE}[。.]?$`, 'u');
+
+function exportDirectoryClaim(text) {
+  const target = EXPORT_SUBJECT.exec(text);
+  if (!target) return null;
+  const statement = text.slice(target[0].length);
+  const replacement = EXPORT_REPLACEMENT.exec(statement);
+  const current = replacement ? null : EXPORT_CURRENT.exec(statement);
+  if (!replacement && !current) return null;
+  const valueOf = raw => raw.trim().replaceAll('/', '\\');
+  return { subject: target[1] === '报告导出目录' ? 'workspace.report' : 'workspace.project',
+    predicate: 'export-directory', value: valueOf((replacement ?? current)[2]),
+    polarity: current?.[1].startsWith('不') ? 'negative' : 'positive', scope: 'space',
+    tag: '导出目录', replaces: replacement ? valueOf(replacement[1]) : null };
+}
 
 export function classifyRememberDirective(text) {
   if (typeof text !== 'string') return null;
@@ -283,8 +360,10 @@ export function localCandidates(text) {
     const decision = /(?:我(?:们)?(?:最终)?(?:决定|选择)|最后(?:决定|选择)|决定采用|选定|we decided)\s*.{0,80}/i.test(quote);
     const fact = /(?:(?:本项目|当前项目|项目|服务|开发服务器|测试环境|构建工具|包管理器|数据库|运行时|仓库).{0,80}?(?:使用|采用|运行在|位于|端口|路径|版本|是|用\s*\S)|^我(?:现在|目前)?(?:写代码用|用的是)\s*\S|^编辑器是\s*\S|(?:the )?project uses\b)/i.test(quote);
     const event = EVENT_CUE.test(quote) && /(?:我|我们|自己|完成|去了|看了|买了|做了|试了|发现|遇到|经历|解决|发生)/.test(quote);
-    if (/^(?:不对[，,：:]|更正[：:]|纠正[：:]|我说错了[，,：:]|correction:)/i.test(quote)) {
+    if (CORRECTION_PREFIX.test(quote)) {
       rule = 'correction'; category = 'knowledge';
+    } else if (PLAN_CUE.test(quote) && (TASK_ACTION.test(quote) || /改到|切换|调整|导出/.test(quote))) {
+      rule = 'plan'; layer = 'L1'; category = 'task'; horizon = 'task';
     } else if (event && /(?:完成了|解决了|取消了)/.test(quote)) {
       rule = 'event'; category = 'event'; horizon = 'event';
     } else if (continuationTask || TASK_CUE.test(quote)) {
@@ -301,7 +380,7 @@ export function localCandidates(text) {
       rule = 'decision'; category = 'event'; horizon = 'event';
     } else if (event) {
       rule = 'event'; category = 'event'; horizon = 'event';
-    } else if (fact) {
+    } else if (fact || exportDirectoryClaim(quote)) {
       rule = 'fact'; category = 'knowledge';
       horizon = LONG_TERM_CUE.test(quote) ? 'long_term' : 'unspecified';
     } else continue;
@@ -312,7 +391,7 @@ export function localCandidates(text) {
   return result;
 }
 
-export const ENCODING_VERSION = 'local-context-v4';
+export const ENCODING_VERSION = 'local-context-v5';
 const TECH_VALUES = [
   ['package-manager', /\b(?:pnpm|npm|yarn|bun)\b/gi, '包管理器'],
   ['storage', /\b(?:SQLite|PostgreSQL|MySQL|MongoDB|Redis)\b/gi, '数据库'],
@@ -320,6 +399,10 @@ const TECH_VALUES = [
 ];
 export function technicalClaim(text) {
   if (/[?？]|(?:如果|假设|例如|比如|听说|他说|她说)/.test(text)) return null;
+  text = text.replace(CORRECTION_PREFIX, '');
+  if (PLAN_CUE.test(text)) return null;
+  const directory = exportDirectoryClaim(text);
+  if (directory) return directory;
   const explicitSubject = /^(?:本项目|这个项目|当前项目|项目|本仓库|这个仓库)(?:目前|现在|默认|暂时)?(?:不使用|不采用|不再用|不要再用|不用|使用|采用|用|改成|改为|换成|换为)/.test(text) ? 'workspace.project' :
     /^我(?:现在|目前)?用的是/.test(text) ? 'user' :
       /^(?:以后|今后|默认)/.test(text) ? 'workspace.default' : null;

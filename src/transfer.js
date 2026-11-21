@@ -1,9 +1,10 @@
 import { createCipheriv, createDecipheriv, createHmac, randomBytes, scryptSync, timingSafeEqual, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
-import { atomicFile } from './database.js';
+import { atomicFile, transaction } from './database.js';
 import { MemorySpace, openSpaceFor } from './store.js';
-import { expandForgotten, ForgetLedger } from './forget-ledger.js';
+import { expandForgotten, ForgetLedger, sourceEventAnchors } from './forget-ledger.js';
+import { PrivateSessionRegistry } from './private-session-registry.js';
 import { importPrivateEntry, migratePrivateJournalLayout, MAX_PRIVATE_CONTENT_LENGTH } from './private-journal.js';
 import { dailyJournalPath, journalFileHash, undatedJournalPath, writeJournalFile } from './journal-files.js';
 import { readAutomaticKey } from './backup-key.js';
@@ -24,7 +25,7 @@ export function packBackup(space, password = '', { includePrivate = Boolean(pass
 function packSnapshot(snapshot, password = '') {
   if (password) string(password, '备份口令', 256);
   requireValue(!password || password.length >= 12, 'WEAK_PASSWORD', '加密备份口令至少 12 个字符。');
-  requireValue([1, 2, 3].includes(snapshot.version), 'BACKUP_VERSION', '不支持此备份版本。');
+  requireValue([1, 2, 3, 4].includes(snapshot.version), 'BACKUP_VERSION', '不支持此备份版本。');
   const version = snapshot.version;
   const payload = JSON.stringify(snapshot);
   if (!password) return checkBackupSize(JSON.stringify({ format: 'tidal-backup', version, sha256: hash(payload), payload }));
@@ -41,7 +42,7 @@ function packSnapshot(snapshot, password = '') {
 export function unpackBackup(text, password = '') {
   checkBackupSize(text);
   const envelope = JSON.parse(text);
-  requireValue([1, 2, 3].includes(envelope.version), 'BACKUP_VERSION', '不支持此备份版本。');
+  requireValue([1, 2, 3, 4].includes(envelope.version), 'BACKUP_VERSION', '不支持此备份版本。');
   let payload;
   if (envelope.format === 'tidal-encrypted-backup') {
     requireValue(typeof password === 'string' && password.length >= 12 && password.length <= 256, 'PASSWORD_REQUIRED', '请提供正确的备份口令。');
@@ -73,7 +74,8 @@ export function unpackBackup(text, password = '') {
     (document.retrievalEvents === undefined || Array.isArray(document.retrievalEvents)) &&
     (document.scenes === undefined || Array.isArray(document.scenes)) &&
     (document.sceneMembers === undefined || Array.isArray(document.sceneMembers)) &&
-    (document.sceneOperations === undefined || Array.isArray(document.sceneOperations)),
+    (document.sceneOperations === undefined || Array.isArray(document.sceneOperations)) &&
+    (document.version < 4 || Array.isArray(document.eventAnchors) && typeof document.unknownEventCoverage === 'boolean'),
   'INVALID_BACKUP', '记忆快照结构无效。');
   requireValue(envelope.format === 'tidal-encrypted-backup' ||
     (!document.privateEntries && !document.privateAliases && !document.privatePending && !document.privateForgottenIds &&
@@ -130,7 +132,22 @@ export function restoreBackup(root, name, text, password, config) {
       requireValue(typeof key === 'string' && /^[a-f0-9]{64}$/.test(key), 'INVALID_BACKUP', '遗忘标记无效。');
       blockedKeys.add(key);
     }
-    return restoreDocument(root, name, document, config, { lineageId, coverage, blockedIds, blockedKeys, blockedPrivateIds, ledger });
+    const incomingEvents = document.version >= 4 ? document.eventAnchors : [];
+    const seenEvents = new Set();
+    for (const anchor of incomingEvents) {
+      requireValue(anchor && typeof anchor.sessionId === 'string' && /^[a-zA-Z0-9_.:@-]{1,256}$/.test(anchor.sessionId) &&
+        Number.isSafeInteger(anchor.eventSeq) && anchor.eventSeq >= 0,
+      'INVALID_BACKUP', '遗忘来源事件标记无效。');
+      const key = JSON.stringify([anchor.sessionId, anchor.eventSeq]);
+      requireValue(!seenEvents.has(key), 'INVALID_BACKUP', '备份包含重复的遗忘来源事件标记。');
+      seenEvents.add(key);
+    }
+    const unknownEvents = document.version >= 4 ? document.unknownEventCoverage :
+      Boolean(document.tombstones.length || document.forgottenKeys?.length);
+    const blockedEvents = new Set([...state.eventAnchors, ...incomingEvents]
+      .map(anchor => JSON.stringify([anchor.sessionId, anchor.eventSeq])));
+    return restoreDocument(root, name, document, config, { lineageId, coverage, blockedIds, blockedKeys,
+      blockedPrivateIds, blockedEvents, incomingEvents, unknownEvents, ledger });
   } finally { ledger.close(); }
 }
 
@@ -332,7 +349,8 @@ function restorePrivateJournal(store, document, blockedPrivateIds) {
   return { restored: rows.length, skipped: entries.length - rows.length };
 }
 
-function restoreDocument(root, name, document, config, { lineageId, coverage, blockedIds, blockedKeys, blockedPrivateIds, ledger }) {
+function restoreDocument(root, name, document, config, { lineageId, coverage, blockedIds, blockedKeys,
+  blockedPrivateIds, blockedEvents, incomingEvents, unknownEvents, ledger }) {
   const target = join(root, 'spaces', name);
   const validate = record => {
     requireValue(typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id), 'INVALID_BACKUP', '记忆 ID 无效。');
@@ -359,7 +377,9 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
   });
   const seeds = [...blockedIds,
     ...normalized.filter(record => blockedKeys.has(record.dedupeKey)).map(record => record.id),
-    ...revisions.filter(({ record }) => blockedKeys.has(record.dedupeKey)).map(({ record }) => record.id)];
+    ...revisions.filter(({ record }) => blockedKeys.has(record.dedupeKey)).map(({ record }) => record.id),
+    ...[...normalized, ...revisions.map(item => item.record)].filter(record => sourceEventAnchors(record)
+      .some(anchor => blockedEvents.has(JSON.stringify([anchor.sessionId, anchor.eventSeq])))).map(record => record.id)];
   const blocked = expandForgotten([...normalized, ...revisions.map(item => item.record)], seeds);
   const skipped = new Set(normalized.filter(record => blocked.has(record.id)).map(record => record.id));
   const staging = `restore-${randomUUID()}`;
@@ -367,12 +387,17 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
   let completed = false, published = false;
   try {
     store = new MemorySpace(root, staging, { config, lineageId, registerName: false, deferLedgerWrites: true });
-    for (const record of normalized) if (!skipped.has(record.id)) store.persist(record);
+    const privateVersion = store.reconciledPrivateVersion;
+    const blockedScenes = new Set((document.sceneMembers ?? [])
+      .filter(row => store.blockedSessionIds.has(row?.session_id)).map(row => row.scene_id));
+    const quarantined = store.classifyPrivateRecords([...normalized, ...revisions.map(item => item.record)], blockedScenes);
+    const omitted = id => skipped.has(id) || quarantined.has(id);
+    for (const record of normalized) if (!omitted(record.id)) store.persist(record);
     for (const revision of revisions) {
       const validated = revision.record;
-      if (!skipped.has(validated.id)) store.db(revision.layer).prepare('INSERT OR REPLACE INTO revisions VALUES(?,?,?)')
+      if (!omitted(validated.id)) store.db(revision.layer).prepare('INSERT OR REPLACE INTO revisions VALUES(?,?,?)')
         .run(validated.id, validated.revision, JSON.stringify(validated));
-      else store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(validated.dedupeKey);
+      else if (skipped.has(validated.id)) store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(validated.dedupeKey);
     }
     for (const row of document.tombstones) {
       store.system.prepare('INSERT OR IGNORE INTO tombstones VALUES(?,?)').run(row.id, row.dedupe_key);
@@ -381,6 +406,10 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
     for (const key of document.forgottenKeys ?? []) {
       store.system.prepare('INSERT OR IGNORE INTO forgotten_keys VALUES(?)').run(key);
     }
+    for (const anchor of incomingEvents)
+      store.system.prepare('INSERT OR IGNORE INTO forgotten_events VALUES(?,?)').run(anchor.sessionId, anchor.eventSeq);
+    if (unknownEvents)
+      store.system.prepare("INSERT OR REPLACE INTO metadata VALUES('forget-source-unknown','1')").run();
     for (const id of skipped) {
       const record = records.get(id);
       store.system.prepare('INSERT OR IGNORE INTO tombstones VALUES(?,?)').run(record.id, record.dedupeKey);
@@ -389,13 +418,13 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
     for (const row of document.reinforcements ?? []) {
       requireValue(row && typeof row === 'object' && records.has(row.id), 'INVALID_BACKUP', '强化依据引用无效。');
       string(row.evidence, '强化依据', 256);
-      if (!skipped.has(row.id)) store.system.prepare('INSERT INTO reinforcements VALUES(?,?)').run(row.id, row.evidence);
+      if (!omitted(row.id)) store.system.prepare('INSERT INTO reinforcements VALUES(?,?)').run(row.id, row.evidence);
     }
     for (const row of document.retrievalEvents ?? []) {
       requireValue(row && typeof row === 'object' && records.get(row.id)?.layer === row.layer &&
         row.layer !== 'L0' && typeof row.evidence === 'string' && /^recall:[a-f0-9]{64}$/.test(row.evidence),
       'INVALID_BACKUP', '召回依据引用无效。');
-      if (!skipped.has(row.id)) store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
+      if (!omitted(row.id)) store.db(row.layer).prepare('INSERT INTO retrieval_events VALUES(?,?)').run(row.id, row.evidence);
     }
     requireValue((document.eventOperations === undefined || Array.isArray(document.eventOperations)) &&
       (document.sessionFocus === undefined || Array.isArray(document.sessionFocus)),
@@ -408,7 +437,7 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
         timestamp(row.created_at, '事件操作时间') && !operationIds.has(row.operation_id),
       'INVALID_BACKUP', '经历操作元数据无效。');
       operationIds.add(row.operation_id);
-      if (!skipped.has(row.record_id)) store.system.prepare('INSERT INTO event_operations VALUES(?,?,?,?)')
+      if (!omitted(row.record_id)) store.system.prepare('INSERT INTO event_operations VALUES(?,?,?,?)')
         .run(row.operation_id, row.payload_hash, row.record_id, row.created_at);
     }
     const focusSessions = new Set();
@@ -421,7 +450,8 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
         timestamp(row.updated_at, '会话焦点更新时间'),
       'INVALID_BACKUP', '会话焦点元数据无效。');
       focusSessions.add(row.session_id);
-      if ((!row.task_ref || !skipped.has(row.task_ref)) && (row.scene_ref || row.task_ref))
+      if (!store.blockedSessionIds.has(row.session_id) && (!row.task_ref || !omitted(row.task_ref)) &&
+          (!row.scene_ref || !blockedScenes.has(row.scene_ref)) && (row.scene_ref || row.task_ref))
         store.system.prepare('INSERT INTO session_focus(session_id,task_ref,scene_ref,updated_at) VALUES(?,?,?,?)')
           .run(row.session_id, row.task_ref ?? null, row.scene_ref ?? null, row.updated_at);
     }
@@ -432,7 +462,8 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
         timestamp(row.created_at, '场景创建时间') && !scenes.has(row.id),
       'INVALID_BACKUP', '场景定义无效。');
       scenes.add(row.id);
-      store.system.prepare('INSERT INTO scenes VALUES(?,?,?)').run(row.id, row.title, row.created_at);
+      if (!blockedScenes.has(row.id))
+        store.system.prepare('INSERT INTO scenes VALUES(?,?,?)').run(row.id, row.title, row.created_at);
     }
     const members = new Set();
     for (const row of document.sceneMembers ?? []) {
@@ -442,12 +473,13 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
         !members.has(`${row.scene_id}:${row.session_id}`),
       'INVALID_BACKUP', '场景成员引用无效。');
       members.add(`${row.scene_id}:${row.session_id}`);
-      store.system.prepare('INSERT INTO scene_members VALUES(?,?,?)')
-        .run(row.scene_id, row.session_id, row.joined_at);
+      if (!blockedScenes.has(row.scene_id) && !store.blockedSessionIds.has(row.session_id))
+        store.system.prepare('INSERT INTO scene_members VALUES(?,?,?)')
+          .run(row.scene_id, row.session_id, row.joined_at);
     }
     for (const record of normalized) {
-      const sceneRef = record.source?.kind === 'session-event' ? record.source.sceneRef : null;
-      if (!skipped.has(record.id) && scenes.has(sceneRef) &&
+      const sceneRef = ['session-event', 'host-tool-receipt'].includes(record.source?.kind) ? record.source.sceneRef : null;
+      if (!omitted(record.id) && scenes.has(sceneRef) && !blockedScenes.has(sceneRef) &&
           store.system.prepare('SELECT 1 FROM scene_members WHERE scene_id=? AND session_id=?')
             .get(sceneRef, record.sessionId))
         store.system.prepare('INSERT INTO scene_records VALUES(?,?,?)')
@@ -460,8 +492,9 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
         timestamp(row.created_at, '场景操作时间') && !sceneOperations.has(row.operation_id),
       'INVALID_BACKUP', '场景操作元数据无效。');
       sceneOperations.add(row.operation_id);
-      store.system.prepare('INSERT INTO scene_operations VALUES(?,?,?,?)')
-        .run(row.operation_id, row.payload_hash, row.scene_id, row.created_at);
+      if (!blockedScenes.has(row.scene_id))
+        store.system.prepare('INSERT INTO scene_operations VALUES(?,?,?,?)')
+          .run(row.operation_id, row.payload_hash, row.scene_id, row.created_at);
     }
     const graphPairs = new Set();
     for (const row of document.graphRelations ?? []) {
@@ -474,7 +507,7 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
       const key = `${row.leftId}:${row.rightId}`;
       requireValue(!graphPairs.has(key), 'INVALID_BACKUP', '备份包含重复图谱修正。');
       graphPairs.add(key);
-      if (!skipped.has(row.leftId) && !skipped.has(row.rightId)) {
+      if (!omitted(row.leftId) && !omitted(row.rightId)) {
         store.system.prepare('INSERT INTO graph_relations VALUES(?,?,?,?,?,?)')
           .run(row.leftId, row.rightId, row.state, row.leftHash, row.rightHash, row.updatedAt);
       }
@@ -482,6 +515,8 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
     const privateRestore = restorePrivateJournal(store, document, blockedPrivateIds);
     store.reconciledForgetVersion = null;
     store.recover();
+    requireValue(store.privateVersion() === privateVersion, 'PRIVATE_REGISTRY_CHANGED',
+      '恢复期间私人会话隔离状态发生变化；未发布恢复空间，请重试。', 409);
     const restoredCount = store.all().filter(record => record.layer !== 'L0').length;
     const restoredPrivateCount = store.privateDb.prepare('SELECT count(*) AS n FROM entries').get().n;
     store.rebuildViews();
@@ -492,12 +527,20 @@ function restoreDocument(root, name, document, config, { lineageId, coverage, bl
     store.close();
     store = undefined;
     requireValue(!existsSync(target), 'SPACE_EXISTS', '恢复目标已被创建，请使用其他名称。', 409);
-    ledger.publishRestore(name, lineageId, expectedVersion, markers, keys, privateMarkers, () => {
-      renameSync(join(root, 'spaces', staging), target);
-      published = true;
-    });
+    const registry = new PrivateSessionRegistry(root);
+    try {
+      transaction(registry.db, () => {
+        requireValue(registry.version() === privateVersion, 'PRIVATE_REGISTRY_CHANGED',
+          '恢复期间私人会话隔离状态发生变化；未发布恢复空间，请重试。', 409);
+        ledger.publishRestore(name, lineageId, expectedVersion, markers, keys, privateMarkers, () => {
+          renameSync(join(root, 'spaces', staging), target);
+          published = true;
+        }, { events: incomingEvents, unknown: unknownEvents, known: true });
+      });
+    } finally { registry.close(); }
     completed = true;
-    return { space: name, records: restoredCount, skippedForgotten: normalized.length - restoredCount,
+    return { space: name, records: restoredCount, skippedForgotten: skipped.size,
+      skippedQuarantined: [...quarantined].filter(id => records.has(id) && !skipped.has(id)).length,
       forgetCoverage: coverage, privateCount: restoredPrivateCount,
       skippedPrivate: privateRestore.skipped };
   } catch (error) {
