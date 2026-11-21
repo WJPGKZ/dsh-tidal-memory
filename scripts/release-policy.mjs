@@ -5,13 +5,13 @@ import { gunzipSync } from 'node:zlib';
 
 export const SOURCE_FILES = Object.freeze([
   'backup-key.js', 'database.js', 'edition.json', 'embedding-worker.js', 'embedding.js',
-  'forget-ledger.js', 'graph-index.js', 'graph-semantic.js', 'graph.js', 'host-deps.js', 'model-packs.js',
-  'journal-files.js', 'model.js', 'private-journal.js', 'private-session-registry.js', 'runtime.js', 'semantic-index.js', 'sleep-context.js',
-  'store.js', 'topic-index.js', 'transfer.js',
+  'event-capture.js', 'forget-ledger.js', 'graph-index.js', 'graph-semantic.js', 'graph.js', 'host-deps.js', 'model-packs.js',
+  'journal-files.js', 'model-consolidation.js', 'model.js', 'private-journal.js', 'private-session-registry.js', 'runtime.js', 'semantic-index.js', 'sleep-context.js',
+  'store.js', 'topic-index.js', 'transfer.js', 'workspace-storage.js',
 ]);
 export const PACKAGE_FILES = Object.freeze([
   'index.js', 'index.d.ts', 'client.js', ...SOURCE_FILES.map(name => `src/${name}`),
-  'scripts/setup-model.mjs', 'scripts/bench-topics.mjs', 'scripts/bench-backup.mjs',
+  'scripts/setup-model.mjs', 'scripts/bench-topics.mjs', 'scripts/bench-backup.mjs', 'scripts/migrate-workspaces.mjs',
   'cordis.patch.yml', 'README.md', 'CONTRIBUTING.md', 'LICENSE',
 ]);
 

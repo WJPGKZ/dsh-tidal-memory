@@ -101,6 +101,82 @@ test('first admitted input supplies semantic recall before capture, strengthenin
   assert.equal(store.raw(memory.id).recallCount, 1);
 });
 
+test('exact identifiers use lexical evidence without starting embeddings and do not confuse prefixes', async t => {
+  const { runtime, store, embedding, agent } = fixture(t);
+  const exact = store.create({ layer: 'L2', text: '宿主版本为 0.2.2-rc.5。' }, ADMIN);
+  const prefix = store.create({ layer: 'L2', text: '另一版本为 0.2.2-rc.50。' }, ADMIN);
+  embedding.pause();
+  const result = await runtime.recallForAgentAsync(agent, '0.2.2-rc.5');
+  assert.equal(result.semanticStatus.state, 'exact');
+  assert.equal(result.picked[0].id, exact.id);
+  assert.equal(result.picked.find(item => item.id === exact.id).reason,
+    '精确标识符匹配（不等于事实验证）');
+  assert.equal(result.picked.find(item => item.id === prefix.id)?.reason,
+    undefined);
+  assert.equal(embedding.calls.length, 0);
+  await runtime.preStep({ agent }, admit('0.2.2-rc.5'));
+  assert.match(runtime.context({ agent }), /0\.2\.2-rc\.5/);
+  assert.doesNotMatch(runtime.context({ agent }), /语义联想尚未完整就绪/);
+  assert.equal(embedding.calls.length, 0);
+});
+
+test('exact identifier boundaries reject longer dotted versions and file extensions', t => {
+  const { store, agent } = fixture(t);
+  const exact = store.create({ layer: 'L2', text: '版本 0.2.2-rc.5。文件 index.js。' }, ADMIN);
+  const longer = store.create({ layer: 'L2', text: '版本 0.2.2-rc.5.1，文件 index.js.map。' }, ADMIN);
+  const prefix = store.create({ layer: 'L2', text: '版本 1.0.2.2-rc.5。' }, ADMIN);
+  for (const query of ['0.2.2-rc.5', 'index.js']) {
+    const ids = store.exactIdentifierRecords(query, { sessionId: agent.id }).map(record => record.id);
+    assert.ok(ids.includes(exact.id));
+    assert.equal(ids.includes(longer.id), false);
+    assert.equal(ids.includes(prefix.id), false);
+  }
+});
+
+test('exact identifier lookup checks matches beyond the first FTS candidates', t => {
+  const { store, agent } = fixture(t);
+  const filler = Array.from({ length: 60 }, (_, index) => `filler${index}`).join(' ');
+  const wanted = store.create({ layer: 'L2', text: `0.2.2-rc.5 ${filler}` }, ADMIN);
+  for (let index = 0; index < 205; index++)
+    store.create({ layer: 'L2', text: `0.2.2-rc.5.${index}` }, ADMIN);
+  assert.equal(store.searchRecords('0.2.2-rc.5', {
+    persistentOnly: true, mode: 'all', statuses: ['active'], limitPerLayer: 200,
+  }).some(record => record.id === wanted.id), false);
+  const ids = store.exactIdentifierRecords('0.2.2-rc.5', { sessionId: agent.id }).map(record => record.id);
+  assert.deepEqual(ids, [wanted.id]);
+});
+
+test('private-history sessions never embed automatic or explicitly requested queries', async t => {
+  const { runtime, store, embedding, agent, config } = fixture(t);
+  agent.session.requestContext = () => ({ provider: 'synthetic', model: 'test' });
+  config.privateMainSessions = [{ space: 'shared', sessionId: agent.id, provider: 'synthetic', model: 'test' }];
+  runtime.syncConfig();
+  runtime.privateAgentDisposers.set(agent.id, () => {});
+  runtime.privateSessionRegistry().markExposed({ sessionId: agent.id, space: 'shared',
+    lineageId: store.lineageId, provider: 'synthetic', model: 'test', now: new Date().toISOString() });
+  store.create({ layer: 'L3', text: '允许使用的普通背景', pinned: true }, ADMIN);
+  await runtime.preStep({ agent }, admit('PRIVATE_QUERY_CANARY'));
+  runtime.context({ agent });
+  assert.equal(embedding.calls.some(call => JSON.stringify(call).includes('PRIVATE_QUERY_CANARY')), false);
+  assert.equal(runtime.sessions.get(agent.id).query, '');
+  const result = await runtime.recallForAgentAsync(agent, 'PRIVATE_QUERY_CANARY');
+  assert.equal(result.semanticStatus.state, 'privacy-lexical');
+  assert.equal(embedding.calls.length, 0);
+  assert.equal(JSON.stringify(store.traces(ADMIN)).includes('PRIVATE_QUERY_CANARY'), false);
+});
+
+test('credential-shaped messages do not enter ordinary capture, recall traces or embeddings', async t => {
+  const { runtime, store, embedding, agent } = fixture(t);
+  const text = '记住：api_key = sk-synthetic1234567890abcdef';
+  await runtime.preStep({ agent }, admit(text));
+  runtime.onEvent(agent.session, { type: 'user/message', seq: 1, time: Date.now(), data: message(text) });
+  assert.equal(store.all().some(record => JSON.stringify(record).includes('synthetic1234567890abcdef')), false);
+  assert.equal(JSON.stringify(store.traces(ADMIN)).includes('synthetic1234567890abcdef'), false);
+  assert.equal(JSON.stringify(embedding.calls).includes('synthetic1234567890abcdef'), false);
+  assert.equal(runtime.lastError.code, 'SENSITIVE_CONTENT_SKIPPED');
+  await assert.rejects(runtime.recallForAgentAsync(agent, text), { code: 'SENSITIVE_QUERY_EXCLUDED' });
+});
+
 test('index revisions update without recomputing unchanged content; edits and forgetting remove old vectors', async t => {
   const { runtime, store, embedding, agent } = fixture(t);
   let memory = store.create({ layer: 'L2', text: 'SQLite' }, ADMIN);

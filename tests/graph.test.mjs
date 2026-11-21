@@ -83,7 +83,7 @@ test('manual decisions survive rebuild and backup, become stale on content chang
   assert.equal(space.graphNeighbors({ id: center.id }, reader).items[0].relation.kind, 'excluded');
   const backup = packBackup(space);
   const envelope = JSON.parse(backup);
-  assert.equal(envelope.version, 3);
+  assert.equal(envelope.version, 4);
   assert.equal(unpackBackup(backup).graphRelations.length, 1);
   space.graphIndex.close();
   space.graphIndex = null;

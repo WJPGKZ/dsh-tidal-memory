@@ -255,7 +255,7 @@ test('runtime opens spaces lazily, skips assistant capture and isolates lock con
   const root = mkdtempSync(join(tmpdir(), 'tidal-runtime-review-'));
   const cwd = join(root, 'workspace');
   const config = { dataRoot: root, autoBackup: false, bindings: [{ cwd, space: 'test' }] };
-  const session = { id: 'session', header: { cwd } };
+  const session = { id: 'session', header: { cwd }, snapshotEvents: () => [] };
   const agent = { id: session.id, session, status: 'idle' };
   const ctx = { agents: { list: () => [agent], get: () => agent },
     settings: { describe: () => [] }, logger: { warn() {} } };

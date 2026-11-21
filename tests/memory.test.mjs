@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { MemorySpace } from '../src/store.js';
 import { classifyRememberDirective, configOf, hash, LAYERS } from '../src/model.js';
 import { applyImport, importPreview, packBackup, restoreBackup, unpackBackup } from '../src/transfer.js';
+import { PrivateSessionRegistry } from '../src/private-session-registry.js';
+import { SemanticIndex } from '../src/semantic-index.js';
 
 const admin = { admin: true };
 function fixture(t, options = {}) {
@@ -51,6 +53,107 @@ test('same workspace shares across sessions and merges duplicate provenance, wit
   assert.equal(second.stability, 1);
   assert.equal(space.get(first.id, { sessionId: 'session-b' }).text, first.text);
   assert.equal(second.status, 'active');
+});
+
+test('ordinary agent interfaces expose provenance pointers without copied source excerpts', t => {
+  const { space } = fixture(t);
+  const source = { kind: 'derived', parentId: 'source-pointer', excerpt: 'SYNTHETIC_RAW_EXCERPT',
+    original: { kind: 'session', sessionId: 'other-session', eventId: '12',
+      context: { excerpt: 'SYNTHETIC_RAW_CONTEXT', sourceId: 'other-pointer' } } };
+  const task = space.create({ layer: 'L1', text: 'synthetic task summary', source }, admin);
+  const event = space.create({ layer: 'L2', text: 'synthetic event summary', category: 'event',
+    horizon: 'event', occurredAt: '2026-01-01T10:00:00Z', source }, admin);
+  const actor = { sessionId: 'reader' };
+  space.setSessionFocus({ taskRef: task.id }, actor);
+  const results = [space.readEvidence({ id: task.id }, actor), space.get(task.id, actor),
+    space.sessionFocus(actor), space.timeline({}, actor),
+    space.create({ layer: 'L2', text: event.text, category: 'event', horizon: 'event',
+      occurredAt: event.occurredAt }, actor)];
+  assert.equal(JSON.stringify(results).includes('SYNTHETIC_RAW_'), false);
+  assert.equal(space.readEvidence({ id: task.id }, actor).sources[0].original.sessionId, 'other-session');
+  assert.equal(space.get(task.id, admin).source.excerpt, 'SYNTHETIC_RAW_EXCERPT');
+});
+
+test('private-session provenance and descendants are quarantined across ordinary outputs and recovery', async t => {
+  const { root, space, own } = fixture(t);
+  const clean = create(space, 'clean shared topic', { topics: ['shared-topic'] });
+  const source = space.capture({ sessionId: 'private-session', eventId: 1,
+    text: 'SYNTHETIC_PRIVATE_ORIGIN', role: 'user' });
+  const derived = space.promote(source.id, { layer: 'L2', text: 'SYNTHETIC_PRIVATE_DERIVED',
+    category: 'event', horizon: 'event', status: 'active', topics: ['shared-topic'] }, admin);
+  const descendant = create(space, 'SYNTHETIC_PRIVATE_DESCENDANT', { parents: [derived.id, clean.id] });
+  const sourceOnly = create(space, 'SYNTHETIC_PRIVATE_SOURCE_LINK', { source: {
+    kind: 'derived', parentId: clean.id, original: { kind: 'session', sessionId: 'private-session', eventId: '3' },
+  } });
+  const nested = create(space, 'SYNTHETIC_PRIVATE_NESTED', { source: {
+    kind: 'derived', original: { kind: 'session', sessionId: 'private-session', eventId: '2' },
+  } });
+  const actor = { sessionId: 'private-session' };
+  const scene = space.createScene({ title: 'SYNTHETIC_PRIVATE_SCENE',
+    operationId: '00000000-0000-0000-0000-000000000111' }, actor);
+  space.topics();
+  const graph = space.graph();
+  await graph.sync();
+  space.semanticIndex = new SemanticIndex(space);
+  space.semanticIndex.db.prepare('INSERT INTO documents VALUES(?,?,?,?)').run(derived.id, 'hash', 1, 0);
+  const backup = packBackup(space);
+
+  const registry = new PrivateSessionRegistry(root);
+  registry.markExposed({ sessionId: 'private-session', space: 'test', lineageId: space.lineageId,
+    provider: 'synthetic', model: 'test', now: new Date().toISOString() });
+  registry.close();
+  space.reconcileForgetLedger();
+  const blocked = [source, derived, descendant, sourceOnly, nested];
+  assert.ok(space.raw(source.id), 'quarantine must not destroy the original record');
+  for (const record of blocked) {
+    assert.equal(space.all().some(item => item.id === record.id), false);
+    assert.throws(() => space.get(record.id, admin), { code: 'NOT_FOUND' });
+    assert.equal(space.db(record.layer).prepare('SELECT count(*) AS n FROM search WHERE id=?').get(record.id).n, 0);
+    assert.equal(graph.db.prepare('SELECT count(*) AS n FROM documents WHERE id=?').get(record.id).n, 0);
+  }
+  assert.equal(space.semanticIndex.db.prepare('SELECT count(*) AS n FROM documents WHERE id=?').get(derived.id).n, 0);
+  assert.equal(existsSync(join(space.directory, LAYERS[derived.layer].directory, 'views', `${derived.id}.md`)), false);
+  assert.equal(space.get(clean.id, admin).text, clean.text);
+  assert.equal(space.listScenes(actor).length, 0);
+  assert.equal(space.organizePending().organized, 0);
+  space.rebuildSearch();
+  space.rebuildViews();
+  assert.equal(JSON.stringify(space.snapshot()).includes('SYNTHETIC_PRIVATE_'), false);
+  assert.equal(space.db(derived.layer).prepare('SELECT count(*) AS n FROM search WHERE id=?').get(derived.id).n, 0);
+  assert.throws(() => create(space, nested.text), { code: 'PRIVATE_SESSION_QUARANTINED' });
+
+  const restored = restoreBackup(root, 'quarantined-restore', backup, '', space.config);
+  assert.equal(restored.records, 1);
+  const copy = own(new MemorySpace(root, 'quarantined-restore'));
+  assert.equal(JSON.stringify(copy.snapshot()).includes('SYNTHETIC_PRIVATE_'), false);
+  assert.ok(space.forget(clean.id, admin).deleted >= 2, 'forgetting must include quarantined descendants');
+  assert.equal(space.raw(descendant.id), undefined);
+  assert.equal(space.raw(sourceOnly.id), undefined);
+  assert.throws(() => space.get(scene.id, actor), { code: 'NOT_FOUND' });
+});
+
+test('privacy changes during evidence and backup reads invalidate the result without affecting another workspace', t => {
+  const { root, space, own } = fixture(t);
+  const record = create(space, 'SYNTHETIC_STALE_PRIVATE', { sessionId: 'soon-private' });
+  const other = own(new MemorySpace(root, 'other'));
+  const allowed = create(other, 'SYNTHETIC_STALE_PRIVATE', { sessionId: 'different-session' });
+  const registry = new PrivateSessionRegistry(root);
+  const read = space.readEvidenceOnce.bind(space);
+  space.readEvidenceOnce = (...args) => {
+    const result = read(...args);
+    registry.db.prepare(`INSERT OR IGNORE INTO private_sessions
+      (session_id,space,lineage_id,state,provider,model,updated_at) VALUES(?,?,?,'exposed',?,?,?)`)
+      .run('soon-private', 'test', space.lineageId, 'synthetic', 'test', new Date().toISOString());
+    return result;
+  };
+  try {
+    assert.throws(() => space.readEvidence({ id: record.id }, { sessionId: 'reader' }), { code: 'NOT_FOUND' });
+    assert.equal(JSON.stringify(space.snapshot()).includes('SYNTHETIC_STALE_PRIVATE'), false);
+    assert.equal(other.get(allowed.id, admin).text, 'SYNTHETIC_STALE_PRIVATE');
+  } finally {
+    space.readEvidenceOnce = read;
+    registry.close();
+  }
 });
 test('different workspaces have independent stores and configuration disallows shared binding', t => {
   const { root, space, own } = fixture(t);

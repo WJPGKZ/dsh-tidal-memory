@@ -19,6 +19,7 @@ window.__ModuleLoader__.load({
     const css = `
       .tidal{--tidal-accent:var(--dsw-alias-state-business-primary,#197b85);--tidal-muted:var(--dsw-alias-label-secondary,#617381);--tidal-border:var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l2,#d4dfe3));--tidal-surface:var(--dsw-alias-settings-card-fill,var(--dsw-alias-bg-layer-1,transparent));font-family:inherit;color:var(--dsw-alias-label-primary,#182c3a);max-width:1120px;margin:auto;padding:4px 0 20px;box-sizing:border-box}
       .tidal *{box-sizing:border-box}.tidal h2,.tidal h3{margin:0 0 10px}.tidal small,.tidal .muted{color:var(--tidal-muted)}
+      .tidal fieldset{min-width:0;border:0;margin:0;padding:0}.tidal summary,.tidal .row strong{overflow-wrap:anywhere}
       .tidal .hero{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}
       .tidal .brand{font-size:24px;font-weight:700}.tidal .version{font-size:13px;font-weight:400;margin-left:10px;color:var(--tidal-accent)}.tidal .eyebrow{font-size:11px;letter-spacing:2px;color:var(--tidal-accent)}
       .tidal button,.tidal input,.tidal select,.tidal textarea{font:inherit;color:inherit}
@@ -83,6 +84,84 @@ window.__ModuleLoader__.load({
       return h('label', { className: 'check' }, h('input', {
         type: 'checkbox', checked: Boolean(value), onChange: event => set(event.target.checked),
       }), h('span', null, label));
+    }
+    const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const workspaceName = row => row?.title === 'default-workspace' ? '默认工作区' : row?.title;
+    const pathKey = value => /^[a-z]:[\\/]|^\\\\/i.test(value) ? value.replaceAll('/', '\\').toLowerCase() : value;
+    const hostRow = (binding, rows) => binding && rows.find(row => binding.workspaceId ?
+      row.id === binding.workspaceId && pathKey(row.cwd) === pathKey(binding.cwd) : pathKey(row.cwd) === pathKey(binding.cwd));
+    const spaceLabel = (binding, rows) => binding?.displayName || workspaceName(hostRow(binding, rows)) || binding?.space;
+    function pathSuffix(cwd, peers) {
+      const parts = cwd.split(/[\\/]+/).filter(Boolean);
+      for (let n = 1; n <= parts.length; n++) {
+        const tail = parts.slice(-n).join('/');
+        if (!peers.some(other => other !== cwd && pathKey(other).split(/[\\/]+/).filter(Boolean).slice(-n)
+          .join('/') === pathKey(cwd).split(/[\\/]+/).filter(Boolean).slice(-n).join('/'))) return tail;
+      }
+      return cwd;
+    }
+    const semanticKeys = ['embeddingMode', 'embeddingModelPath', 'embeddingDevice', 'embeddingTimeoutSeconds', 'embeddingMinScore', 'embeddingRelativeFloor'];
+    const policyKeys = ['enabled', 'autoCandidates', 'injectContext', 'autoArchive', 'graphRecall', 'minScore', 'relativeFloor',
+      'tokenBudget', 'maxRecall', 'residentBudget', 'contextMessages', 'workingHours', 'halfLifeDays', 'idleMinutes',
+      'bufferHours', 'backupKeep', 'residentMode', 'autoConsolidate', 'dailyConsolidateAt', 'autoBackup'];
+    const fold = (label, ...children) => h('details', { className: 'panel stack' }, h('summary', null, label), ...children);
+
+    function SessionPicker({ label, choices, selected, onSelect, load, loading, error, ready, disabled, childrenAllowed }) {
+      const [filter, setFilter] = React.useState('');
+      const [children, setChildren] = React.useState(false);
+      const [limit, setLimit] = React.useState(30);
+      const details = React.useRef(null), search = React.useRef(null);
+      const visible = choices.filter(item => !item.child || (childrenAllowed && children));
+      const title = item => item.title || '名称暂不可用';
+      const duplicates = new Map();
+      for (const item of visible) duplicates.set(title(item), (duplicates.get(title(item)) || 0) + 1);
+      const matches = visible.filter(item => title(item).toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase()));
+      const current = choices.find(item => item.id === selected);
+      const close = () => { details.current.open = false; details.current.querySelector('summary').focus(); };
+      const select = id => { onSelect(id); close(); };
+      return h('details', { ref: details, onToggle: e => {
+        if (e.currentTarget.open) { setFilter(''); setLimit(30); load(); search.current?.focus(); }
+      }, onKeyDown: e => { if (e.key === 'Escape' && details.current.open) { e.preventDefault(); close(); } } },
+      h('summary', { 'aria-label': `选择${label}` }, `${label}：${current ? title(current) : selected ? '已选择（名称暂不可用）' : '未选择'}`),
+      h('div', { className: 'stack' },
+        field(`搜索${label}`, filter, v => { setFilter(v); setLimit(30); }, 'search', { ref: search, disabled }),
+        childrenAllowed && check('显示子会话', children, setChildren),
+        loading && h('small', { role: 'status' }, '正在读取此工作区的会话…'),
+        error && h('p', { role: 'alert' }, error),
+        h('select', { size: Math.min(7, Math.max(2, matches.length + 1)), value: selected || '', 'aria-label': label,
+          disabled: disabled || loading || Boolean(error), onChange: e => select(e.target.value) },
+          h('option', { value: '' }, '不选择'),
+          ...(selected && !matches.slice(0, limit).some(item => item.id === selected) ?
+            [h('option', { key: selected, value: selected, hidden: true }, '已选择')] : []),
+          ...matches.slice(0, limit).map(item => h('option', { key: item.id, value: item.id, title: title(item) },
+            title(item) + (duplicates.get(title(item)) > 1 ? ` · ${item.createdAt ? new Date(item.createdAt).toLocaleDateString() + ' · ' : ''}${item.id.replace(/^session-/, '').slice(0, 8)}` : '') +
+            (item.child ? ' · 子会话' : '')))),
+        !loading && !error && ready && !matches.length && h('small', null, filter ? '没有匹配的会话名称。' : '没有符合此用途的会话。'),
+        matches.length > limit && h('button', { type: 'button', onClick: () => setLimit(limit + 30) }, '显示更多匹配'),
+        h('button', { type: 'button', disabled: disabled || loading, onClick: load }, '刷新会话列表')));
+    }
+
+    function WorkspacePanel({ row, binding, space, busy, change, oldSpaces, openOld }) {
+      const [name, setName] = React.useState(null);
+      const [old, setOld] = React.useState('');
+      const act = (text, onClick, off = false) => h('button', { type: 'button', disabled: busy || off, onClick }, text);
+      return h('section', { className: 'panel stack' }, h('h3', null, '当前工作区的记忆'),
+        row ? h('div', { className: 'stack' }, h('strong', null, workspaceName(row) || row.cwd),
+          h('p', { className: 'path' }, row.memoryDirectory),
+          h('small', null, '这个目录包含本工作区的四层记忆、日记与索引。选择工作区不会授予会话权限。'),
+          row.error && h('p', { role: 'alert' }, row.error.message),
+          binding ? h('div', { className: 'stack' },
+            h('div', { className: 'row' }, h('span', null, '记忆别名：' + (binding.displayName || '未设置')),
+              act('编辑中文别名', () => setName(binding.displayName || ''))),
+            name !== null && h('div', { className: 'row' }, field('记忆别名（仅设置页显示）', name, setName, 'text', { maxLength: 128 }),
+              act('保存别名', async () => { if (await change(space, { action: 'rename', displayName: name })) setName(null); }), act('取消', () => setName(null))),
+            act('解除工作区绑定', () => { if (window.confirm('停止此工作区的会话绑定和授权？本地记忆文件不会删除。'))
+              void change(space, { action: 'unbind' }); })) :
+            act('绑定此工作区', () => change(space, { action: 'bind', workspaceId: row.id, cwd: row.cwd }), Boolean(row.error))) :
+          h('small', null, '正在查看未绑定的旧空间；它不是 DSH 工作区。'),
+        oldSpaces.length > 0 && fold('高级：只查看未绑定的旧空间', h('label', null, '旧空间',
+          h('select', { 'aria-label': '旧空间', value: old, onChange: e => setOld(e.target.value) }, h('option', { value: '' }, '选择旧空间'),
+            ...oldSpaces.map(key => h('option', { key, value: key }, key)))), act('查看旧空间', () => openOld(old), !old)));
     }
     function GraphView({ space, busy, run, openEditor }) {
       const [layer, setLayer] = React.useState('L3');
@@ -315,11 +394,14 @@ window.__ModuleLoader__.load({
               !suggestions.items.length ? h('p', { className: 'muted' }, '本批没有达到门槛的语义候选。') : null,
               suggestions.nextCursor ? act('检查下一批语义候选', () => findSuggestions(suggestions.nextCursor)) : null) : null)) : null);
     }
-    function Page() {
-      const [space, setSpace] = React.useState('default');
+    function Page({ sessionList }) {
+      const [space, setSpace] = React.useState('');
+      const oldView = React.useRef(false);
       const [tab, setTab] = React.useState('overview');
       const [status, setStatus] = React.useState(null);
-      const [config, setConfig] = React.useState(null);
+      const [edits, setEdits] = React.useState({});
+      const config = status?.space === space ? { ...status.config,
+        ...Object.fromEntries(Object.entries(edits).map(([key, edit]) => [key, edit.value])) } : null;
       const [layer, setLayer] = React.useState('L3');
       const [items, setItems] = React.useState({ total: 0, items: [] });
       const [query, setQuery] = React.useState('');
@@ -336,35 +418,59 @@ window.__ModuleLoader__.load({
       const [password, setPassword] = React.useState('');
       const [automaticPassword, setAutomaticPassword] = React.useState('');
       const [privateWritersInput, setPrivateWritersInput] = React.useState('');
+      const [modelApiKeyInput, setModelApiKeyInput] = React.useState('');
+      const [privateSummaryDay, setPrivateSummaryDay] = React.useState('');
       const [restoreName, setRestoreName] = React.useState('');
       const [restoreText, setRestoreText] = React.useState('');
       const [privateImport, setPrivateImport] = React.useState(false);
       const [plan, setPlan] = React.useState(null);
       const [selected, setSelected] = React.useState([]);
-      const [newCwd, setNewCwd] = React.useState('');
-      const [newSpace, setNewSpace] = React.useState('');
+      const [historyImportPlan, setHistoryImportPlan] = React.useState(null);
+      const [historyImportSelected, setHistoryImportSelected] = React.useState([]);
+      const [historyImportSession, setHistoryImportSession] = React.useState('');
+      const [historyImportQuery, setHistoryImportQuery] = React.useState('');
+      const [historyImportDate, setHistoryImportDate] = React.useState('');
+      const [directory, setDirectory] = React.useState({ items: [], error: '' });
+      const directoryRequest = React.useRef(0);
       const [sessionCatalog, setSessionCatalog] = React.useState(null);
       const [sessionsLoading, setSessionsLoading] = React.useState(false);
+      const [catalogError, setCatalogError] = React.useState('');
+      const sidebar = React.useSyncExternalStore(
+        React.useCallback(listener => sessionList?.subscribe(listener) ?? (() => {}), [sessionList]),
+        React.useCallback(() => sessionList?.getSnapshot() ?? null, [sessionList]));
       const sessionRequest = React.useRef(0);
       const generation = React.useRef(0);
-      const initialSpace = React.useRef(true);
+
 
       async function refresh() {
+        if (!space) return;
         const version = ++generation.current;
         const data = await request(space, '/status');
         if (version !== generation.current) return;
-        if (initialSpace.current) {
-          initialSpace.current = false;
-          if (data.config.bindings.length === 1 && data.config.bindings[0].space !== space) {
-            setSpace(data.config.bindings[0].space);
-            return;
-          }
-        }
-        setStatus(data); setConfig(data.config); setPrivateWritersInput(data.config.privateWriters.join(','));
+        setStatus(data);
       }
+      async function readDirectory() {
+        const ticket = ++directoryRequest.current;
+        try {
+          const data = await request(space, '/workspaces');
+          if (ticket === directoryRequest.current) {
+            setDirectory({ items: data.items, error: '' });
+            setSpace(current => current && (oldView.current || data.items.some(row => row.space === current)) ? current :
+              data.items.find(row => row.bound)?.space || data.items[0]?.space || '');
+          }
+        } catch (error) {
+          if (ticket === directoryRequest.current) setDirectory({ items: [], error: error.message });
+        }
+      }
+      React.useEffect(() => { readDirectory(); return () => { directoryRequest.current++; }; }, [space]);
       React.useEffect(() => {
-        setDraft(null); setPlan(null); setExtra(null); setLifecycle(null); setRecall(null); setTopicDetail(null);
-        setSessionCatalog(null); setSessionsLoading(false);
+        if (status?.space === space && !edits.privateWriters) setPrivateWritersInput(status.config.privateWriters.join(','));
+      }, [status, space, edits.privateWriters]);
+      React.useEffect(() => {
+        setDraft(null); setPlan(null); setHistoryImportPlan(null); setHistoryImportSelected([]);
+        setHistoryImportSession(''); setHistoryImportQuery(''); setHistoryImportDate('');
+        setExtra(null); setLifecycle(null); setRecall(null); setTopicDetail(null);
+        setSessionCatalog(null); setSessionsLoading(false); setCatalogError(''); setPrivateSummaryDay('');
         refresh().catch(error => setNotice({ error: true, text: error.message }));
         return () => { generation.current++; sessionRequest.current++; };
       }, [space]);
@@ -390,68 +496,114 @@ window.__ModuleLoader__.load({
         } finally { setBusy(false); }
       }
       const button = (label, action, style = '') => h('button', { type: 'button', disabled: busy, className: style, onClick: action }, label);
-      const patchConfig = (key, value) => setConfig(current => ({ ...current, [key]: value }));
+      const patchConfig = (key, value) => setEdits(current => {
+        const next = { ...current };
+        if (sameValue(value, status.config[key])) delete next[key];
+        else next[key] = { base: current[key]?.base ?? status.config[key], value };
+        return next;
+      });
+      const switchSpace = (next, archived = false) => {
+        if (next === space || (Object.keys(edits).length && !window.confirm('放弃未保存的设置并切换空间？取消可留在此处保存。'))) return;
+        oldView.current = archived;
+        sessionRequest.current++; generation.current++;
+        setEdits({}); setNotice(null); setSpace(next);
+      };
       const patchDraft = (key, value) => setDraft(current => ({ ...current, [key]: value }));
       const promotionText = () => draft.layer === 'L0'
         ? draft.text.replace(/^\s*(?:请)?(?:记住|记一下|remember)\s*[:：,，]\s*/i, '').trim()
         : draft.text;
-      const saveConfig = () => run(() => request(space, '/config', {
-        revision: status.settingsRevision, patch: config,
-      }), '设置已保存。');
-      const privateMain = config?.privateMainSessions?.find(item => item.space === space) ?? null;
-      const knownSessions = new Map((sessionCatalog?.space === space ? sessionCatalog.items : [])
-        .map(item => [item.id, item]));
-      for (const session of status?.space === space ? status.sessions : []) {
-        const previous = knownSessions.get(session.id);
-        knownSessions.set(session.id, { ...session, ...previous });
-      }
-      const sessionChoices = [...knownSessions.values()].sort((a, b) =>
-        a.title.localeCompare(b.title, 'zh-CN') || a.id.localeCompare(b.id));
-      const chosenSession = sessionChoices.find(item => item.id === privateMain?.sessionId);
-      const boundWorkspace = status?.config.bindings.find(item => item.space === space)?.cwd;
-      const sessionLabel = session => {
-        const state = { idle: '空闲', running: '运行中', inactive: '未运行' }[session.status] || session.status;
-        return `${session.title || '未命名会话'} · ${state} · ${session.id.replace(/^session-/, '').slice(0, 8)}${session.origin === 'subagent' ? ' · 子会话' : ''}${session.metadataError ? ' · 元数据读取不完整' : ''}`;
+      const saveSection = (keys, selectionKey) => run(async () => {
+        const changed = keys.filter(key => edits[key]);
+        for (const key of changed) if (!sameValue(status.config[key], edits[key].base))
+          throw new Error('此区块已在别处修改。请放弃草稿，核对最新设置后再编辑。');
+        if (selectionKey) {
+          const selection = config[selectionKey].find(item => item.space === space) ?? null;
+          await request(space, '/workspace-selection', { setting: selectionKey, selection, revision: status.settingsRevision });
+        } else {
+          await request(space, '/config', { revision: status.settingsRevision, patch: Object.fromEntries(changed.map(key => [key, config[key]])) });
+        }
+        setEdits(current => Object.fromEntries(Object.entries(current).filter(([key]) => !changed.includes(key))));
+      }, '设置已保存。');
+      const changeBinding = async (target, action) => {
+        const result = await run(async () => {
+          const saved = await request(target, '/workspace-binding', { ...action, revision: status.settingsRevision });
+          if (action.action === 'unbind' && target === space)
+            setEdits(current => Object.fromEntries(Object.entries(current).filter(([key]) => !key.endsWith('Sessions'))));
+          return saved;
+        }, saved => saved.alreadyBound ? '该工作区已经绑定，未创建新空间。' : '工作区设置已保存。');
+        if (result && ['bind', 'manual'].includes(action.action) && !Object.keys(edits).length) {
+          setSpace(result.space); setTab('settings');
+        }
+        return result;
       };
-      async function readWorkspaceSessions(append = false) {
+      const sessionChoices = (sessionCatalog?.space === space ? sessionCatalog.items : []).map(item => {
+        const summary = sidebar?.byId?.[item.id];
+        const title = summary?.blank ? '新会话' : summary?.displayTitle;
+        return { ...item, title: title && title !== item.id ? title : item.title };
+      }).sort((a, b) =>
+        a.title.localeCompare(b.title, 'zh-CN') || a.id.localeCompare(b.id));
+      const currentWorkspace = directory.items.find(row => row.space === space);
+      const binding = status?.config.bindings.find(item => item.space === space);
+      const boundWorkspace = status?.space === space && binding && (!binding.workspaceId || hostRow(binding, directory.items));
+      async function readWorkspaceSessions() {
+        if (!boundWorkspace) return;
         const ticket = ++sessionRequest.current;
-        setSessionsLoading(true); setNotice(null);
+        setSessionsLoading(true); setCatalogError('');
         try {
-          const offset = append && sessionCatalog?.space === space ? sessionCatalog.nextOffset : 0;
-          const data = await request(space, `/workspace-sessions?offset=${offset ?? 0}`);
+          const data = await request(space, '/workspace-sessions?view=picker');
           if (ticket !== sessionRequest.current || data.space !== space) return;
-          setSessionCatalog(previous => {
-            const items = new Map((append && previous?.space === space ? previous.items : []).map(item => [item.id, item]));
-            for (const item of data.items) items.set(item.id, item);
-            return { ...data, items: [...items.values()] };
-          });
-          setNotice({ error: data.warnings > 0,
-            text: `已读取该工作区会话：本批 ${data.items.length} 个，共 ${data.total} 个。${data.warnings ? `其中 ${data.warnings} 个的名称或模型元数据读取不完整，可重试。` : ''}主会话选择与未保存设置未改动。` });
+          setSessionCatalog(data);
         } catch (error) {
-          if (ticket === sessionRequest.current) setNotice({ error: true, text: error.message });
+          if (ticket === sessionRequest.current) { setSessionCatalog(null); setCatalogError(error.message); }
         } finally {
           if (ticket === sessionRequest.current) setSessionsLoading(false);
         }
       }
-      const setPrivateMain = patch => {
-        if (!privateMain) return;
-        patchConfig('privateMainSessions', [
-          ...config.privateMainSessions.filter(item => item.space !== space),
-          { ...privateMain, ...patch },
-        ]);
+      const savedRoute = ['privateMainSessions', 'historyMainSessions', 'deepOrganizationSessions'].some(key =>
+        status?.config[key]?.some(item => item.space === space));
+      React.useEffect(() => {
+        if (tab === 'settings' && boundWorkspace && savedRoute) readWorkspaceSessions();
+      }, [tab, space, Boolean(boundWorkspace), savedRoute]);
+      const picker = (label, selected, onSelect, childrenAllowed = false) => h(SessionPicker, {
+        key: `${space}:${label}`, label, selected, onSelect, childrenAllowed, choices: sessionChoices, load: readWorkspaceSessions,
+        loading: sessionsLoading, error: catalogError, ready: sessionCatalog?.space === space, disabled: busy || !boundWorkspace,
+      });
+      const routeCard = (label, setting) => {
+        const selected = config[setting].find(item => item.space === space);
+        const found = sessionChoices.find(item => item.id === selected?.sessionId);
+        const choose = id => {
+          const items = config[setting].filter(item => item.space !== space);
+          const session = sessionChoices.find(item => item.id === id);
+          if (session) items.push({ space, sessionId: id, provider: session.provider, model: session.model });
+          patchConfig(setting, items);
+        };
+        const verified = found?.provider && found.model && found.provider === selected?.provider && found.model === selected.model;
+        return h('section', { className: 'panel stack', 'aria-label': label },
+          picker(label, selected?.sessionId, choose, setting === 'deepOrganizationSessions'),
+          selected && h('small', null, `模型：${selected.provider && selected.model ? `${selected.provider} / ${selected.model}` : '请先在 DSH 中为会话选择模型'}`),
+          selected && sessionCatalog && !verified && h('p', { role: 'alert' },
+            found?.provider && found.model ? `路由已变化：${found.provider} / ${found.model}，不会自动切换。` : '当前无法核实会话或模型；请在 DSH 中选择模型后刷新。'),
+          selected && found?.provider && found.model && !verified && button('使用当前模型路由', () => choose(found.id)),
+          h('button', { type: 'button', disabled: busy || !edits[setting] || Boolean(selected && !verified),
+            onClick: () => saveSection([setting], setting) }, `保存${label}`));
       };
-      const selectPrivateMain = sessionId => {
-        const remaining = config.privateMainSessions.filter(item => item.space !== space);
-        if (sessionId) {
-          const session = sessionChoices.find(item => item.id === sessionId);
-          remaining.push({
-            space, sessionId,
-            provider: session?.provider || '',
-            model: session?.model || '',
-          });
-        }
-        patchConfig('privateMainSessions', remaining);
-      };
+      const previewSelectedHistory = () => run(async () => {
+        const result = await request(space, '/history/import-preview', {
+          sessionIds: [historyImportSession], query: historyImportQuery, date: historyImportDate,
+        });
+        setHistoryImportPlan(result);
+        setHistoryImportSelected([]);
+        return { candidates: result.candidateCount, skipped: result.skippedUnclassified + result.skippedTooLong,
+          truncated: result.truncated };
+      }, value => `历史预览完成：${value.candidates} 条待选候选；未分类或过长跳过 ${value.skipped} 条${value.truncated ? '；超过本批 200 条上限，请缩小范围' : ''}。尚未写入记忆。`);
+      const applySelectedHistory = () => run(async () => {
+        const result = await request(space, '/history/import-apply', {
+          id: historyImportPlan.id, selected: historyImportSelected,
+        });
+        setHistoryImportPlan(null);
+        setHistoryImportSelected([]);
+        return result;
+      }, value => value.status);
       const saveDraft = () => run(async () => {
         const patch = {
           text: draft.text, category: draft.category, status: draft.status, kind: draft.kind,
@@ -473,7 +625,8 @@ window.__ModuleLoader__.load({
           values.map(value => h('option', { key: value, value }, labels[value] || value))));
 
       let content;
-      if (!status || !config) content = h('div', { className: 'empty' }, '正在读取记忆系统…');
+      if (!space) content = h('div', { className: 'empty' }, '请先在 DSH 中添加工作区，然后刷新此页。');
+      else if (!status || !config) content = h('div', { className: 'empty' }, '正在读取记忆系统…');
       else if (status.unavailable) content = h('div', { className: 'panel stack', role: 'alert' },
         h('h3', null, '当前空间不可用，未保存或召回记忆'),
         h('p', null, `${status.spaceError.code} · ${status.spaceError.message}`),
@@ -488,12 +641,12 @@ window.__ModuleLoader__.load({
         h('div', { className: 'panel stack' },
           h('h3', null, '同工作区共享，不按会话分库'),
           h('p', { className: 'muted' }, '四层分别落盘。新记忆自动保存并参与召回，无需逐条审核；可召回不等于已核实。人工确认和纠错是可选操作，冲突不会自动覆盖。'),
-          h('p', null, `整理和检索均在本地完成，不发起整理模型调用 · 每轮预算 ${config.tokenBudget}（UTF-8 字节保守估算）`),
+          h('p', null, `普通记忆默认本地整理；已显式配置模型时，深度整理按工作区设置发送普通 L1/L2 · 每轮注入预算 ${config.tokenBudget}（UTF-8 字节保守估算）`),
           h('p', { className: 'muted' }, config.injectContext
             ? '已开启普通记忆上下文：选中的记忆会随当前聊天请求发送给你配置的模型。'
             : '自动记忆上下文已关闭；聊天模型主动调用记忆工具时，工具结果仍会进入聊天请求。'),
           status.legacyModelExtractionIgnored ? h('div', { className: 'message' },
-            '已忽略旧版后台模型提炼配置；此版本不会为整理调用模型。') : null,
+            '已忽略旧版后台模型提炼配置；只有显式选择工作区模型或 API 并保存后才会发送整理材料。') : null,
           config.bindings.length === 0 ? h('div', { className: 'message' }, '尚未绑定工作区。请在“设置与迁移”中绑定；未绑定前不会读取或捕获聊天。') : null,
           h('div', { className: 'row' }, button('立即整理', () => run(() => request(space, '/maintenance', {}), value =>
             value.waitingForConversation ? '对话正在运行，整理已等待。' : JSON.stringify(value)), 'primary'),
@@ -505,6 +658,13 @@ window.__ModuleLoader__.load({
             `二次编码 ${status.encoding.sleep.from} 至 ${status.encoding.sleep.until} · 检查 ${status.encoding.sleep.inspected} 条 · 新增 ${status.encoding.sleep.candidates} 条待确认候选 · 到期前未二次检查 ${status.encoding.expiredBeforeSleep ?? 0} 条` :
             `尚未进行二次编码 · 到期前未二次检查 ${status.encoding.expiredBeforeSleep ?? 0} 条`),
           h('pre', null, JSON.stringify(status.encoding.reasons, null, 2))) : null,
+        status.capture ? h('div', { className: 'panel stack' }, h('h3', null, '事件捕获诊断'),
+          h('p', null, `有结果 ${status.capture.counts.saved} · 无产出 ${status.capture.counts.empty} · 待核 ${status.capture.counts.review} · 等待配对 ${status.capture.counts.waiting} · 失败 ${status.capture.counts.failed} · 处理中 ${status.capture.counts.pending}`),
+          h('p', { className: 'muted' }, `${status.capture.coverage} 有缺口的会话 ${status.capture.sessionsWithGaps} 个。`),
+          h('small', null, '只重试已登记且当前仍可访问的干净会话；无法访问的事件不会自动读取旧历史。'),
+          button('重试已登记事件', () => run(() => request(space, '/capture/retry', {}), value =>
+            `已重试 ${value.retried} 项；当前不可访问 ${value.unavailable} 项；失败 ${value.failed} 项。`)),
+          h('details', null, h('summary', null, '查看脱敏原因'), h('pre', null, JSON.stringify(status.capture.reasons, null, 2)))) : null,
         h('div', { className: 'panel' }, h('h3', null, '本地语义联想'),
           h('p', null, status.semantic?.mode === 'off' ? '标准组合：词面、别名、时间及来源关系检索，不加载 embedding。' :
             `${status.semantic?.ready ? '模型已加载' : '模型未就绪'} · ${status.semantic?.model ?? '等待首次准备'} · 索引 ${status.semantic?.index?.indexed ?? 0} / ${status.semantic?.index?.total ?? '?'} 条`),
@@ -667,40 +827,34 @@ window.__ModuleLoader__.load({
           status.private.indexFile && h('p', { className: 'path' }, `内部索引：${status.private.indexFile}`),
           h('small', null, '不出现在普通搜索、图谱和明文备份中。主会话回顾时，日记片段会进入该会话历史；此隔离不是对本机管理员或其他任意文件工具的绝对保密。')),
         h('div', { className: 'panel stack' },
-          h('h3', null, '同工作区主会话回顾'),
-          h('p', { className: 'muted' }, '仅指定会话可收到昨日及更早的私人日记片段；模型路由必须与设置一致。插件不显示日记正文，也不自动授权其他会话。'),
-          h('p', { className: 'path' }, `已保存工作区：${boundWorkspace || '尚未绑定，请先保存工作区设置'}`),
-          h('div', { className: 'row' },
-            h('button', { type: 'button', disabled: busy || sessionsLoading || !boundWorkspace,
-              onClick: () => readWorkspaceSessions() }, sessionsLoading ? '正在读取工作区会话…' : '读取该工作区会话'),
-            sessionCatalog?.space === space && sessionCatalog.nextOffset !== null ?
-              h('button', { type: 'button', disabled: busy || sessionsLoading,
-                onClick: () => readWorkspaceSessions(true) }, '读取更多会话') : null),
-          h('small', null, sessionCatalog?.space === space ?
-            `已载入 ${sessionCatalog.items.length} / ${sessionCatalog.total} 个工作区会话（包含未运行会话），按名称选择；同名时核对 ID。` :
-            '当前仅显示已加载会话。点击读取按钮获取该工作区的历史会话名称，不启动会话，也不更改授权。'),
-          h('label', null, h('span', null, '主会话'),
-            h('select', { 'aria-label': '私人日记主会话', value: privateMain?.sessionId ?? '',
-              onChange: event => selectPrivateMain(event.target.value) },
-            h('option', { value: '' }, '未启用（默认）'),
-            ...(privateMain && !sessionChoices.some(item => item.id === privateMain.sessionId) ?
-              [h('option', { key: privateMain.sessionId, value: privateMain.sessionId },
-                `${privateMain.sessionId}（已选择，尚未载入名称）`)] : []),
-            ...sessionChoices.map(session => h('option', { key: session.id, value: session.id },
-              sessionLabel(session))))),
-          privateMain ? h('small', null, `已选择：${chosenSession?.title || '名称尚未读取'} · ID：${privateMain.sessionId}；修改后需保存才生效。`) : null,
-          privateMain ? h('div', { className: 'fields' },
-            field('Provider ID', privateMain.provider, value => setPrivateMain({ provider: value })),
-            field('Model ID', privateMain.model, value => setPrivateMain({ model: value }))) : null,
-          privateMain && (!privateMain.provider || !privateMain.model) ?
-            h('small', null, '该会话暂无可用模型路由。请填写准确的 Provider ID / Model ID，或打开该会话并选定模型后重新读取。') : null,
+          h('h3', null, '日记设置与维护'),
+          h('p', { className: 'muted' }, '仅指定会话可收到昨日及更早的私人日记片段；模型路由必须与设置一致。自动日记汇总默认关闭；开启后也只读取绑定工作区会话，并且不在管理页显示正文。'),
+          button('管理此工作区的会话授权', () => setTab('settings')),
           field('主会话日记上下文预算（字节）', config.privateContextBudget,
             value => patchConfig('privateContextBudget', value), 'number', { min: 1024, max: 32000, step: 512 }),
           check('允许同工作区其他会话提交私人日记贡献（默认关闭）', config.privateContributionsEnabled,
             value => patchConfig('privateContributionsEnabled', value)),
           h('small', null, '此开关仅允许写入，不会自动写日记。启用后需会话实际调用 tidal_private_contribute，或由获准作者插件提交；仅选择主会话只会开启回顾，不会补写空缺日期。'),
           h('small', null, `待主会话回顾 ${status.private.reviewPendingDays ?? 0} 天 · 已完整观察 ${status.private.observedDays ?? 0} 天 · 近期日记按上下文预算分段提供。`),
-          button('保存主会话设置', saveConfig, 'primary'),
+          h('small', null, '启用后只读取此绑定工作区内目标日期的用户与助手文本；由上方已授权主会话的模型生成，正文仅写入 YYYY-MM-DD.md，不进入普通记忆或界面状态。'),
+          h('small', null, status.private.automaticSummary ?
+            `最近自动汇总：${status.private.automaticSummary.day || '日期未知'} · ${
+              ({ completed: '已写入', 'no-content': '当天无可用文本', failed: '失败' })[status.private.automaticSummary.state] || '状态未知'} · ${
+              status.private.automaticSummary.messageCount} 条消息 · ${
+              status.private.automaticSummary.provider || '无路由'} / ${status.private.automaticSummary.model || '无模型'}` :
+            '尚无自动汇总记录；仅选择主会话不会自动生成日记。'),
+          h('div', { className: 'fields' },
+            field('单日回溯日期', privateSummaryDay, setPrivateSummaryDay, 'date'),
+            h('div', { className: 'stack' },
+              h('small', null, '只处理一个日期；若该日已有自动日记，不会重复追加。'),
+              h('button', { type: 'button', disabled: busy || !privateSummaryDay || !config.privateAutoJournalEnabled ||
+                !status.config.privateAutoJournalEnabled,
+                onClick: () => run(() => request(space, '/private/daily-summary', { day: privateSummaryDay }),
+                  value => value.state === 'completed'
+                    ? `已写入 ${value.day} 私人 Markdown 日记（${value.messageCount} 条会话消息）；正文未在界面展示。`
+                    : value.state === 'no-content' ? `${value.day} 没有可用会话文本，未写入日记。`
+                      : `该日期已处理：${value.day}。`) }, '生成该日私人日记'))),
+          button('保存日记全局设置', () => saveSection(['privateContextBudget', 'privateContributionsEnabled']), 'primary'),
           h('small', null, '主会话历史会保留已注入的私人片段。若会话被 fork、路由不符或继承了私人历史，插件会拒绝其继续运行；清空日记不会自动解除已污染会话的限制。'),
           status.private.failure ? h('p', { className: 'message error' },
             `私人日记文件整理在 ${status.private.failure.at} 未完成，已完成条目保留；可单独重试。`) : null,
@@ -713,12 +867,46 @@ window.__ModuleLoader__.load({
             setPrivateWritersInput(value);
             patchConfig('privateWriters', value.split(',').map(x => x.trim()).filter(Boolean));
           }),
-          button('保存作者权限', saveConfig, 'primary'),
-          button('清空私人记录', () => {
+          button('保存作者权限', () => saveSection(['privateWriters']), 'primary'),
+          fold('危险操作 · 清空私人记录', button('清空私人记录', () => {
             if (window.prompt('清空当前私人记录，同数据根同谱系恢复将遵守标记；旧离线备份不会被改写。输入 DELETE PRIVATE JOURNAL 确认：') === 'DELETE PRIVATE JOURNAL')
               run(() => request(space, '/private/clear', { confirmation: 'DELETE PRIVATE JOURNAL' }), '当前私人记录已清空；旧备份未删除。');
-          }, 'danger')));
+          }, 'danger'))));
       else content = h('div', { className: 'stack' },
+        h(WorkspacePanel, { key: space, row: currentWorkspace, binding, space, busy, change: changeBinding,
+          oldSpaces: status.spaces.filter(key => !directory.items.some(row => row.space === key)), openOld: key => switchSpace(key, true) }),
+        boundWorkspace ? h('div', { className: 'panel stack' }, h('h3', null, '此工作区的会话与权限'),
+          h('small', null, '按 DSH 侧栏名称选择。只对当前工作区生效；三项分别保存，选择不等于授权。'),
+          routeCard('历史查证主会话', 'historyMainSessions'), routeCard('私人日记主会话', 'privateMainSessions'),
+          config.deepOrganizationMode === 'session' && routeCard('整理模型会话', 'deepOrganizationSessions')) :
+          h('small', null, '请先绑定工作区，再选择会话。'),
+        h('div', { className: 'panel stack' }, h('h3', null, '全局 · 功能开关与模型来源'),
+          check('允许指定主会话查找同工作区会话记录（默认关闭）', config.historyReadEnabled, v => patchConfig('historyReadEnabled', v)),
+          check('按日自动生成私人日记（默认关闭）', config.privateAutoJournalEnabled, v => patchConfig('privateAutoJournalEnabled', v)),
+          h('small', null, '开启后仍需在各工作区单独授权会话及准确模型。私人日记片段会进入获准主会话的历史。'),
+          h('label', null, h('span', null, '普通深度整理方式'),
+            h('select', { 'aria-label': '普通深度整理方式', value: config.deepOrganizationMode,
+              onChange: event => patchConfig('deepOrganizationMode', event.target.value) },
+            h('option', { value: 'local' }, '本地规则（默认，不调用生成模型）'),
+            h('option', { value: 'session' }, '使用所选工作区会话模型'),
+            h('option', { value: 'api' }, '使用 OpenAI-compatible API'))),
+          config.deepOrganizationMode === 'api' ? h('div', { className: 'stack' },
+            field('完整 API 地址', config.deepOrganizationApiEndpoint,
+              value => patchConfig('deepOrganizationApiEndpoint', value)),
+            field('API 模型名', config.deepOrganizationApiModel,
+              value => patchConfig('deepOrganizationApiModel', value)),
+            field('API 密钥（只写入，不回显）', modelApiKeyInput, setModelApiKeyInput,
+              'password', { autoComplete: 'new-password' }),
+            h('div', { className: 'row' },
+              button('保存 API 密钥', () => run(async () => {
+                await request(space, '/model-api-key', { apiKey: modelApiKeyInput });
+                setModelApiKeyInput('');
+              }, 'API 密钥已受 Windows 当前账户保护并保存。')),
+              button('清除 API 密钥', () => run(() => request(space, '/model-api-key/clear', {}),
+                '本地整理 API 密钥已清除。'), 'danger')),
+            h('small', null, `API 密钥${status.modelApiKey?.configured ? '已保存' : '未保存'}；仅在启动整理请求时解封到内存，不进入配置或备份。`)) : null,
+          button('保存全局功能设置', () => saveSection(['historyReadEnabled', 'privateAutoJournalEnabled', 'deepOrganizationMode', 'deepOrganizationApiEndpoint', 'deepOrganizationApiModel']), 'primary')),
+        fold('高级设置 · 全局策略、索引和文件位置',
         h('div', { className: 'panel stack' }, h('h3', null, '文件位置'),
           ...[['plugin', '插件代码'], ['models', '共享模型目录'], ['semanticIndex', '当前空间的派生语义索引'],
             ['topicIndex', '当前空间的派生主题索引'], ['graphIndex', '当前空间的派生图谱索引'],
@@ -728,17 +916,6 @@ window.__ModuleLoader__.load({
             .map(([key, label]) => h('div', { key }, h('strong', null, label),
               h('p', { className: 'path' }, status.paths?.[key]))),
           h('small', null, '普通记忆数据库的位置见总览四层卡片；私人日记位置只在私人页展示，不提供正文。模型与备份不放在插件代码目录，更新插件不会替换记忆或重新下载模型。')),
-        h('div', { className: 'panel stack' }, h('h3', null, '工作区绑定'),
-          h('small', null, '一个工作区对应一个空间。同工作区的全部原生会话共享记忆；子代理第一版默认不参与。工作区名称尽量使用英文，便于 DSH 与终端管理；中文绝对路径仍可用，路径需与宿主工作目录一致，不会自动继承子目录。'),
-          ...config.bindings.map((binding, i) => h('div', { className: 'row', key: binding.cwd },
-            h('code', { className: 'path' }, `${binding.cwd} → ${binding.space}`),
-            button('解除', () => patchConfig('bindings', config.bindings.filter((_, index) => index !== i))))),
-          h('div', { className: 'fields' }, field('工作区绝对路径', newCwd, setNewCwd), field('空间名（小写字母、数字或短横线）', newSpace, setNewSpace)),
-          h('div', { className: 'row' },
-            button('添加绑定', () => { patchConfig('bindings', [...config.bindings, { cwd: newCwd, space: newSpace }]); setNewCwd(''); setNewSpace(''); }),
-            ...[...new Set(status.sessions.map(s => s.cwd).filter(Boolean))].slice(0, 4).map(cwd =>
-              button(`使用 ${cwd}`, () => setNewCwd(cwd)))),
-          h('p', { className: 'path muted' }, `数据根：${status.root}。更换根目录须停止插件、备份迁移并重启。`)),
         h('div', { className: 'panel stack' }, h('h3', null, '本地语义组合'),
           h('label', null, '本地语义组合', h('select', { 'aria-label': '本地语义组合', value: config.embeddingMode,
             onChange: event => patchConfig('embeddingMode', event.target.value) },
@@ -767,7 +944,7 @@ window.__ModuleLoader__.load({
               field('语义相对门槛（-1 使用模型默认）', config.embeddingRelativeFloor,
                 value => patchConfig('embeddingRelativeFloor', value), 'number', { min: -1, max: 1, step: 0.05 }),
               h('p', { className: 'muted' }, '冷启动先校验文件，再加载模型和增量索引。超时或失败明确标记降级，不会停止保存普通记忆。显卡初始化失败可改用 CPU，不连接已有的未知模型服务。'))),
-          h('div', { className: 'row' }, button('保存语义设置', saveConfig, 'primary'),
+          h('div', { className: 'row' }, button('保存语义设置', () => saveSection(semanticKeys), 'primary'),
             button('准备本地语义索引', () => run(() => request(space, '/semantic/prepare', {}), '本地模型与语义索引已就绪。')),
             button('重新校验模型并重建语义索引', () => run(() => request(space, '/semantic/rebuild', {}), '模型已重新校验，派生语义索引已重建。'))),
           h('small', null, '空间空闲时只为已启用的本地语义组合准备普通索引，前台请求优先。私人日记和 L0 不进入向量索引。模型、向量与缓存不进入记忆备份；删除普通记忆同时清理其向量。')),
@@ -794,13 +971,13 @@ window.__ModuleLoader__.load({
             pack.error ? h('p', { role: 'alert' }, `${pack.error.code} · ${pack.error.message}`) : null))),
         h('div', { className: 'panel stack' }, h('h3', null, '记忆策略'),
           check('启用记忆捕获与召回', config.enabled, value => patchConfig('enabled', value)),
-          check('自动记录并召回用户陈述（本地规则，无需审核）', config.autoCandidates, value => patchConfig('autoCandidates', value)),
-          check('额外保存助手全文到短期 L0（默认关闭）', config.captureAssistant, value => patchConfig('captureAssistant', value)),
+          check('自动记录用户陈述及受支持的工具回执', config.autoCandidates, value => patchConfig('autoCandidates', value)),
+          h('small', null, '助手全文不再自动捕获；明确的完成自述只作为待核线索。旧版助手全文设置保留但不再生效。'),
           check('将本地召回的普通记忆附加到当前聊天请求', config.injectContext, value => patchConfig('injectContext', value)),
           check('已确认图谱关联辅助召回（默认关闭）', config.graphRecall, value => patchConfig('graphRecall', value)),
           h('p', { className: 'muted' }, '仅从通过本轮词面证据门槛的已选记忆扩展人工确认且仍有效的关联，最多补充 3 条，使用剩余预算；纯语义命中和主题相同不自动扩展。'),
           h('p', { className: 'muted' }, '人工关联不保证与当前问题相关，可能带入不同主体、时期或冲突内容；大空间下也可能增加延迟。启用前可先在“回忆与整理”中检查结果。'),
-          h('p', { className: 'muted' }, '关闭后不自动注入记忆，但模型主动调用记忆工具仍可读取普通记忆。整理不发起额外模型请求。'),
+          h('p', { className: 'muted' }, '关闭后不自动注入记忆，但模型主动调用记忆工具仍可读取普通记忆。纯本地整理模式不会发起生成模型请求。'),
           h('div', { className: 'fields' },
             field('最低相关性分数', config.minScore, value => patchConfig('minScore', value), 'number', { min: 0, max: 1, step: 0.05 }),
             field('相对最高分门槛', config.relativeFloor, value => patchConfig('relativeFloor', value), 'number', { min: 0, max: 1, step: 0.05 })),
@@ -824,13 +1001,8 @@ window.__ModuleLoader__.load({
           h('p', { className: 'muted' }, '常驻不等于已核实；过期、待审核和已被替代的条目不注入。常驻先使用独立额度，但总预算仍是硬上限。近期消息逐条匹配，不用无关内容凑数。'),
           check('空闲时执行小整理（纯本地规则）', config.autoConsolidate, value => patchConfig('autoConsolidate', value)),
           check('低重要且未使用的旧 L2 自动归档（保存满八个半衰期，不删除）', config.autoArchive, value => patchConfig('autoArchive', value)),
-          h('label', null, h('span', null, '普通深度整理方式'),
-            h('select', { 'aria-label': '普通深度整理方式', value: config.deepOrganizationMode,
-              onChange: event => patchConfig('deepOrganizationMode', event.target.value) },
-            h('option', { value: 'local' }, '本地规则 / 语义索引（默认）'),
-            h('option', { value: 'selected', disabled: true }, '宿主自选模型（暂不可用）'))),
           h('small', null, status.organizationModels?.ordinary?.message),
-          h('small', null, 'rc5 暂无已验证的外部插件后台整理审计接口；宿主模型和手填 API 均暂不可用，不会为整理发送数据。'),
+          h('small', null, '深度整理材料仅包括当前工作区的有效普通 L1/L2；严格排除 L0 与私人日记。原始记录保留，模型输出作为 L3 待核候选，确认前不会自动召回。L3 存储不设总条数上限，常驻额度和单次召回条数只限制注入上下文，不限制保存。'),
           h('div', { className: 'fields' },
             field('每日深度整理时间（本机时间，留空关闭）', config.dailyConsolidateAt,
               value => patchConfig('dailyConsolidateAt', value), 'time'),
@@ -839,19 +1011,47 @@ window.__ModuleLoader__.load({
                 `${new Date(status.deepConsolidation.at).toLocaleString()} · ${status.deepConsolidation.manual ? '手动' : '定时'} · 提炼 ${status.deepConsolidation.promoted} 条` : '尚未运行'}`),
               h('small', null, `下次预计：${status.nextDailyConsolidationAt ?
                 new Date(status.nextDailyConsolidationAt).toLocaleString() : '已关闭'}`))),
-          h('p', { className: 'muted' }, '本地深度整理不调用生成模型。私人轻整理与普通整理分开；整理前按恢复点设置备份，不含 L0，是否包含私人日记由加密范围决定。宿主每分钟检查，停机后空闲时补跑最近一次。L1 时长仅影响此后自动捕获的任务。'),
+          h('p', { className: 'muted' }, '普通深度整理按上方模式运行；私人日记轻整理与普通记忆分开。整理前先创建恢复点，不含 L0，是否包含私人日记由备份范围决定。宿主每分钟检查，停机后空闲时补跑最近一次。L1 时长仅影响此后自动捕获的任务。'),
           button('立即深度整理一次', () => run(() => request(space, '/consolidate', {}),
-            value => `本地深度整理完成：检查 ${value.inspected} 条，提炼 ${value.promoted} 条，二次编码新增 ${value.reencoding?.candidates ?? 0} 条待确认候选，冲突待复核 ${value.conflicts} 条。${
+            value => `深度整理完成：检查 ${value.inspected} 条，规则提炼 ${value.promoted} 条，模型待核 ${value.modelOrganization?.pendingEvidence ?? 0} 条，二次编码新增 ${value.reencoding?.candidates ?? 0} 条待确认候选，冲突待复核 ${value.conflicts} 条。${
               value.privateOrganization?.state === 'completed' ? '' : '私人整理未全部完成，请查看私人日记状态。'}${
-              value.modelExtraction?.state === 'unavailable' ? '自选模型未运行。' : ''}`)),
+              value.modelOrganization?.state === 'failed' ? '模型整理失败，原始 L1/L2 保留；查看错误状态后重试。' : ''}`)),
           status.deepConsolidation?.eligibility ? h('details', null, h('summary', null, '查看上次整理未产出的原因'),
             h('pre', null, JSON.stringify(status.deepConsolidation, null, 2))) : null,
           check('空闲维护自动备份（范围在“备份与恢复”中选择）', config.autoBackup, value => patchConfig('autoBackup', value)),
-          h('div', { className: 'row' }, button('保存设置', saveConfig, 'primary'),
+          h('div', { className: 'row' }, button('保存设置', () => saveSection(policyKeys), 'primary'),
             button('重建搜索索引', () => run(() => request(space, '/rebuild/search', {}), '搜索索引已重建。')),
             button('重建主题索引', () => run(() => request(space, '/rebuild/topics', {}), '主题索引已重建。')),
             button('重建可读文件', () => run(() => request(space, '/rebuild/views', {}), 'L1-L3 可读视图已重建，旧 L0 生成副本已清理。'))),
           h('p', { className: 'muted' }, 'L0 仍是明文短期缓冲，不生成新 Markdown 副本。重建可读文件只清理带原生成标记的旧 L0 副本，不删除手写文件。旧备份可能含完整会话原文，不受 72 小时清理约束，需另行检查和删除。')),
+        ),
+        fold('迁移与维护 · 补录、导入和恢复',
+            h('div', { className: 'panel stack' }, h('h4', null, '历史补录（管理操作）'),
+              h('p', { className: 'muted' }, '只预览所选普通用户消息中可由本地规则识别的原句；助手消息、工具结果、私人/继承会话和已遗忘事件不参与。候选按 L1/L2 待核保存，不会自动成为长期事实。'),
+              picker('历史补录来源会话', historyImportSession, id => { setHistoryImportSession(id); setHistoryImportPlan(null); }, true),
+              field('历史补录查询词（或选择日期）', historyImportQuery, value => {
+                setHistoryImportQuery(value); setHistoryImportPlan(null);
+              }, 'text', { disabled: busy }),
+              field('历史补录日期（YYYY-MM-DD，可选）', historyImportDate, value => {
+                setHistoryImportDate(value); setHistoryImportPlan(null);
+              }, 'date', { disabled: busy }),
+              h('div', { className: 'row' },
+                button('预览所选会话历史', previewSelectedHistory),
+                historyImportPlan ? h('small', null,
+                  `${historyImportPlan.sessionsChecked} 个会话 · ${historyImportPlan.candidateCount} 条候选${historyImportPlan.id ? ' · 20 分钟后过期' : ''} · ${historyImportPlan.coverage}`) : null),
+              historyImportPlan ? h('div', { className: 'stack' },
+                historyImportPlan.truncated ? h('p', { className: 'message' }, '候选超过每批上限，请缩小查询范围后重新预览。') : null,
+                ...historyImportPlan.candidates.map(candidate => h('label', { className: 'import-candidate', key: candidate.importId },
+                  h('input', { type: 'checkbox', disabled: busy || !historyImportPlan.id || candidate.status === 'already-exists',
+                    checked: historyImportSelected.includes(candidate.importId),
+                    onChange: event => setHistoryImportSelected(current => event.target.checked ?
+                      [...current, candidate.importId] : current.filter(id => id !== candidate.importId)) }),
+                  h('span', null, `${candidate.status === 'already-exists' ? '已存在' : '待核'} · ${candidate.layer} · ${candidate.at} · ${candidate.rule} · ${candidate.text} · 来源 ${candidate.sessionId}:${candidate.eventSeq}`))),
+                historyImportPlan.candidates.length ?
+                  h('button', { type: 'button', className: 'primary',
+                    disabled: busy || !historyImportPlan.id || historyImportSelected.length === 0,
+                    onClick: applySelectedHistory }, `确认补录所选 ${historyImportSelected.length} 条`) :
+                  h('p', { className: 'muted' }, '没有可补录候选；这不代表所选范围内没有其他相关内容。')) : null),
         h('div', { className: 'panel stack' }, h('h3', null, '旧记忆导入'),
           h('p', { className: 'muted' }, '选择 Markdown、文本或 fish-memory JSON。先预览，后导入；旧资料不会自动成为当前人格。'),
           check('本批文件全部作为私人记录（预览不显示正文）', privateImport, setPrivateImport),
@@ -892,7 +1092,7 @@ window.__ModuleLoader__.load({
               setAutomaticPassword('');
               return value;
             }, '口令已由 Windows 当前账户保护；请离线保存原口令，再选择并保存自动恢复点方式。')),
-            button('保存自动备份方式', saveConfig, 'primary')),
+            button('保存自动备份方式', () => saveSection(['autoBackupMode']), 'primary')),
           h('hr'),
           field('手动备份 / 恢复口令（至少 12 字符；手动加密备份包含私人记录）', password, setPassword, 'password', { autoComplete: 'new-password' }),
           button('下载备份', () => run(async () => {
@@ -909,36 +1109,42 @@ window.__ModuleLoader__.load({
             setRestoreText(''); setPassword(''); return result;
           }, value => `已恢复到 ${value.space}，跳过 ${value.skippedForgotten} 条已知遗忘记录及 ${value.skippedPrivate} 条已清空的私人记录。${
             value.forgetCoverage === 'backup-only' ? '此设备没有更新的同谱系标记，只能依据备份当时的标记；旧离线备份可能带回之后遗忘的内容。' :
-              value.forgetCoverage === 'legacy-name-match' ? '旧备份按来源空间名匹配本机标记，无法证明名称未被复用。' : '已应用本机同谱系遗忘标记。'}请绑定对应工作区后使用。`))));
+              value.forgetCoverage === 'legacy-name-match' ? '旧备份按来源空间名匹配本机标记，无法证明名称未被复用。' : '已应用本机同谱系遗忘标记。'}请绑定对应工作区后使用。`)))));
 
       return h('main', { className: 'tidal', 'data-plugin': 'tidal-memory' },
         h('div', { className: 'hero' }, h('div', null, h('div', { className: 'eyebrow' }, 'TIDAL MEMORY'),
           h('div', { className: 'brand' }, '潮汐记忆', h('span', { className: 'version' }, status?.version ? `v${status.version}` : '版本未知')), h('small', null, '跨会话连续 · 按工作区隔离 · 四层独立存储')),
-          h('div', { className: 'row' }, h('select', { 'aria-label': '记忆空间', disabled: busy, value: space, onChange: e => setSpace(e.target.value) },
-            (status?.spaces || ['default']).map(name => h('option', { key: name, value: name }, name))),
-            button('刷新', () => run(() => Promise.resolve())))),
+          h('div', { className: 'row' }, h('label', null, '当前 DSH 工作区', h('select', { 'aria-label': '当前 DSH 工作区', disabled: busy,
+            value: currentWorkspace?.id || '', onChange: e => { const row = directory.items.find(item => item.id === e.target.value); if (row) switchSpace(row.space); } },
+            !currentWorkspace && h('option', { value: '' }, oldView.current ? '正在查看旧空间' : '请选择工作区'),
+            ...directory.items.map(row => h('option', { key: row.id, value: row.id, title: row.cwd },
+              (workspaceName(row) || row.cwd) + (directory.items.some(other => other.id !== row.id && other.title === row.title) ?
+                ' · ' + pathSuffix(row.cwd, directory.items.map(item => item.cwd)) : ''))))),
+            button('刷新', () => run(readDirectory)))),
+        directory.error && h('p', { role: 'alert', className: 'message error' }, directory.error),
         status ? h('div', { className: 'status-strip', 'aria-label': '记忆服务状态' },
           h('strong', null, '状态'), h('span', { className: status.unavailable ? 'badge' : 'badge ok' },
             status.unavailable ? '记忆服务：当前空间已暂停' : '记忆服务：已挂载'),
-          h('span', { className: 'badge' }, `空间：${space}`),
-          h('span', { className: 'badge' }, status.config.bindings.some(b => b.space === space) ? '工作区：已绑定' : '工作区：未绑定'),
+          h('span', { className: 'badge' }, currentWorkspace ? `当前工作区：${workspaceName(currentWorkspace) || currentWorkspace.cwd}` : `旧空间：${space}`),
+          h('span', { className: 'badge' }, boundWorkspace ? '工作区：已绑定' : binding ? '工作区：绑定待核对' : '工作区：未绑定'),
           h('span', { className: 'badge' }, status.unavailable ? '整理与检索：不可用' : '整理与检索：本地运行'),
           h('span', { className: 'badge' }, `上下文注入：${status.config.injectContext ? '已开启' : '已关闭'}`)) : null,
         h('nav', { className: 'tabs', 'aria-label': '记忆管理' },
           ...[['overview', '总览'], ['memories', '分层记忆'], ['graph', '记忆图谱'], ['recall', '回忆与整理'], ['private', '私人日记'], ['settings', '设置与迁移']]
             .map(([id, label]) => h('button', { key: id, type: 'button', role: 'tab', 'aria-selected': tab === id, onClick: () => { setTab(id); setNotice(null); } }, label))),
+        Object.keys(edits).length > 0 && h('div', { className: 'row' }, h('small', null, '有未保存的设置；请在相应区块保存。'), button('放弃设置草稿', () => setEdits({}))),
         notice ? h('div', { className: `message ${notice.error ? 'error' : ''}`, role: notice.error ? 'alert' : 'status' }, notice.text) : null,
         status?.error ? h('div', { className: 'message error' }, `${status.error.code} · ${status.error.message}`) : null,
         status?.searchIndex?.some(index => !index.current) ? h('div', { className: 'message error', role: 'alert' },
           '分词索引需要升级，旧索引不会参与召回。请在设置中重建搜索索引。') : null,
         ...(status?.errors || []).map((error, i) => h('div', { className: 'message error', key: i }, `${error.code} · ${error.message}`)),
-        content);
+        h('fieldset', { disabled: busy }, content));
     }
     class Boundary extends React.Component {
       constructor(props) { super(props); this.state = { error: null }; }
       static getDerivedStateFromError(error) { return { error: error.message }; }
       render() {
-        return this.state.error ? h('div', { role: 'alert' }, `潮汐记忆界面加载失败：${this.state.error}`) : h(Page);
+        return this.state.error ? h('div', { role: 'alert' }, `潮汐记忆界面加载失败：${this.state.error}`) : h(Page, this.props);
       }
     }
     return {
@@ -952,7 +1158,7 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section', id: 'tidal-memory', order: 32,
           label: () => '潮汐记忆', inject: () => ({}),
-        }, Boundary));
+        }, () => h(Boundary, { sessionList: ctx.get?.('sessions')?.list })));
       },
     };
   },

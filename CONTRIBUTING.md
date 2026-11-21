@@ -1,6 +1,6 @@
 # Contributing
 
-Tidal Memory uses workspace-shared, four-layer memory for DeepSeek Harness rc5. Capture, deterministic classification and consolidation do not call a model. Optional embedding inference is entirely local, with BGE-small CPU and Qwen3/Vulkan packs kept outside plugin code.
+Tidal Memory uses workspace-shared, four-layer memory for DeepSeek Harness 0.2.2-rc.5. Capture, deterministic classification and local rule-based consolidation do not call a model. Optional model-assisted consolidation uses the configured host or API route; embedding inference is local, with BGE-small CPU and Qwen3/Vulkan packs kept outside plugin code.
 
 ## Areas where help is welcome
 
@@ -32,9 +32,9 @@ pnpm bench:graph
 pnpm bench 10000
 ```
 
-The repository targets DeepSeek Harness `0.2.1-rc.5` and Node.js 24. Changes involving prompt delivery should distinguish provider registration, session event projection, and actual network delivery; do not claim a request was sent unless the host exposes evidence for it.
+The repository targets DeepSeek Harness `0.2.2-rc.5` and Node.js 24. Changes involving prompt delivery should distinguish provider registration, session event projection, and actual network delivery; do not claim a request was sent unless the host exposes evidence for it.
 
-Host dependencies are pinned in `tests/host-fixture`, separately from the plugin package. Missing or mismatched dependencies fail the tests instead of skipping. The CI host step exercises the real rc5 agent loop up to a fake transport's received request; it does not call a provider or cover compaction and long-conversation continuity.
+Host dependencies are pinned in `tests/host-fixture`, separately from the plugin package. Missing or mismatched dependencies fail the tests instead of skipping. The CI host step exercises the real host agent loop up to a fake transport's received request; it does not call a provider or cover compaction and long-conversation continuity.
 
 The benchmark compares a pinned original 0.1.0 commit with the working tree in separate processes. Its labeled development fixtures include unrelated active tasks and known semantic misses; they are not representative field data. Keep the failing semantic probes, report metric denominators and negative-query counts, and do not claim competitor or general-quality improvements from these fixtures. Local results go to `.preview/benchmark.json`.
 

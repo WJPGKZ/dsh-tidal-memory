@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { MemorySpace } from '../src/store.js';
 import { hash } from '../src/model.js';
 import { ForgetLedger } from '../src/forget-ledger.js';
@@ -369,6 +370,49 @@ test('opening a local space reconstructs a lost lineage ledger from its own mark
   assert.equal(result.skippedForgotten, 1);
   assert.equal(result.skippedPrivate, 1);
   assert.ok(reopened.privateDb.prepare('SELECT 1 FROM private_tombstones WHERE id=?').get(entry.id));
+});
+
+test('source anchors reject differently identified records on same-root and fresh-root restore', t => {
+  const { root, offline, space, open } = fixture(t);
+  const source = { kind: 'session', sessionId: 'original-session', eventId: '42', role: 'user' };
+  const first = create(space, 'first part of a source event', { sessionId: source.sessionId, source });
+  create(space, 'second part of a source event', { sessionId: source.sessionId, source });
+  const staleDocument = unpackBackup(packBackup(space));
+  const rewritten = { ...structuredClone(staleDocument.records[0]), id: randomUUID(),
+    text: 'different segmentation of the same original event' };
+  staleDocument.records.push(rewritten);
+  const staleBackup = packBackup({ snapshot: () => staleDocument });
+  space.forget(first.id, admin);
+  const current = packBackup(space);
+  assert.equal(space.all().length, 0);
+  assert.equal(unpackBackup(current).unknownEventCoverage, false);
+  assert.equal(restoreBackup(root, 'same-root', staleBackup, '', space.config).skippedForgotten, 3);
+  assert.equal(open(root, 'same-root').all().length, 0);
+  restoreBackup(offline, 'current', current, '', space.config);
+  assert.equal(restoreBackup(offline, 'older', staleBackup, '', space.config).skippedForgotten, 3);
+  assert.equal(open(offline, 'older').all().length, 0);
+});
+
+test('source anchors survive ledger loss and old unanchored markers remain explicitly unknown', t => {
+  const { root, offline, space, open } = fixture(t);
+  const source = { kind: 'session', sessionId: 'known-origin', eventId: '23', role: 'user' };
+  const record = create(space, 'anchored deletion', { sessionId: source.sessionId, source });
+  space.forget(record.id, admin);
+  const anchoredBackup = unpackBackup(packBackup(space));
+  assert.equal(anchoredBackup.unknownEventCoverage, false);
+  space.close();
+  for (const suffix of ['', '-wal', '-shm'])
+    rmSync(join(root, 'system', `forget-ledger.sqlite3${suffix}`), { force: true });
+  const reopened = open(root, 'shared');
+  assert.equal(reopened.forgetLedger.hasEvent(reopened.lineageId, source.sessionId, 23), true);
+  assert.equal(reopened.forgetLedger.hasUnknownEventCoverage(reopened.lineageId), false);
+
+  anchoredBackup.version = 3;
+  delete anchoredBackup.eventAnchors;
+  delete anchoredBackup.unknownEventCoverage;
+  restoreBackup(offline, 'legacy', packBackup({ snapshot: () => anchoredBackup }), '', reopened.config);
+  const legacy = open(offline, 'legacy');
+  assert.equal(legacy.forgetLedger.hasUnknownEventCoverage(legacy.lineageId), true);
 });
 
 test('old offline snapshots cannot know about later forget operations and report that limitation', t => {

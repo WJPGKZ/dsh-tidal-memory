@@ -72,7 +72,7 @@ export async function graphSemanticSuggestions(store, index, pack, options, acto
   const references = new Set(graphReferences(center).map(ref => ref.id));
   const ignored = store.system.prepare('SELECT state FROM graph_relations WHERE left_id=? AND right_id=?');
   const findDocuments = index.db.prepare('SELECT id,content_hash,chunks FROM documents WHERE id>? ORDER BY id LIMIT ?');
-  const startVersion = store.reconciledForgetVersion;
+  const startVersion = store.reconciledForgetVersion, startPrivateVersion = store.reconciledPrivateVersion;
   const check = () => {
     if (signal?.aborted || shouldPause()) throw new MemoryError('GRAPH_PAUSED', '语义候选已让出，请在空闲时重试。', 409);
     requireValue(validateModel() && !index.closed && index.state === 'ready', 'GRAPH_MODEL_CHANGED',
@@ -80,6 +80,8 @@ export async function graphSemanticSuggestions(store, index, pack, options, acto
     store.reconcileForgetLedger();
     requireValue(startVersion === store.reconciledForgetVersion && startVersion === store.forgetVersion(),
       'FORGET_CONFLICT', '候选计算期间遗忘标记发生变化，请重试。', 409);
+    requireValue(startPrivateVersion === store.reconciledPrivateVersion && startPrivateVersion === store.privateVersion(),
+      'PRIVATE_REGISTRY_CHANGED', '候选计算期间私人会话隔离状态发生变化，请重试。', 409);
     const current = store.rawOrdinary(id);
     const currentScope = store.recallScope(actor, scopeOptions);
     requireValue(current && currentScope.accept(current) && memoryContentHash(current) === centerHash,

@@ -127,6 +127,7 @@ export interface EvidenceRecord {
   occurredAt: string | null;
   kind: string;
   horizon: string;
+  evidence: string;
   taskKey: string;
   topics: string[];
   validFrom: string | null;

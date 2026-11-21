@@ -14,5 +14,9 @@ for (const file of files(process.cwd()).filter(file => /\.(js|mjs)$/.test(file))
   if (result.status !== 0) { console.error(result.stderr); process.exit(1); }
 }
 const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
-if (manifest.engines.dsh !== '0.2.1-rc.5') throw new Error('Unexpected host compatibility declaration');
+const fixture = JSON.parse(readFileSync(join('tests', 'host-fixture', 'package.json'), 'utf8'));
+const host = manifest.engines.dsh;
+if (!host || manifest.peerDependencies['@deepseek-ai/dsh'] !== host ||
+    Object.entries(fixture.dependencies).some(([name, version]) => name.startsWith('@deepseek-ai/dsh-') && version !== host))
+  throw new Error('Host compatibility declarations and fixture dependencies must match.');
 console.log('Syntax and package checks passed.');

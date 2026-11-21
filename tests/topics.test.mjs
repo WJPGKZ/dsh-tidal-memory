@@ -163,7 +163,7 @@ test('topic pages bound output size while preserving a way to read all provenanc
   const items = [];
   let cursor, pages = 0;
   do {
-    const result = space.readEvidence({ topic, cursor, limit: 100 }, reader);
+    const result = space.readEvidence({ topic, cursor, limit: 100 }, admin);
     pages++;
     assert.equal(result.total, records.length);
     assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') <= 1024 * 1024);
@@ -177,7 +177,7 @@ test('topic pages bound output size while preserving a way to read all provenanc
   assert.equal(large.sourcesComplete, false);
   assert.equal(large.sourcesTotal, records[0].count);
   assert.deepEqual(large.sources, []);
-  assert.equal(space.readEvidence({ id: large.id }, reader).sources.length, records[0].count);
+  assert.equal(space.readEvidence({ id: large.id }, admin).sources.length, records[0].count);
   for (const record of records.slice(1)) {
     const item = items.find(value => value.id === record.id);
     assert.equal(item.sourcesComplete, true);

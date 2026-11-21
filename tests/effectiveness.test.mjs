@@ -222,6 +222,12 @@ test('effectiveness defaults are configurable without overwriting explicit exist
   assert.equal(configOf({ tokenBudget: 12000 }).tokenBudget, 12000);
   assert.equal(configOf({ tokenBudget: 192000, maxRecall: 100 }).maxRecall, 100);
   assert.equal(configOf({ workingHours: 0 }).workingHours, 0);
+  assert.equal(configOf({ deepOrganizationMode: 'selected' }).deepOrganizationMode, 'local');
+  assert.equal(configOf({ deepOrganizationMode: 'api', deepOrganizationApiEndpoint:
+    'http://[::1]:8080/v1/chat/completions', deepOrganizationApiModel: 'test-model' }).deepOrganizationMode, 'api');
+  assert.throws(() => configOf({ deepOrganizationMode: 'api',
+    deepOrganizationApiEndpoint: 'http://192.168.1.5/v1/chat/completions',
+    deepOrganizationApiModel: 'test-model' }), { code: 'INVALID_CONFIG' });
   for (const dailyConsolidateAt of ['3:00', '24:00', '00:60', null]) {
     assert.throws(() => configOf({ dailyConsolidateAt }), { code: 'INVALID_CONFIG' });
   }
@@ -410,14 +416,15 @@ test('derived expiry and forgotten provenance are respected by deep consolidatio
   const target = space.all().find(item => item.layer === 'L3');
   assert.equal(target.validUntil, expiry);
   space.forget(target.id, admin);
-  assert.equal(space.consolidate(200, { deep: true }).skipped, 1);
+  assert.equal(space.consolidate(200, { deep: true }).promoted, 0);
   assert.equal(space.all().filter(item => item.layer === 'L3').length, 0);
   restoreBackup(root, 'copy', before, '', space.config);
   const copy = new MemorySpace(root, 'copy');
   try {
+    assert.equal(copy.all().length, 0);
     const result = copy.consolidate(200, { deep: true });
     assert.equal(result.promoted, 0);
-    assert.equal(result.skipped, 1);
+    assert.equal(copy.all().filter(item => item.layer === 'L3').length, 0);
   }
   finally { copy.close(); }
 });

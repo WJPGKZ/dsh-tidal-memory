@@ -55,7 +55,9 @@ export class SemanticIndex {
   }
   forget(ids) {
     for (const id of ids) this.dirty.delete(id);
+    this.db.exec('PRAGMA secure_delete=ON');
     transaction(this.db, () => { for (const id of ids) this.db.prepare('DELETE FROM documents WHERE id=?').run(id); });
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
   reconcile(pack) {
     const records = this.store.all().filter(indexable);
@@ -115,7 +117,8 @@ export class SemanticIndex {
             const insertVector = this.db.prepare('INSERT INTO vectors VALUES(?,?,?)');
             for (const item of prepared) {
               const current = this.store.raw(item.id);
-              if (!current || !indexable(current) || memoryContentHash(current) !== item.contentHash) continue;
+              if (!current || this.store.quarantinedIds.has(current.id) ||
+                  !indexable(current) || memoryContentHash(current) !== item.contentHash) continue;
               remove.run(item.id);
               insertDocument.run(item.id, item.contentHash, current.revision, item.vectors.length);
               item.vectors.forEach((vector, part) => insertVector.run(item.id, part,
@@ -130,7 +133,7 @@ export class SemanticIndex {
         for (const id of [...this.dirty]) {
           check();
           const record = this.store.raw(id);
-          if (!record || !indexable(record)) {
+          if (!record || this.store.isPrivateQuarantined(record) || !indexable(record)) {
             this.db.prepare('DELETE FROM documents WHERE id=?').run(id);
             this.dirty.delete(id);
             continue;
@@ -160,12 +163,14 @@ export class SemanticIndex {
     return job;
   }
   search(queries, pack, { accept = () => true, limit = 120 } = {}) {
+    this.store.reconcilePrivateRegistry();
     requireValue(!this.closed && this.db.prepare("SELECT value FROM metadata WHERE key='model'").get()?.value === pack.fingerprint,
       'INDEX_MODEL_MISMATCH', '语义索引与当前模型版本不同，请重建。', 409);
     const scores = new Map(), documents = new Map();
     for (const row of this.db.prepare('SELECT * FROM documents').all()) {
       const record = this.store.raw(row.id);
-      if (record && indexable(record) && accept(record) && row.content_hash === memoryContentHash(record))
+      if (record && !this.store.isPrivateQuarantined(record) && indexable(record) &&
+          accept(record) && row.content_hash === memoryContentHash(record))
         documents.set(row.id, { ...row, currentRevision: record.revision });
     }
     for (const row of this.db.prepare('SELECT id,vector FROM vectors').all()) {
@@ -189,10 +194,12 @@ export class SemanticIndex {
         revision: documents.get(id).currentRevision }));
   }
   status() {
+    this.store.reconcilePrivateRegistry();
     const indexed = this.db.prepare(`SELECT count(*) AS n FROM documents d
       WHERE chunks=(SELECT count(*) FROM vectors v WHERE v.id=d.id)`).get().n;
     let total = 0;
-    for (const [layer, db] of this.store.dbs) if (layer !== 'L0') total += db.prepare(
+    if (this.store.quarantinedIds.size) total = this.store.all().filter(indexable).length;
+    else for (const [layer, db] of this.store.dbs) if (layer !== 'L0') total += db.prepare(
       "SELECT count(*) AS n FROM memories WHERE status IN ('active','archived','superseded','completed','cancelled')").get().n;
     return { state: this.state, indexed, total, pending: Math.max(0, total - indexed),
       fingerprint: this.db.prepare("SELECT value FROM metadata WHERE key='model'").get()?.value ?? null,
