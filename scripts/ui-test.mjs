@@ -106,9 +106,14 @@ try {
   assert.equal(await page.getByLabel('单日回溯日期').inputValue(), '');
   await page.getByLabel('主会话日记上下文预算（字节）').fill('9000');
   await page.getByRole('button', { name: '管理此工作区的会话授权' }).click();
-  const openPicker = async label => {
+  const openPicker = async (label, { keyboard = false } = {}) => {
     const response = page.waitForResponse(r => r.url().includes('/workspace-sessions?view=picker'));
-    await page.locator('summary').filter({ hasText: new RegExp(`^${label}：`) }).click();
+    const trigger = page.locator('summary').filter({ hasText: new RegExp(`^${label}：`) });
+    if (keyboard) {
+      await trigger.focus();
+      await trigger.press('Enter');
+    } else await trigger.click();
+    // Opening resets the search; wait for that handler before entering a query.
     await response;
   };
   await openPicker('私人日记主会话');
@@ -188,8 +193,7 @@ try {
   await page.locator('summary').filter({ hasText: /^私人日记主会话：重命名后的主会话/ }).waitFor();
   await page.setViewportSize({ width: 480, height: 860 });
   const privateTrigger = page.locator('summary[aria-label="选择私人日记主会话"]');
-  await privateTrigger.focus();
-  await privateTrigger.press('Enter');
+  await openPicker('私人日记主会话', { keyboard: true });
   await page.getByLabel('搜索私人日记主会话').fill('记录 31');
   await mainSelect.locator('option[value="catalog-31"]').waitFor({ state: 'attached' });
   await page.getByLabel('搜索私人日记主会话').press('Escape');
